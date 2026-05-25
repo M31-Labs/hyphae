@@ -26,30 +26,42 @@ carries provenance.
 
 ## Status
 
-**v0.1.1** — the contribution loop closes end-to-end.
+**v0.1.3** — full read + contribute loop, Ed25519 signing, graph queries,
+pulse aggregation, and a GoSX-based browser visualization.
 
 Today you can:
 
-- `hypha index rebuild` — walk a Hyphae install root and populate a SQLite
-  index over every space's mdpp files.
+- `hypha index rebuild` — walk an install root and populate a SQLite
+  index (FTS5 + objects + anchors + edges) over every space.
 - `hypha recall <query>` — BM25-ranked, token-budgeted full-text search
   returning a compact `summary + anchors` response.
-- `hypha spore submit <file>` — validate, write to a space inbox, emit a
-  content-hashed receipt, and persist it to the audit log.
-- `hypha graft <spore-id> --as <identity>` — apply a spore's
-  `proposed_writes` to canonical files using bounded mdpp edits, record
-  `derived_from` edges, update spore status in-place, persist the receipt.
-- `hypha identity init` / `hypha identity list` — Ed25519 keypair
-  generation and listing.
-- `hypha cap issue` — scoped local capability token, persisted with a
-  matching receipt.
+- `hypha spore submit <file> [--sign --as <id>]` — validate, optionally
+  Ed25519-sign, write to inbox, emit + persist a content-hashed receipt.
+- `hypha graft <spore-id> --as <id> [--verify]` — apply a spore's
+  `proposed_writes` (`append_section`, `insert_after`, `replace_block`,
+  `create_file`, `add_tag`) via bounded mdpp edits, record `derived_from`
+  edges, update spore status in-place, persist the receipt.
+- `hypha identity init|list` — Ed25519 keypair generation, identity files
+  (mode-0600 private key sidecar), listing.
+- `hypha cap issue` — scoped local capability token, persisted.
+- `hypha graph backlinks|related|trace <id>` — walk the typed graph
+  (cycle-safe BFS, optional kind filters).
+- `hypha pulse [--window 30d]` — time-windowed signal aggregation: top
+  initiatives, hot zones, recent pressure, edge-kind distribution,
+  activity counts. Cached in `pulse_cache`.
 - `hypha receipts list` — query the audit log by space, subject, action,
   time window.
 
-Coming next (v0.1.2+): Ed25519 spore signing on submit + verification on
-intake, mdpp.fmt after graft, additional `proposed_write` kinds
-(`replace_block`, `create_file`, `add_tag`), HTTP API, alignment
-(`change:assess`), pulse aggregation.
+For the browser visualization (separate binary, GoSX-based):
+
+- `hypha-viz [--addr 127.0.0.1:7777]` — local server with a force-directed
+  knowledge graph, search bar, click-to-expand neighbors, object detail
+  panel. Earth-tone palette, plain Go + GoSX, no JS build step.
+
+Coming next: HTTP API for cloud-agent spore submission, alignment
+(`change:assess`), peer federation (signed manifests + drift detection),
+Engine-backed graph rendering (Go-via-TinyGo for the canvas), mdpp.fmt
+after graft.
 
 The canonical Hyphae space (concepts, decisions, initiatives, protocols, skills)
 is installed under `~/.hyphae/spaces/m31labs-hyphae/`. The binary in this repo
@@ -136,12 +148,19 @@ federated independently of any one codebase.
 | Package | Role |
 | --- | --- |
 | `cmd/hypha` | CLI surface |
+| `cmd/hypha-viz` | GoSX-based browser visualization (separate binary) |
 | `internal/types` | Object / Anchor / Edge / Spore / Capability / Receipt |
 | `internal/db` | SQLite open + embedded schema migration |
 | `internal/parser` | Walk an mdpp space, extract Objects + Anchors + Edges |
-| `internal/spore` | Validate spore frontmatter, write to inbox, emit receipt |
+| `internal/spore` | Validate spore frontmatter, sign/verify (Ed25519), write to inbox, emit receipt |
 | `internal/recall` | FTS5 indexer + token-budgeted recall query |
-| `internal/capability` | Local (unsigned, v0.1) capability tokens |
+| `internal/graft` | Hyphae graft engine — bounded mdpp edits applying proposed_writes |
+| `internal/graph` | Backlinks / Related / Trace queries over the edges table |
+| `internal/pulse` | Time-windowed signal aggregation + cache |
+| `internal/identity` | Ed25519 keypair gen + identity files + private-key sidecar (0600) |
+| `internal/receipts` | Audit log persistence + queries |
+| `internal/capability` | Scoped local capability tokens |
+| `internal/vizdata` | Shared graph-query helpers for the viz binary |
 
 Built on [Markdown++ (mdpp)](https://github.com/odvcencio/mdpp): a
 grammar-aware Markdown stack with byte-precise ranges, source-preserving

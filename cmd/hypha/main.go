@@ -18,6 +18,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -29,13 +30,14 @@ import (
 	"github.com/odvcencio/hyphae/internal/graph"
 	"github.com/odvcencio/hyphae/internal/identity"
 	"github.com/odvcencio/hyphae/internal/parser"
+	"github.com/odvcencio/hyphae/internal/pulse"
 	"github.com/odvcencio/hyphae/internal/recall"
 	"github.com/odvcencio/hyphae/internal/receipts"
 	"github.com/odvcencio/hyphae/internal/spore"
 	"github.com/odvcencio/hyphae/internal/types"
 )
 
-const usage = `hypha — Hyphae v0.1.2 CLI
+const usage = `hypha — Hyphae v0.1.3 CLI
 
 Usage:
   hypha index    rebuild [--root <path>]
@@ -48,7 +50,11 @@ Usage:
   hypha graph    backlinks <object-id> [--kind k1,k2] [--limit N]
   hypha graph    related   <object-id> [--kind k1,k2] [--limit N]
   hypha graph    trace     <object-id> [--kind derived_from,cites] [--max-depth 4]
+  hypha pulse    [--space <uri>] [--window 30d] [--ttl 5m] [--format json|text]
   hypha receipts list [--space <uri>] [--subject <uri>] [--action <name>] [--since 24h] [--limit N]
+
+Separate binary for the browser visualization (GoSX-based):
+  hypha-viz       [--addr 127.0.0.1:7777] [--root <hyphae-home>]
 
 Environment:
   HYPHAE_HOME    install root (default: $HOME/.hyphae)
@@ -87,9 +93,113 @@ func run(args []string) error {
 		return cmdReceipts(rest)
 	case "graph":
 		return cmdGraph(rest)
+	case "pulse":
+		return cmdPulse(rest)
 	default:
 		return fmt.Errorf("unknown command %q (try `hypha help`)", group)
 	}
+}
+
+// --- pulse -----------------------------------------------------------------
+
+func cmdPulse(args []string) error {
+	fs := flag.NewFlagSet("pulse", flag.ContinueOnError)
+	spaceURI := fs.String("space", "", "filter by space URI (default: all spaces)")
+	windowStr := fs.String("window", "30d", "Go duration window (e.g. 7d, 30d, q2 → 90d)")
+	ttlStr := fs.String("ttl", "5m", "cache TTL; pass 0 to force recompute")
+	format := fs.String("format", "json", "json | text")
+	if err := fs.Parse(reorderFlagsFirst(args)); err != nil {
+		return err
+	}
+
+	window, err := parseFlexDuration(*windowStr)
+	if err != nil {
+		return fmt.Errorf("--window %q: %w", *windowStr, err)
+	}
+	ttl, err := time.ParseDuration(*ttlStr)
+	if err != nil {
+		return fmt.Errorf("--ttl %q: %w", *ttlStr, err)
+	}
+
+	root, err := resolveRoot("")
+	if err != nil {
+		return err
+	}
+	conn, err := openIndex(root)
+	if err != nil {
+		return err
+	}
+	defer conn.Close()
+
+	var p pulse.Pulse
+	if ttl <= 0 {
+		p, err = pulse.Compute(conn, *spaceURI, window)
+	} else {
+		p, err = pulse.ComputeAndCache(conn, *spaceURI, window, ttl)
+	}
+	if err != nil {
+		return err
+	}
+
+	switch *format {
+	case "json":
+		enc := json.NewEncoder(os.Stdout)
+		enc.SetIndent("", "  ")
+		return enc.Encode(p)
+	case "text":
+		printPulseText(os.Stdout, p)
+		return nil
+	default:
+		return fmt.Errorf("unknown --format %q", *format)
+	}
+}
+
+// parseFlexDuration accepts Go durations plus a few human-friendly shorthands:
+// "Nd" → N*24h, "q1".."q4" → 90d. Falls back to time.ParseDuration.
+func parseFlexDuration(s string) (time.Duration, error) {
+	if len(s) > 1 && s[len(s)-1] == 'd' {
+		n, err := time.ParseDuration(s[:len(s)-1] + "h")
+		if err == nil {
+			return n * 24, nil
+		}
+	}
+	if len(s) == 2 && s[0] == 'q' && s[1] >= '1' && s[1] <= '4' {
+		return 90 * 24 * time.Hour, nil
+	}
+	return time.ParseDuration(s)
+}
+
+// printPulseText renders a Pulse in a compact human format.
+func printPulseText(w io.Writer, p pulse.Pulse) {
+	fmt.Fprintf(w, "Pulse: %s (window %s, %d activity tokens used)\n",
+		nonEmpty(p.Space, "<all spaces>"), p.Window, p.TokensUsed)
+	fmt.Fprintf(w, "  Activity: %d spores submitted, %d grafts applied, %d new objects, %d new edges\n",
+		p.Activity.SporesSubmitted, p.Activity.GraftsApplied, p.Activity.NewObjects, p.Activity.NewEdges)
+	if len(p.TopInitiatives) > 0 {
+		fmt.Fprintln(w, "  Top initiatives:")
+		for _, t := range p.TopInitiatives {
+			fmt.Fprintf(w, "    %s — %s  (%d inbound)\n", t.ID, t.Title, t.InboundEdges)
+		}
+	}
+	if len(p.HotZones) > 0 {
+		fmt.Fprintln(w, "  Hot zones:")
+		for _, h := range p.HotZones {
+			fmt.Fprintf(w, "    %s [%s]  graft_in=%d  new_out=%d\n", h.ObjectID, h.Type, h.GraftEdgesIn, h.NewEdgesOut)
+		}
+	}
+	if len(p.RecentPressure) > 0 {
+		fmt.Fprintln(w, "  Recent pressure:")
+		for _, pr := range p.RecentPressure {
+			fmt.Fprintf(w, "    %s (%s) ×%d\n", pr.Kind, pr.Topic, pr.Count)
+		}
+	}
+}
+
+func nonEmpty(s, fallback string) string {
+	if s == "" {
+		return fallback
+	}
+	return s
 }
 
 // --- index rebuild ----------------------------------------------------------
