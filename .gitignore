@@ -1,0 +1,23 @@
+# Build artifacts
+/hypha
+/hypha-lsp
+*.exe
+*.dll
+*.so
+*.dylib
+
+# Test artifacts
+*.test
+*.out
+coverage.*
+profile.*
+
+# Editor / OS
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+
+# Orchard-stack internal metadata (not part of the public mirror)
+/.graft/
