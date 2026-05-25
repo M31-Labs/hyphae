@@ -26,6 +26,7 @@ import (
 	"github.com/odvcencio/hyphae/internal/capability"
 	"github.com/odvcencio/hyphae/internal/db"
 	"github.com/odvcencio/hyphae/internal/graft"
+	"github.com/odvcencio/hyphae/internal/graph"
 	"github.com/odvcencio/hyphae/internal/identity"
 	"github.com/odvcencio/hyphae/internal/parser"
 	"github.com/odvcencio/hyphae/internal/recall"
@@ -34,16 +35,19 @@ import (
 	"github.com/odvcencio/hyphae/internal/types"
 )
 
-const usage = `hypha — Hyphae v0.1.1 CLI
+const usage = `hypha — Hyphae v0.1.2 CLI
 
 Usage:
   hypha index    rebuild [--root <path>]
   hypha recall   <query> [--limit N] [--max-tokens N] [--shape headline|summary+anchors] [--format json|text]
-  hypha spore    submit <file>
+  hypha spore    submit <file> [--sign --as <identity-uri>]
   hypha cap      issue --subject <uri> --space <uri> [--permissions p1,p2] [--expires 24h]
   hypha identity init --name <name> --authority <auth> --space <uri> [--expires 1y]
   hypha identity list
-  hypha graft    <spore-id> --as <identity-uri> [--space <hypha-uri>]
+  hypha graft    <spore-id> --as <identity-uri> [--space <hypha-uri>] [--verify]
+  hypha graph    backlinks <object-id> [--kind k1,k2] [--limit N]
+  hypha graph    related   <object-id> [--kind k1,k2] [--limit N]
+  hypha graph    trace     <object-id> [--kind derived_from,cites] [--max-depth 4]
   hypha receipts list [--space <uri>] [--subject <uri>] [--action <name>] [--since 24h] [--limit N]
 
 Environment:
@@ -81,6 +85,8 @@ func run(args []string) error {
 		return cmdGraft(rest)
 	case "receipts":
 		return cmdReceipts(rest)
+	case "graph":
+		return cmdGraph(rest)
 	default:
 		return fmt.Errorf("unknown command %q (try `hypha help`)", group)
 	}
@@ -125,7 +131,10 @@ func cmdIndex(args []string) error {
 			return fmt.Errorf("walk %s: %w", sp.Path, err)
 		}
 		if err := recall.IndexBatch(conn, objects); err != nil {
-			return fmt.Errorf("index %s: %w", sp.URI, err)
+			return fmt.Errorf("index FTS %s: %w", sp.URI, err)
+		}
+		if err := persistObjectsAnchorsEdges(conn, sp.Path, objects, anchors, edges); err != nil {
+			return fmt.Errorf("index tables %s: %w", sp.URI, err)
 		}
 		totalObj += len(objects)
 		totalAnc += len(anchors)
@@ -136,6 +145,86 @@ func cmdIndex(args []string) error {
 		totalObj, totalAnc, totalEdg, len(spaces))
 	fmt.Fprintf(os.Stderr, "db: %s\n", dbPath)
 	return nil
+}
+
+// persistObjectsAnchorsEdges writes parser output to objects/anchors/edges
+// tables. Uses one transaction per space for atomicity + speed. UPSERTs are
+// idempotent so re-indexing the same space is safe.
+func persistObjectsAnchorsEdges(conn *sql.DB, spacePath string, objects []types.Object, anchors []types.Anchor, edges []types.Edge) error {
+	tx, err := conn.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback() //nolint:errcheck
+
+	now := time.Now().UTC().Format(time.RFC3339)
+
+	for _, o := range objects {
+		tagsJSON := "[]"
+		if len(o.Tags) > 0 {
+			if b, jerr := json.Marshal(o.Tags); jerr == nil {
+				tagsJSON = string(b)
+			}
+		}
+		// file_id: use the path relative to space root as a stable synthetic id.
+		fileID, _ := filepath.Rel(spacePath, o.FilePath)
+		if fileID == "" {
+			fileID = o.FilePath
+		}
+		updated := now
+		if !o.UpdatedAt.IsZero() {
+			updated = o.UpdatedAt.UTC().Format(time.RFC3339)
+		}
+		if _, err := tx.Exec(`
+			INSERT INTO objects (id, type, space_id, file_id, status, title, tags_json, summary, updated_at)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+			ON CONFLICT(id) DO UPDATE SET
+				type = excluded.type,
+				space_id = excluded.space_id,
+				file_id = excluded.file_id,
+				status = excluded.status,
+				title = excluded.title,
+				tags_json = excluded.tags_json,
+				summary = excluded.summary,
+				updated_at = excluded.updated_at`,
+			o.ID, string(o.Type), o.SpaceID, fileID, o.Status, o.Title, tagsJSON, o.Summary, updated); err != nil {
+			return fmt.Errorf("upsert object %q: %w", o.ID, err)
+		}
+	}
+
+	for _, a := range anchors {
+		if _, err := tx.Exec(`
+			INSERT INTO anchors (id, object_id, heading_path, start_byte, end_byte, start_line, end_line, node_kind)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+			ON CONFLICT(id) DO UPDATE SET
+				object_id = excluded.object_id,
+				heading_path = excluded.heading_path,
+				start_byte = excluded.start_byte,
+				end_byte = excluded.end_byte,
+				start_line = excluded.start_line,
+				end_line = excluded.end_line,
+				node_kind = excluded.node_kind`,
+			a.ID, a.ObjectID, a.HeadingPath, a.StartByte, a.EndByte, a.StartLine, a.EndLine, a.NodeKind); err != nil {
+			return fmt.Errorf("upsert anchor %q: %w", a.ID, err)
+		}
+	}
+
+	for _, e := range edges {
+		conf := e.Confidence
+		if conf == 0 {
+			conf = 1.0
+		}
+		// INSERT OR IGNORE: parser-derived edges are idempotent by (kind, src, dst);
+		// any prior graft-derived edge keeps its richer metadata.
+		if _, err := tx.Exec(`
+			INSERT OR IGNORE INTO edges (id, kind, src_id, dst_id, confidence, derivation, created_at)
+			VALUES (?, ?, ?, ?, ?, ?, ?)`,
+			e.ID, string(e.Kind), e.SrcID, e.DstID, conf, e.Derivation, now); err != nil {
+			return fmt.Errorf("upsert edge %q: %w", e.ID, err)
+		}
+	}
+
+	return tx.Commit()
 }
 
 // --- recall -----------------------------------------------------------------
@@ -196,18 +285,26 @@ func cmdRecall(args []string) error {
 
 func cmdSpore(args []string) error {
 	if len(args) == 0 || args[0] != "submit" {
-		return errors.New("usage: hypha spore submit <file>")
+		return errors.New("usage: hypha spore submit <file> [--sign --as <identity-uri>]")
 	}
-	if len(args) < 2 {
-		return errors.New("usage: hypha spore submit <file>")
+	rest := args[1:]
+	fs := flag.NewFlagSet("spore submit", flag.ContinueOnError)
+	sign := fs.Bool("sign", false, "Ed25519-sign the spore before submission")
+	signer := fs.String("as", "", "signer identity URI (required with --sign)")
+	if err := fs.Parse(reorderFlagsFirst(rest)); err != nil {
+		return err
 	}
-	path := args[1]
+	if fs.NArg() == 0 {
+		return errors.New("usage: hypha spore submit <file> [--sign --as <identity-uri>]")
+	}
+	path := fs.Arg(0)
 
 	source, err := os.ReadFile(path)
 	if err != nil {
 		return fmt.Errorf("read %s: %w", path, err)
 	}
 
+	// Parse for validation (also validates we have a usable spore before we sign).
 	sp, verrs := spore.Parse(source)
 	if len(verrs) > 0 {
 		for _, e := range verrs {
@@ -225,9 +322,35 @@ func cmdSpore(args []string) error {
 		return err
 	}
 
-	filePath, receipt, err := spore.Submit(sp, spaceRoot)
-	if err != nil {
-		return fmt.Errorf("submit: %w", err)
+	var filePath string
+	var receipt types.Receipt
+
+	if *sign {
+		if *signer == "" {
+			return errors.New("--sign requires --as <identity-uri>")
+		}
+		identDir := filepath.Join(root, ".catalog", "identities")
+		signerName := identityNameFromURI(*signer)
+		if signerName == "" {
+			return fmt.Errorf("--as %q must be a full identity:// URI", *signer)
+		}
+		priv, lpErr := identity.LoadPrivate(identDir, signerName)
+		if lpErr != nil {
+			return fmt.Errorf("load signer key: %w", lpErr)
+		}
+		signed, sErr := spore.Sign(source, priv, *signer)
+		if sErr != nil {
+			return fmt.Errorf("sign: %w", sErr)
+		}
+		filePath, receipt, err = spore.SubmitBytes(signed, spaceRoot)
+		if err != nil {
+			return fmt.Errorf("submit signed: %w", err)
+		}
+	} else {
+		filePath, receipt, err = spore.Submit(sp, spaceRoot)
+		if err != nil {
+			return fmt.Errorf("submit: %w", err)
+		}
 	}
 
 	// Persist the receipt to the audit log.
@@ -245,11 +368,39 @@ func cmdSpore(args []string) error {
 	if err := enc.Encode(map[string]any{
 		"receipt":  receipt,
 		"filePath": filePath,
+		"signed":   *sign,
 	}); err != nil {
 		return err
 	}
 	fmt.Fprintf(os.Stderr, "\nReported back to Hyphae: %s\n", filePath)
 	return nil
+}
+
+// identityNameFromURI extracts the bare name from "identity://<authority>/<name>".
+// Returns empty string if uri doesn't fit that shape.
+func identityNameFromURI(uri string) string {
+	rest, ok := strings.CutPrefix(uri, "identity://")
+	if !ok {
+		return ""
+	}
+	slash := strings.Index(rest, "/")
+	if slash < 0 || slash == len(rest)-1 {
+		return ""
+	}
+	return rest[slash+1:]
+}
+
+// identityResolver returns a spore.IdentityResolver backed by files under
+// <root>/.catalog/identities/.
+func identityResolver(root string) spore.IdentityResolver {
+	dir := filepath.Join(root, ".catalog", "identities")
+	return func(uri string) (identity.Identity, error) {
+		name := identityNameFromURI(uri)
+		if name == "" {
+			return identity.Identity{}, fmt.Errorf("not a recognized identity URI: %q", uri)
+		}
+		return identity.Load(dir, name)
+	}
 }
 
 // --- cap issue --------------------------------------------------------------
@@ -408,16 +559,17 @@ func cmdIdentityList(args []string) error {
 
 func cmdGraft(args []string) error {
 	if len(args) == 0 {
-		return errors.New("usage: hypha graft <spore-id> --as <identity-uri> [--space <hypha-uri>]")
+		return errors.New("usage: hypha graft <spore-id> --as <identity-uri> [--space <hypha-uri>] [--verify]")
 	}
 	fs := flag.NewFlagSet("graft", flag.ContinueOnError)
 	grafter := fs.String("as", "", "grafter identity URI (recorded in the receipt)")
 	spaceURI := fs.String("space", "", "space URI override (auto-detected from inbox if omitted)")
+	verify := fs.Bool("verify", false, "verify Ed25519 signature on the spore before applying")
 	if err := fs.Parse(reorderFlagsFirst(args)); err != nil {
 		return err
 	}
 	if fs.NArg() == 0 {
-		return errors.New("usage: hypha graft <spore-id> --as <identity-uri> [--space <hypha-uri>]")
+		return errors.New("usage: hypha graft <spore-id> --as <identity-uri> [--space <hypha-uri>] [--verify]")
 	}
 	sporeID := fs.Arg(0)
 	if *grafter == "" {
@@ -446,6 +598,22 @@ func cmdGraft(args []string) error {
 		if err != nil {
 			return err
 		}
+	}
+
+	// Optional pre-graft signature verification.
+	if *verify {
+		sporePath, err := findSporeFilePath(spaceRoot, sporeID)
+		if err != nil {
+			return fmt.Errorf("verify: %w", err)
+		}
+		sporeBytes, err := os.ReadFile(sporePath)
+		if err != nil {
+			return fmt.Errorf("verify read: %w", err)
+		}
+		if err := spore.Verify(sporeBytes, identityResolver(root)); err != nil {
+			return fmt.Errorf("verify failed (refusing graft): %w", err)
+		}
+		fmt.Fprintln(os.Stderr, "verified spore signature")
 	}
 
 	result, err := graft.Apply(conn, root, spaceRoot, sporeID, *grafter)
@@ -502,6 +670,124 @@ func findSporeSpaceRoot(root, sporeID string) (string, error) {
 func bytesContainsID(data []byte, sporeID string) bool {
 	return strings.Contains(string(data), "id: "+sporeID+"\n") ||
 		strings.Contains(string(data), "id: "+sporeID+"\r\n")
+}
+
+// findSporeFilePath returns the on-disk path of the spore matching sporeID
+// inside spaceRoot/inbox/agents/.
+func findSporeFilePath(spaceRoot, sporeID string) (string, error) {
+	inbox := filepath.Join(spaceRoot, "inbox", "agents")
+	entries, err := os.ReadDir(inbox)
+	if err != nil {
+		return "", err
+	}
+	for _, e := range entries {
+		if e.IsDir() || !strings.HasSuffix(e.Name(), ".md") {
+			continue
+		}
+		p := filepath.Join(inbox, e.Name())
+		data, err := os.ReadFile(p)
+		if err != nil {
+			continue
+		}
+		if bytesContainsID(data, sporeID) {
+			return p, nil
+		}
+	}
+	return "", fmt.Errorf("spore %q not found under %s", sporeID, inbox)
+}
+
+// --- graph -----------------------------------------------------------------
+
+func cmdGraph(args []string) error {
+	if len(args) == 0 {
+		return errors.New("usage: hypha graph backlinks|related|trace <object-id> [flags]")
+	}
+	switch args[0] {
+	case "backlinks":
+		return cmdGraphLinks(args[1:], graph.Backlinks)
+	case "related":
+		return cmdGraphLinks(args[1:], graph.Related)
+	case "trace":
+		return cmdGraphTrace(args[1:])
+	default:
+		return fmt.Errorf("unknown graph subcommand %q", args[0])
+	}
+}
+
+type linksFunc func(*sql.DB, string, []types.EdgeKind, int) ([]graph.Neighbor, error)
+
+func cmdGraphLinks(args []string, fn linksFunc) error {
+	fs := flag.NewFlagSet("graph links", flag.ContinueOnError)
+	kindStr := fs.String("kind", "", "comma-separated edge kinds to filter (default: all)")
+	limit := fs.Int("limit", 50, "max results")
+	if err := fs.Parse(reorderFlagsFirst(args)); err != nil {
+		return err
+	}
+	if fs.NArg() == 0 {
+		return errors.New("missing <object-id>")
+	}
+	objectID := fs.Arg(0)
+
+	root, err := resolveRoot("")
+	if err != nil {
+		return err
+	}
+	conn, err := openIndex(root)
+	if err != nil {
+		return err
+	}
+	defer conn.Close()
+
+	out, err := fn(conn, objectID, parseEdgeKinds(*kindStr), *limit)
+	if err != nil {
+		return err
+	}
+	enc := json.NewEncoder(os.Stdout)
+	enc.SetIndent("", "  ")
+	return enc.Encode(out)
+}
+
+func cmdGraphTrace(args []string) error {
+	fs := flag.NewFlagSet("graph trace", flag.ContinueOnError)
+	kindStr := fs.String("kind", "derived_from,cites,source_ref", "comma-separated edge kinds to follow")
+	maxDepth := fs.Int("max-depth", 4, "max BFS depth")
+	if err := fs.Parse(reorderFlagsFirst(args)); err != nil {
+		return err
+	}
+	if fs.NArg() == 0 {
+		return errors.New("usage: hypha graph trace <object-id> [--kind k1,k2] [--max-depth N]")
+	}
+	objectID := fs.Arg(0)
+
+	root, err := resolveRoot("")
+	if err != nil {
+		return err
+	}
+	conn, err := openIndex(root)
+	if err != nil {
+		return err
+	}
+	defer conn.Close()
+
+	steps, err := graph.Trace(conn, objectID, parseEdgeKinds(*kindStr), *maxDepth)
+	if err != nil {
+		return err
+	}
+	enc := json.NewEncoder(os.Stdout)
+	enc.SetIndent("", "  ")
+	return enc.Encode(steps)
+}
+
+func parseEdgeKinds(s string) []types.EdgeKind {
+	if s == "" {
+		return nil
+	}
+	parts := splitCSV(s)
+	out := make([]types.EdgeKind, 0, len(parts))
+	for _, p := range parts {
+		out = append(out, types.EdgeKind(p))
+	}
+	return out
 }
 
 // --- receipts list ---------------------------------------------------------

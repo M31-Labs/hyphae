@@ -1,12 +1,15 @@
 package spore_test
 
 import (
+	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/odvcencio/hyphae/internal/identity"
 	"github.com/odvcencio/hyphae/internal/spore"
 	"github.com/odvcencio/hyphae/internal/types"
 )
@@ -433,5 +436,104 @@ func TestFilenameSlug(t *testing.T) {
 	expected := "2026-05-25-cloud-agent-7f3a.md"
 	if base != expected {
 		t.Errorf("filename = %q, want %q", base, expected)
+	}
+}
+
+// ─── Signing tests ────────────────────────────────────────────────────────────
+
+// makeTestIdentity generates a fresh identity for use in signing tests.
+func makeTestIdentity(t *testing.T) (identity.Identity, identity.PrivateKey) {
+	t.Helper()
+	id, priv, err := identity.Generate("m31labs", "testbot", "hypha://m31labs/research")
+	if err != nil {
+		t.Fatalf("identity.Generate: %v", err)
+	}
+	return id, priv
+}
+
+// resolverFor returns an IdentityResolver that recognises exactly one identity.
+func resolverFor(id identity.Identity) spore.IdentityResolver {
+	return func(uri string) (identity.Identity, error) {
+		if uri == id.ID {
+			return id, nil
+		}
+		return identity.Identity{}, fmt.Errorf("unknown identity %q", uri)
+	}
+}
+
+// TestSignVerifyRoundtrip verifies that Sign produces a document that Verify
+// accepts, and that the output contains a `signature:` block.
+func TestSignVerifyRoundtrip(t *testing.T) {
+	id, priv := makeTestIdentity(t)
+	resolver := resolverFor(id)
+
+	signed, err := spore.Sign(validSporeDoc, priv, id.ID)
+	if err != nil {
+		t.Fatalf("Sign returned error: %v", err)
+	}
+
+	if !strings.Contains(string(signed), "signature:") {
+		t.Error("signed output does not contain a `signature:` block")
+	}
+
+	if err := spore.Verify(signed, resolver); err != nil {
+		t.Fatalf("Verify returned error: %v", err)
+	}
+}
+
+// TestVerifyUnsigned verifies that Verify returns ErrUnsigned for a spore
+// without a signature block.
+func TestVerifyUnsigned(t *testing.T) {
+	resolver := func(uri string) (identity.Identity, error) {
+		return identity.Identity{}, nil
+	}
+
+	err := spore.Verify(validSporeDoc, resolver)
+	if !errors.Is(err, spore.ErrUnsigned) {
+		t.Fatalf("expected ErrUnsigned, got: %v", err)
+	}
+}
+
+// TestTamperedBody verifies that Verify detects a body modification after
+// signing.
+func TestTamperedBody(t *testing.T) {
+	id, priv := makeTestIdentity(t)
+	resolver := resolverFor(id)
+
+	signed, err := spore.Sign(validSporeDoc, priv, id.ID)
+	if err != nil {
+		t.Fatalf("Sign returned error: %v", err)
+	}
+
+	// Append a line to the body to tamper with the content.
+	tampered := append(signed, []byte("\ntampered\n")...)
+
+	err = spore.Verify(tampered, resolver)
+	if err == nil {
+		t.Fatal("Verify should have returned an error for tampered body, got nil")
+	}
+}
+
+// TestUnknownSigner verifies that Verify returns an error when the resolver
+// does not recognise the signing key URI.
+func TestUnknownSigner(t *testing.T) {
+	id, priv := makeTestIdentity(t)
+
+	signed, err := spore.Sign(validSporeDoc, priv, id.ID)
+	if err != nil {
+		t.Fatalf("Sign returned error: %v", err)
+	}
+
+	// Resolver that never resolves anything.
+	unknownResolver := func(uri string) (identity.Identity, error) {
+		return identity.Identity{}, fmt.Errorf("no such identity")
+	}
+
+	err = spore.Verify(signed, unknownResolver)
+	if err == nil {
+		t.Fatal("Verify should have returned an error for unknown signer, got nil")
+	}
+	if !strings.Contains(err.Error(), "unknown signer") {
+		t.Errorf("expected 'unknown signer' in error, got: %v", err)
 	}
 }

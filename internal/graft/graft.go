@@ -1,10 +1,10 @@
 // Package graft implements the graft operation: turning a reviewed spore into
 // canonical knowledge by applying its proposed_writes and proposed_edges.
 //
-// v0.1.1 scope:
-//   - Supported write kinds: append_section, insert_after.
-//   - Unsupported: replace_block, create_file, add_tag — returned as SkippedWrites.
-//   - mdpp.fmt is NOT run after edits (v0.1.2 TODO: wire in mdpp formatter).
+// v0.1.2 scope:
+//   - Supported write kinds: append_section, insert_after, replace_block,
+//     create_file, add_tag.
+//   - mdpp.fmt is NOT run after edits (v0.1.3 TODO: wire in mdpp formatter).
 //   - Receipts are returned, not persisted; the Phase 2 integrator persists them.
 package graft
 
@@ -22,6 +22,13 @@ import (
 	"github.com/odvcencio/hyphae/internal/types"
 	"github.com/odvcencio/mdpp"
 )
+
+// tagsFlowRe matches an inline flow-style tags line: tags: [a, b, c]
+var tagsFlowRe = regexp.MustCompile(`(?m)^(tags:\s*\[)(.*?)(\]\s*)$`)
+
+// tagsBlockRe matches a block-list tags section: "tags:\n  - item\n" etc.
+// We use a simpler approach: find the "tags:" line and its following "  - " entries.
+var tagsKeyRe = regexp.MustCompile(`(?m)^tags:\s*$`)
 
 // Result describes the outcome of a graft.
 type Result struct {
@@ -49,12 +56,8 @@ type SkippedWrite struct {
 	Reason    string
 }
 
-// unsupportedWriteKinds lists kinds deferred to v0.1.2.
-var unsupportedWriteKinds = map[string]bool{
-	"replace_block": true,
-	"create_file":   true,
-	"add_tag":       true,
-}
+// unsupportedWriteKinds lists kinds not yet implemented; empty as of v0.1.2.
+var unsupportedWriteKinds = map[string]bool{}
 
 // Apply loads spore <sporeID> from <spaceRoot>/inbox/agents/, applies its
 // proposed_writes and proposed_edges to canonical files under installRoot
@@ -114,7 +117,23 @@ func Apply(conn *sql.DB, installRoot, spaceRoot, sporeID, grafter string) (Resul
 			continue
 		}
 
-		if pw.Kind != "append_section" && pw.Kind != "insert_after" {
+		var (
+			aw          *AppliedWrite
+			skip        *SkippedWrite
+			edgeSrc     string
+			fatalErr    error
+		)
+
+		switch pw.Kind {
+		case "append_section", "insert_after":
+			aw, skip, edgeSrc, fatalErr = applyInsertWrite(pw, installRoot, rollback)
+		case "create_file":
+			aw, skip, edgeSrc, fatalErr = applyCreateFile(pw, installRoot)
+		case "replace_block":
+			aw, skip, edgeSrc, fatalErr = applyReplaceBlock(pw, installRoot, rollback)
+		case "add_tag":
+			aw, skip, edgeSrc, fatalErr = applyAddTag(pw, installRoot, rollback)
+		default:
 			skippedWrites = append(skippedWrites, SkippedWrite{
 				Kind:      pw.Kind,
 				TargetURI: pw.Target,
@@ -123,110 +142,24 @@ func Apply(conn *sql.DB, installRoot, spaceRoot, sporeID, grafter string) (Resul
 			continue
 		}
 
-		// Resolve target URI → canonical file path + anchor slug.
-		targetFile, anchorSlug, canonicalURI, err := resolveTarget(installRoot, pw.Target)
-		if err != nil {
-			skippedWrites = append(skippedWrites, SkippedWrite{
-				Kind:      pw.Kind,
-				TargetURI: pw.Target,
-				Reason:    fmt.Sprintf("target resolution failed: %v", err),
-			})
+		if fatalErr != nil {
+			return Result{}, fatalErr
+		}
+		if skip != nil {
+			skippedWrites = append(skippedWrites, *skip)
 			continue
 		}
 
-		// Check file existence.
-		if _, statErr := os.Stat(targetFile); os.IsNotExist(statErr) {
-			skippedWrites = append(skippedWrites, SkippedWrite{
-				Kind:      pw.Kind,
-				TargetURI: pw.Target,
-				Reason:    "target file not found",
-			})
-			continue
-		}
-
-		// Read original file (save for rollback before first modification).
-		origBytes, readErr := os.ReadFile(targetFile)
-		if readErr != nil {
-			skippedWrites = append(skippedWrites, SkippedWrite{
-				Kind:      pw.Kind,
-				TargetURI: pw.Target,
-				Reason:    fmt.Sprintf("read target file: %v", readErr),
-			})
-			continue
-		}
-		if _, saved := rollback[targetFile]; !saved {
-			rollback[targetFile] = origBytes
-		}
-
-		// Build the text to insert.
-		insertText, buildErr := buildInsertText(pw)
-		if buildErr != nil {
-			skippedWrites = append(skippedWrites, SkippedWrite{
-				Kind:      pw.Kind,
-				TargetURI: pw.Target,
-				Reason:    fmt.Sprintf("build insert text: %v", buildErr),
-			})
-			continue
-		}
-
-		// Locate heading and compute insertion byte offset.
-		insertOffset, locErr := locateInsertionPoint(origBytes, anchorSlug, pw.Kind)
-		if locErr != nil {
-			skippedWrites = append(skippedWrites, SkippedWrite{
-				Kind:      pw.Kind,
-				TargetURI: pw.Target,
-				Reason:    fmt.Sprintf("locate insertion point: %v", locErr),
-			})
-			continue
-		}
-
-		// Splice the text in.
-		newBytes := spliceBytes(origBytes, insertOffset, insertText)
-
-		// Re-parse to verify document still parses cleanly.
-		if _, parseErr := mdpp.Parse(newBytes); parseErr != nil {
-			skippedWrites = append(skippedWrites, SkippedWrite{
-				Kind:      pw.Kind,
-				TargetURI: pw.Target,
-				Reason:    fmt.Sprintf("post-edit re-parse failed: %v; rolled back", parseErr),
-			})
-			// Restore from rollback map — we already saved the original.
-			_ = os.WriteFile(targetFile, rollback[targetFile], 0o644)
-			// Remove from rollback so defer doesn't double-write it.
-			delete(rollback, targetFile)
-			continue
-		}
-
-		// Write the modified file.
-		if writeErr := os.WriteFile(targetFile, newBytes, 0o644); writeErr != nil {
-			// Return an unrecoverable error; defer will roll back.
-			return Result{}, fmt.Errorf("graft: write canonical file %s: %w", targetFile, writeErr)
-		}
-
-		// Track the inserted range.
-		insertRange := mdpp.Range{
-			StartByte: insertOffset,
-			EndByte:   insertOffset + len(insertText),
-		}
-
-		aw := AppliedWrite{
-			Kind:       pw.Kind,
-			TargetURI:  pw.Target,
-			TargetFile: targetFile,
-			InsertedAt: insertRange,
-		}
-		appliedWrites = append(appliedWrites, aw)
-
-		// Mark as touched (deduplicate).
-		if !containsString(touchedFiles, targetFile) {
-			touchedFiles = append(touchedFiles, targetFile)
+		appliedWrites = append(appliedWrites, *aw)
+		if !containsString(touchedFiles, aw.TargetFile) {
+			touchedFiles = append(touchedFiles, aw.TargetFile)
 		}
 
 		// ── Step 5: record derived_from edge for this write ──────────────────
 		edge := types.Edge{
-			ID:          fmt.Sprintf("edge:derived_from:%s->%s", canonicalURI, sporeID),
+			ID:          fmt.Sprintf("edge:derived_from:%s->%s", edgeSrc, sporeID),
 			Kind:        types.EdgeDerivedFrom,
-			SrcID:       canonicalURI,
+			SrcID:       edgeSrc,
 			DstID:       sporeID,
 			Confidence:  1.0,
 			Derivation:  "graft",
@@ -235,7 +168,6 @@ func Apply(conn *sql.DB, installRoot, spaceRoot, sporeID, grafter string) (Resul
 			CreatedAt:   now,
 		}
 		if dbErr := persistEdge(conn, edge); dbErr != nil {
-			// Return unrecoverable; defer will roll back.
 			return Result{}, fmt.Errorf("graft: persist derived_from edge: %w", dbErr)
 		}
 		appliedEdges = append(appliedEdges, edge)
@@ -313,6 +245,339 @@ func Apply(conn *sql.DB, installRoot, spaceRoot, sporeID, grafter string) (Resul
 		TouchedFiles:   touchedFiles,
 		Receipt:        receipt,
 	}, nil
+}
+
+// ─── write-kind handlers ──────────────────────────────────────────────────────
+
+// applyInsertWrite handles append_section and insert_after writes.
+// Returns (appliedWrite, nil, edgeSrc, nil) on success,
+// (nil, skippedWrite, "", nil) on a soft skip, or (nil, nil, "", err) on a
+// fatal (unrecoverable) error.
+func applyInsertWrite(
+	pw types.ProposedWrite,
+	installRoot string,
+	rollback map[string][]byte,
+) (*AppliedWrite, *SkippedWrite, string, error) {
+	skip := func(reason string) (*AppliedWrite, *SkippedWrite, string, error) {
+		return nil, &SkippedWrite{Kind: pw.Kind, TargetURI: pw.Target, Reason: reason}, "", nil
+	}
+
+	targetFile, anchorSlug, canonicalURI, err := resolveTarget(installRoot, pw.Target)
+	if err != nil {
+		return skip(fmt.Sprintf("target resolution failed: %v", err))
+	}
+	if _, statErr := os.Stat(targetFile); os.IsNotExist(statErr) {
+		return skip("target file not found")
+	}
+
+	origBytes, readErr := os.ReadFile(targetFile)
+	if readErr != nil {
+		return skip(fmt.Sprintf("read target file: %v", readErr))
+	}
+	if _, saved := rollback[targetFile]; !saved {
+		rollback[targetFile] = origBytes
+	}
+
+	insertText, buildErr := buildInsertText(pw)
+	if buildErr != nil {
+		return skip(fmt.Sprintf("build insert text: %v", buildErr))
+	}
+
+	insertOffset, locErr := locateInsertionPoint(origBytes, anchorSlug, pw.Kind)
+	if locErr != nil {
+		return skip(fmt.Sprintf("locate insertion point: %v", locErr))
+	}
+
+	newBytes := spliceBytes(origBytes, insertOffset, insertText)
+	if _, parseErr := mdpp.Parse(newBytes); parseErr != nil {
+		_ = os.WriteFile(targetFile, rollback[targetFile], 0o644)
+		delete(rollback, targetFile)
+		return skip(fmt.Sprintf("post-edit re-parse failed: %v; rolled back", parseErr))
+	}
+
+	if writeErr := os.WriteFile(targetFile, newBytes, 0o644); writeErr != nil {
+		return nil, nil, "", fmt.Errorf("graft: write canonical file %s: %w", targetFile, writeErr)
+	}
+
+	aw := &AppliedWrite{
+		Kind:       pw.Kind,
+		TargetURI:  pw.Target,
+		TargetFile: targetFile,
+		InsertedAt: mdpp.Range{StartByte: insertOffset, EndByte: insertOffset + len(insertText)},
+	}
+	return aw, nil, canonicalURI, nil
+}
+
+// applyCreateFile handles the create_file write kind.
+// Target URI is a space URI (hypha://<authority>/<name>); the actual path
+// comes from payload["path"]. payload["body"] is the full file content.
+func applyCreateFile(
+	pw types.ProposedWrite,
+	installRoot string,
+) (*AppliedWrite, *SkippedWrite, string, error) {
+	skip := func(reason string) (*AppliedWrite, *SkippedWrite, string, error) {
+		return nil, &SkippedWrite{Kind: pw.Kind, TargetURI: pw.Target, Reason: reason}, "", nil
+	}
+
+	relPath, _ := pw.Payload["path"].(string)
+	if relPath == "" {
+		return skip("create_file payload missing 'path'")
+	}
+	body, _ := pw.Payload["body"].(string)
+	if body == "" {
+		return skip("create_file payload missing 'body'")
+	}
+	// Ensure body ends with a newline.
+	if !strings.HasSuffix(body, "\n") {
+		body += "\n"
+	}
+
+	// Resolve space root directory from the space URI.
+	// URI format: hypha://<authority>/<name>  (no path component)
+	spaceDir, authority, name, resolveErr := resolveSpaceURI(installRoot, pw.Target)
+	if resolveErr != nil {
+		return skip(fmt.Sprintf("target resolution failed: %v", resolveErr))
+	}
+
+	absFile := filepath.Join(spaceDir, relPath)
+
+	// Refuse to overwrite.
+	if _, statErr := os.Stat(absFile); statErr == nil {
+		return skip("target file already exists; create_file refuses to overwrite")
+	}
+
+	// Create parent directories.
+	if mkdirErr := os.MkdirAll(filepath.Dir(absFile), 0o755); mkdirErr != nil {
+		return nil, nil, "", fmt.Errorf("graft: create directories for %s: %w", absFile, mkdirErr)
+	}
+
+	// Write the file.
+	if writeErr := os.WriteFile(absFile, []byte(body), 0o644); writeErr != nil {
+		return nil, nil, "", fmt.Errorf("graft: write new file %s: %w", absFile, writeErr)
+	}
+
+	// Verify it parses cleanly.
+	if _, parseErr := mdpp.Parse([]byte(body)); parseErr != nil {
+		_ = os.Remove(absFile)
+		return skip(fmt.Sprintf("new file does not parse: %v", parseErr))
+	}
+
+	// Build the canonical URI for this new file.
+	// Strip .md extension from relPath if present for the URI.
+	uriRelPath := strings.TrimSuffix(relPath, ".md")
+	fileCanonicalURI := fmt.Sprintf("hypha://%s/%s/%s", authority, name, uriRelPath)
+
+	aw := &AppliedWrite{
+		Kind:       pw.Kind,
+		TargetURI:  fileCanonicalURI,
+		TargetFile: absFile,
+		InsertedAt: mdpp.Range{StartByte: 0, EndByte: len(body)},
+	}
+	return aw, nil, fileCanonicalURI, nil
+}
+
+// applyReplaceBlock handles the replace_block write kind.
+// Target: hypha://<...>/<file>#<anchor>  identifying a heading whose section
+// content (heading line preserved, body replaced) will be spliced with new body.
+func applyReplaceBlock(
+	pw types.ProposedWrite,
+	installRoot string,
+	rollback map[string][]byte,
+) (*AppliedWrite, *SkippedWrite, string, error) {
+	skip := func(reason string) (*AppliedWrite, *SkippedWrite, string, error) {
+		return nil, &SkippedWrite{Kind: pw.Kind, TargetURI: pw.Target, Reason: reason}, "", nil
+	}
+
+	body, _ := pw.Payload["body"].(string)
+	if body == "" {
+		return skip("replace_block payload missing 'body'")
+	}
+	if !strings.HasSuffix(body, "\n") {
+		body += "\n"
+	}
+
+	targetFile, anchorSlug, canonicalURI, err := resolveTarget(installRoot, pw.Target)
+	if err != nil {
+		return skip(fmt.Sprintf("target resolution failed: %v", err))
+	}
+	if anchorSlug == "" {
+		return skip("replace_block requires an anchor in the target URI")
+	}
+	if _, statErr := os.Stat(targetFile); os.IsNotExist(statErr) {
+		return skip("target file not found")
+	}
+
+	origBytes, readErr := os.ReadFile(targetFile)
+	if readErr != nil {
+		return skip(fmt.Sprintf("read target file: %v", readErr))
+	}
+	if _, saved := rollback[targetFile]; !saved {
+		rollback[targetFile] = origBytes
+	}
+
+	// Parse and find the target heading.
+	doc, parseErr := mdpp.Parse(origBytes)
+	if parseErr != nil {
+		return skip(fmt.Sprintf("parse target file: %v", parseErr))
+	}
+	headings := doc.AST().Find(mdpp.NodeHeading)
+	if len(headings) == 0 {
+		return skip("no headings found in target file")
+	}
+
+	targetIdx := -1
+	for i, h := range headings {
+		if slugify(strings.TrimSpace(h.Text())) == anchorSlug {
+			targetIdx = i
+			break
+		}
+	}
+	if targetIdx < 0 {
+		return skip(fmt.Sprintf("anchor %q not found in target file", anchorSlug))
+	}
+
+	targetHeading := headings[targetIdx]
+	targetLevel := targetHeading.Level()
+
+	// Section start = start of the heading node.
+	sectionStart := targetHeading.Range.StartByte
+	// Section end = start of the next heading at same or higher level, or EOF.
+	sectionEnd := len(origBytes)
+	for i := targetIdx + 1; i < len(headings); i++ {
+		if headings[i].Level() <= targetLevel {
+			sectionEnd = headings[i].Range.StartByte
+			break
+		}
+	}
+
+	// Extract the heading line verbatim (preserve level and title).
+	headingLine := extractHeadingLine(origBytes, targetHeading.Range.StartByte)
+
+	// Build replacement: headingLine + body
+	replacement := headingLine + body
+
+	// Splice: original[:sectionStart] + replacement + original[sectionEnd:]
+	newBytes := make([]byte, 0, len(origBytes)-( sectionEnd-sectionStart)+len(replacement))
+	newBytes = append(newBytes, origBytes[:sectionStart]...)
+	newBytes = append(newBytes, []byte(replacement)...)
+	newBytes = append(newBytes, origBytes[sectionEnd:]...)
+
+	// Verify.
+	if _, reParseErr := mdpp.Parse(newBytes); reParseErr != nil {
+		_ = os.WriteFile(targetFile, rollback[targetFile], 0o644)
+		delete(rollback, targetFile)
+		return skip(fmt.Sprintf("post-edit re-parse failed: %v; rolled back", reParseErr))
+	}
+
+	if writeErr := os.WriteFile(targetFile, newBytes, 0o644); writeErr != nil {
+		return nil, nil, "", fmt.Errorf("graft: write canonical file %s: %w", targetFile, writeErr)
+	}
+
+	aw := &AppliedWrite{
+		Kind:       pw.Kind,
+		TargetURI:  pw.Target,
+		TargetFile: targetFile,
+		InsertedAt: mdpp.Range{StartByte: sectionStart, EndByte: sectionStart + len(replacement)},
+	}
+	return aw, nil, canonicalURI, nil
+}
+
+// applyAddTag handles the add_tag write kind.
+// Target: hypha://<...>/<file>  (no anchor).
+// payload["tag"] is the string tag to add to the frontmatter tags: list.
+func applyAddTag(
+	pw types.ProposedWrite,
+	installRoot string,
+	rollback map[string][]byte,
+) (*AppliedWrite, *SkippedWrite, string, error) {
+	skip := func(reason string) (*AppliedWrite, *SkippedWrite, string, error) {
+		return nil, &SkippedWrite{Kind: pw.Kind, TargetURI: pw.Target, Reason: reason}, "", nil
+	}
+
+	tag, _ := pw.Payload["tag"].(string)
+	if tag == "" {
+		return skip("add_tag payload missing 'tag'")
+	}
+
+	targetFile, _, canonicalURI, err := resolveTarget(installRoot, pw.Target)
+	if err != nil {
+		return skip(fmt.Sprintf("target resolution failed: %v", err))
+	}
+	if _, statErr := os.Stat(targetFile); os.IsNotExist(statErr) {
+		return skip("target file not found")
+	}
+
+	origBytes, readErr := os.ReadFile(targetFile)
+	if readErr != nil {
+		return skip(fmt.Sprintf("read target file: %v", readErr))
+	}
+
+	// Locate the frontmatter byte range.
+	doc, parseErr := mdpp.Parse(origBytes)
+	if parseErr != nil {
+		return skip(fmt.Sprintf("parse target file: %v", parseErr))
+	}
+
+	fmStart, fmEnd := 0, 0
+	for _, child := range doc.AST().Children {
+		if child.Type == mdpp.NodeFrontmatter {
+			fmStart = child.Range.StartByte
+			fmEnd = child.Range.EndByte
+			break
+		}
+	}
+	if fmEnd == 0 {
+		return skip("no frontmatter in target file")
+	}
+
+	// Check if tag already exists.
+	fm := doc.Frontmatter()
+	if existingTags, ok := fm["tags"]; ok && existingTags != nil {
+		if tagInList(existingTags, tag) {
+			return skip("tag already present")
+		}
+	}
+
+	// Save rollback AFTER confirming we'll modify.
+	if _, saved := rollback[targetFile]; !saved {
+		rollback[targetFile] = origBytes
+	}
+
+	fmSlice := origBytes[fmStart:fmEnd]
+	newFMSlice, editErr := addTagToFrontmatter(fmSlice, tag)
+	if editErr != nil {
+		return skip(fmt.Sprintf("edit frontmatter: %v", editErr))
+	}
+
+	newBytes := make([]byte, 0, len(origBytes)+len(newFMSlice)-len(fmSlice))
+	newBytes = append(newBytes, origBytes[:fmStart]...)
+	newBytes = append(newBytes, newFMSlice...)
+	newBytes = append(newBytes, origBytes[fmEnd:]...)
+
+	// Verify tag was actually added.
+	verDoc, verErr := mdpp.Parse(newBytes)
+	if verErr != nil {
+		_ = os.WriteFile(targetFile, rollback[targetFile], 0o644)
+		delete(rollback, targetFile)
+		return skip(fmt.Sprintf("post-edit re-parse failed: %v; rolled back", verErr))
+	}
+	if !tagInList(verDoc.Frontmatter()["tags"], tag) {
+		_ = os.WriteFile(targetFile, rollback[targetFile], 0o644)
+		delete(rollback, targetFile)
+		return skip("post-edit verification: tag not found in parsed frontmatter; rolled back")
+	}
+
+	if writeErr := os.WriteFile(targetFile, newBytes, 0o644); writeErr != nil {
+		return nil, nil, "", fmt.Errorf("graft: write canonical file %s: %w", targetFile, writeErr)
+	}
+
+	aw := &AppliedWrite{
+		Kind:       pw.Kind,
+		TargetURI:  pw.Target,
+		TargetFile: targetFile,
+		InsertedAt: mdpp.Range{StartByte: fmStart, EndByte: fmStart + len(newFMSlice)},
+	}
+	return aw, nil, canonicalURI, nil
 }
 
 // ─── helpers ──────────────────────────────────────────────────────────────────
@@ -664,6 +929,136 @@ func persistEdge(conn *sql.DB, e types.Edge) error {
 		nil,
 	)
 	return err
+}
+
+// resolveSpaceURI parses a space-level URI (hypha://<authority>/<name>) and
+// returns the absolute space directory, authority, and name.
+func resolveSpaceURI(installRoot, spaceURI string) (spaceDir, authority, name string, err error) {
+	if !strings.HasPrefix(spaceURI, "hypha://") {
+		return "", "", "", fmt.Errorf("space URI must start with hypha://, got %q", spaceURI)
+	}
+	rest := strings.TrimPrefix(spaceURI, "hypha://")
+	// Strip any anchor.
+	if idx := strings.LastIndex(rest, "#"); idx >= 0 {
+		rest = rest[:idx]
+	}
+	// Strip trailing slash.
+	rest = strings.TrimRight(rest, "/")
+	parts := strings.SplitN(rest, "/", 3)
+	if len(parts) < 2 {
+		return "", "", "", fmt.Errorf("space URI must have authority/name, got %q", spaceURI)
+	}
+	authority = parts[0]
+	name = parts[1]
+	dirName := fmt.Sprintf("%s-%s", authority, name)
+	spaceDir = filepath.Join(installRoot, "spaces", dirName)
+	return spaceDir, authority, name, nil
+}
+
+// extractHeadingLine returns the raw source line for the heading at startByte.
+// It reads from startByte to the next newline (inclusive) in src.
+func extractHeadingLine(src []byte, startByte int) string {
+	end := startByte
+	for end < len(src) && src[end] != '\n' {
+		end++
+	}
+	if end < len(src) {
+		end++ // include the newline
+	}
+	return string(src[startByte:end])
+}
+
+// tagInList reports whether tag exists in raw frontmatter tags value.
+// The value may be []any (list of strings) or a single string.
+func tagInList(raw any, tag string) bool {
+	switch v := raw.(type) {
+	case []any:
+		for _, item := range v {
+			if s, ok := item.(string); ok && s == tag {
+				return true
+			}
+		}
+	case []string:
+		for _, s := range v {
+			if s == tag {
+				return true
+			}
+		}
+	case string:
+		return v == tag
+	}
+	return false
+}
+
+// addTagToFrontmatter edits the raw frontmatter bytes (the full `---\n...\n---`
+// block) to add tag to the tags: list. It handles three cases:
+//
+//  1. Inline flow: tags: [a, b]         → tags: [a, b, newtag]
+//  2. Block list: tags:\n  - a\n  - b\n → ... + "  - newtag\n"
+//  3. Absent: inserts tags: [newtag] before the closing ---
+func addTagToFrontmatter(fmSlice []byte, tag string) ([]byte, error) {
+	s := string(fmSlice)
+
+	// Case 1: inline flow style — tags: [a, b] on a single line.
+	if tagsFlowRe.MatchString(s) {
+		result := tagsFlowRe.ReplaceAllStringFunc(s, func(match string) string {
+			sub := tagsFlowRe.FindStringSubmatch(match)
+			// sub[1] = "tags: [", sub[2] = "a, b", sub[3] = "]..."
+			existing := strings.TrimSpace(sub[2])
+			if existing == "" {
+				return sub[1] + tag + sub[3]
+			}
+			return sub[1] + existing + ", " + tag + sub[3]
+		})
+		return []byte(result), nil
+	}
+
+	// Case 2: block list style — tags: on its own line followed by "  - item" lines.
+	// Find "tags:" line (alone on its line).
+	if tagsKeyRe.MatchString(s) {
+		// Find the position of "tags:\n" and append a new "  - tag\n" item after
+		// all existing "  - " items in this block.
+		loc := tagsKeyRe.FindStringIndex(s)
+		if loc != nil {
+			insertPos := loc[1] // just after "tags:\n"
+			// Scan forward past all "  - ..." lines.
+			remaining := s[insertPos:]
+			consumed := 0
+			for {
+				// Lines that belong to the block-list value: start with whitespace + "- "
+				nlIdx := strings.IndexByte(remaining[consumed:], '\n')
+				if nlIdx < 0 {
+					break
+				}
+				line := remaining[consumed : consumed+nlIdx]
+				trimmed := strings.TrimLeft(line, " \t")
+				if strings.HasPrefix(trimmed, "- ") {
+					consumed += nlIdx + 1
+				} else {
+					break
+				}
+			}
+			// Insert "  - tag\n" at position insertPos+consumed.
+			absInsert := insertPos + consumed
+			result := s[:absInsert] + "  - " + tag + "\n" + s[absInsert:]
+			return []byte(result), nil
+		}
+	}
+
+	// Case 3: no tags: field — insert before closing "---".
+	// Find the closing "---" of the frontmatter.
+	// The fmSlice is "---\n...\n---\n"; find the last "---".
+	closingRe := regexp.MustCompile(`(?m)^---\s*$`)
+	locs := closingRe.FindAllStringIndex(s, -1)
+	if len(locs) < 2 {
+		// Malformed frontmatter; insert at end of slice just before final newline.
+		newLine := "tags: [" + tag + "]\n"
+		return []byte(s + newLine), nil
+	}
+	// Insert before the closing ---
+	closingStart := locs[len(locs)-1][0]
+	result := s[:closingStart] + "tags: [" + tag + "]\n" + s[closingStart:]
+	return []byte(result), nil
 }
 
 // slugify converts a heading text to a URL-safe slug matching parser.slugify.

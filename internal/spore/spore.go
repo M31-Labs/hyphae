@@ -315,6 +315,57 @@ func Submit(s types.Spore, spaceRoot string) (filePath string, r types.Receipt, 
 	return filePath, r, nil
 }
 
+// SubmitBytes is like Submit but writes the given source bytes verbatim
+// (after parsing for validation) rather than reconstructing from struct.
+// Use this when the input bytes must be preserved exactly — e.g. a
+// pre-signed spore where the signature covers the on-disk content.
+func SubmitBytes(source []byte, spaceRoot string) (filePath string, r types.Receipt, err error) {
+	s, verrs := Parse(source)
+	if len(verrs) > 0 {
+		msgs := make([]string, len(verrs))
+		for i, e := range verrs {
+			msgs[i] = e.Error()
+		}
+		return "", types.Receipt{}, fmt.Errorf("spore failed validation: %s", strings.Join(msgs, "; "))
+	}
+	if s.TokenCount > tokenCap {
+		return "", types.Receipt{}, fmt.Errorf("spore body exceeds hard cap (5000 tokens estimated)")
+	}
+
+	filename := sporeFilename(s)
+	inboxDir := filepath.Join(spaceRoot, "inbox", "agents")
+	if mkErr := os.MkdirAll(inboxDir, 0o755); mkErr != nil {
+		return "", types.Receipt{}, fmt.Errorf("failed to create inbox directory: %w", mkErr)
+	}
+	filePath = filepath.Join(inboxDir, filename)
+	if _, statErr := os.Stat(filePath); statErr == nil {
+		return "", types.Receipt{}, fmt.Errorf("spore already exists at %s", filePath)
+	}
+	if writeErr := os.WriteFile(filePath, source, 0o644); writeErr != nil {
+		return "", types.Receipt{}, fmt.Errorf("failed to write spore file: %w", writeErr)
+	}
+
+	hash := sha256.Sum256(source)
+	contentHash := fmt.Sprintf("%x", hash[:])
+
+	shortID := sporeShortID(s.ID)
+	dateStr := s.SubmittedAt.Format("2006-01-02")
+
+	r = types.Receipt{
+		ID:              fmt.Sprintf("hypha-receipt:%s:%s", dateStr, shortID),
+		SpaceID:         s.SpaceID,
+		SubjectID:       s.AgentID,
+		SubjectKind:     "agent",
+		Action:          "spore:create",
+		Status:          "accepted_for_review",
+		ContentHash:     contentHash,
+		CreatedAt:       time.Now().UTC(),
+		PermissionsUsed: []string{"spore:create"},
+		NextState:       "review",
+	}
+	return filePath, r, nil
+}
+
 // ─── helpers ──────────────────────────────────────────────────────────────────
 
 // stringField safely retrieves a string value from a map.

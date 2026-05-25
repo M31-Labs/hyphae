@@ -299,9 +299,9 @@ func TestApply_MissingTargetFile(t *testing.T) {
 	}
 }
 
-// ─── Test 3: unsupported write kinds → skipped ───────────────────────────────
+// ─── Test 3: unknown write kind → skipped ────────────────────────────────────
 
-func TestApply_UnsupportedWriteKind(t *testing.T) {
+func TestApply_UnknownWriteKind(t *testing.T) {
 	conn := openTestDB(t)
 	installRoot := t.TempDir()
 	spaceRoot := filepath.Join(installRoot, "spaces", "test-space")
@@ -309,15 +309,12 @@ func TestApply_UnsupportedWriteKind(t *testing.T) {
 	sporeID := "spore.2026-05-25.test.agent03"
 	agentID := "agent://test/agent"
 	proposedWritesYAML := `proposed_writes:
-  - kind: replace_block
-    target: hypha://test/space/concepts/target#section-one
-    body: replacement
-  - kind: create_file
-    target: hypha://test/space/concepts/new
-    body: new file
-  - kind: add_tag
+  - kind: frobnicate
     target: hypha://test/space/concepts/target
-    body: mytag
+    body: whatever
+  - kind: transmute_lead
+    target: hypha://test/space/concepts/target
+    body: gold
 `
 	makeSporeFile(t, spaceRoot, sporeID, agentID, "unreviewed", proposedWritesYAML)
 
@@ -326,16 +323,362 @@ func TestApply_UnsupportedWriteKind(t *testing.T) {
 		t.Fatalf("Apply returned error: %v", err)
 	}
 
-	if len(result.SkippedWrites) != 3 {
-		t.Errorf("SkippedWrites: want 3, got %d", len(result.SkippedWrites))
+	if len(result.SkippedWrites) != 2 {
+		t.Errorf("SkippedWrites: want 2, got %d", len(result.SkippedWrites))
 	}
 	for _, sw := range result.SkippedWrites {
-		if !strings.Contains(sw.Reason, "unsupported write kind in v0.1.1") {
-			t.Errorf("SkippedWrite %q Reason: want 'unsupported write kind in v0.1.1', got %q", sw.Kind, sw.Reason)
+		if !strings.Contains(sw.Reason, "unknown write kind") {
+			t.Errorf("SkippedWrite %q Reason: want 'unknown write kind', got %q", sw.Kind, sw.Reason)
 		}
 	}
 	if result.NewSporeStatus != "partial" {
 		t.Errorf("NewSporeStatus: want 'partial', got %q", result.NewSporeStatus)
+	}
+}
+
+// ─── Test 4: create_file ──────────────────────────────────────────────────────
+
+func TestApply_CreateFile(t *testing.T) {
+	conn := openTestDB(t)
+	installRoot := t.TempDir()
+	spaceRoot := filepath.Join(installRoot, "spaces", "test-space")
+
+	// Ensure the concepts dir exists under the space, but NOT the target file.
+	if err := os.MkdirAll(filepath.Join(installRoot, "spaces", "test-space", "concepts"), 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+
+	sporeID := "spore.2026-05-25.test.agent04"
+	agentID := "agent://test/agent"
+	proposedWritesYAML := `proposed_writes:
+  - kind: create_file
+    target: hypha://test/space
+    path: concepts/test-new.md
+    body: |
+      ---
+      mdpp: "0.1"
+      id: concept.test-new
+      type: concept
+      space: hypha://test/space
+      status: canonical
+      ---
+
+      # Test New Concept
+
+      This is a freshly created concept.
+`
+	makeSporeFile(t, spaceRoot, sporeID, agentID, "unreviewed", proposedWritesYAML)
+
+	result, err := Apply(conn, installRoot, spaceRoot, sporeID, "identity://odvcencio")
+	if err != nil {
+		t.Fatalf("Apply returned error: %v", err)
+	}
+
+	if len(result.AppliedWrites) != 1 {
+		t.Fatalf("AppliedWrites: want 1, got %d: %+v", len(result.AppliedWrites), result.SkippedWrites)
+	}
+	if len(result.SkippedWrites) != 0 {
+		t.Errorf("SkippedWrites: want 0, got %d: %+v", len(result.SkippedWrites), result.SkippedWrites)
+	}
+	if result.NewSporeStatus != "accepted" {
+		t.Errorf("NewSporeStatus: want 'accepted', got %q", result.NewSporeStatus)
+	}
+
+	aw := result.AppliedWrites[0]
+	if aw.Kind != "create_file" {
+		t.Errorf("AppliedWrite.Kind: want 'create_file', got %q", aw.Kind)
+	}
+
+	// File should exist and parse.
+	expectedPath := filepath.Join(installRoot, "spaces", "test-space", "concepts", "test-new.md")
+	data, readErr := os.ReadFile(expectedPath)
+	if readErr != nil {
+		t.Fatalf("created file not found at %s: %v", expectedPath, readErr)
+	}
+	if _, parseErr := func() (interface{}, error) {
+		_, err := os.Stat(expectedPath)
+		return nil, err
+	}(); parseErr != nil {
+		t.Errorf("created file stat failed: %v", parseErr)
+	}
+	if !strings.Contains(string(data), "Test New Concept") {
+		t.Errorf("created file missing expected content; got:\n%s", data)
+	}
+
+	// TargetFile should be the absolute path.
+	if aw.TargetFile != expectedPath {
+		t.Errorf("AppliedWrite.TargetFile: want %q, got %q", expectedPath, aw.TargetFile)
+	}
+	// InsertedAt should span the whole file.
+	if aw.InsertedAt.StartByte != 0 {
+		t.Errorf("InsertedAt.StartByte: want 0, got %d", aw.InsertedAt.StartByte)
+	}
+	if aw.InsertedAt.EndByte == 0 {
+		t.Error("InsertedAt.EndByte: want >0, got 0")
+	}
+
+	// TouchedFiles should include the new path.
+	if len(result.TouchedFiles) != 1 || result.TouchedFiles[0] != expectedPath {
+		t.Errorf("TouchedFiles: want [%s], got %v", expectedPath, result.TouchedFiles)
+	}
+
+	// Edge should be in DB.
+	var count int
+	if err := conn.QueryRow(`SELECT COUNT(*) FROM edges WHERE dst_id = ? AND kind = 'derived_from'`, sporeID).Scan(&count); err != nil {
+		t.Fatalf("edge count query: %v", err)
+	}
+	if count != 1 {
+		t.Errorf("derived_from edges: want 1, got %d", count)
+	}
+}
+
+// ─── Test 5: replace_block ────────────────────────────────────────────────────
+
+func TestApply_ReplaceBlock(t *testing.T) {
+	conn := openTestDB(t)
+	installRoot := t.TempDir()
+	spaceRoot := filepath.Join(installRoot, "spaces", "test-space")
+
+	canonicalContent := `---
+mdpp: "0.1"
+id: concept.target
+type: concept
+space: hypha://test/space
+status: canonical
+---
+
+# Target Concept
+
+## Section One
+
+Old content that will be replaced.
+
+More old content.
+
+## Section Two
+
+Sibling section stays untouched.
+
+## Section Three
+
+Another sibling.
+`
+	canonicalFile := makeCanonicalFile(t,
+		filepath.Join(installRoot, "spaces"),
+		"test-space/concepts/target.md",
+		canonicalContent,
+	)
+
+	sporeID := "spore.2026-05-25.test.agent05"
+	agentID := "agent://test/agent"
+	proposedWritesYAML := `proposed_writes:
+  - kind: replace_block
+    target: hypha://test/space/concepts/target#section-one
+    body: |
+      This is the replacement body.
+
+      It has multiple paragraphs.
+`
+	makeSporeFile(t, spaceRoot, sporeID, agentID, "unreviewed", proposedWritesYAML)
+
+	result, err := Apply(conn, installRoot, spaceRoot, sporeID, "identity://odvcencio")
+	if err != nil {
+		t.Fatalf("Apply returned error: %v", err)
+	}
+
+	if len(result.AppliedWrites) != 1 {
+		t.Fatalf("AppliedWrites: want 1, got %d; skipped: %+v", len(result.AppliedWrites), result.SkippedWrites)
+	}
+	if result.NewSporeStatus != "accepted" {
+		t.Errorf("NewSporeStatus: want 'accepted', got %q", result.NewSporeStatus)
+	}
+
+	newContent, readErr := os.ReadFile(canonicalFile)
+	if readErr != nil {
+		t.Fatalf("read canonical file: %v", readErr)
+	}
+	s := string(newContent)
+
+	// New body is present.
+	if !strings.Contains(s, "This is the replacement body.") {
+		t.Errorf("replacement body missing from file:\n%s", s)
+	}
+	// Old content is gone.
+	if strings.Contains(s, "Old content that will be replaced.") {
+		t.Errorf("old content still present in file:\n%s", s)
+	}
+	// Heading line preserved.
+	if !strings.Contains(s, "## Section One\n") {
+		t.Errorf("heading line not preserved in file:\n%s", s)
+	}
+	// Sibling sections untouched.
+	if !strings.Contains(s, "## Section Two\n") {
+		t.Errorf("## Section Two missing from file:\n%s", s)
+	}
+	if !strings.Contains(s, "Sibling section stays untouched.") {
+		t.Errorf("sibling section content missing from file:\n%s", s)
+	}
+	if !strings.Contains(s, "## Section Three\n") {
+		t.Errorf("## Section Three missing from file:\n%s", s)
+	}
+
+	// Edge in DB.
+	var count int
+	if err := conn.QueryRow(`SELECT COUNT(*) FROM edges WHERE dst_id = ? AND kind = 'derived_from'`, sporeID).Scan(&count); err != nil {
+		t.Fatalf("edge count query: %v", err)
+	}
+	if count != 1 {
+		t.Errorf("derived_from edges: want 1, got %d", count)
+	}
+}
+
+// ─── Test 6: add_tag ──────────────────────────────────────────────────────────
+
+func TestApply_AddTag(t *testing.T) {
+	conn := openTestDB(t)
+	installRoot := t.TempDir()
+	spaceRoot := filepath.Join(installRoot, "spaces", "test-space")
+
+	canonicalContent := `---
+mdpp: "0.1"
+id: concept.target
+type: concept
+space: hypha://test/space
+status: canonical
+tags: [existing-tag, another-tag]
+---
+
+# Target Concept
+
+Body text unchanged.
+`
+	canonicalFile := makeCanonicalFile(t,
+		filepath.Join(installRoot, "spaces"),
+		"test-space/concepts/target.md",
+		canonicalContent,
+	)
+
+	sporeID := "spore.2026-05-25.test.agent06"
+	agentID := "agent://test/agent"
+	proposedWritesYAML := `proposed_writes:
+  - kind: add_tag
+    target: hypha://test/space/concepts/target
+    tag: new-tag
+`
+	makeSporeFile(t, spaceRoot, sporeID, agentID, "unreviewed", proposedWritesYAML)
+
+	result, err := Apply(conn, installRoot, spaceRoot, sporeID, "identity://odvcencio")
+	if err != nil {
+		t.Fatalf("Apply returned error: %v", err)
+	}
+
+	if len(result.AppliedWrites) != 1 {
+		t.Fatalf("AppliedWrites: want 1, got %d; skipped: %+v", len(result.AppliedWrites), result.SkippedWrites)
+	}
+	if result.NewSporeStatus != "accepted" {
+		t.Errorf("NewSporeStatus: want 'accepted', got %q", result.NewSporeStatus)
+	}
+
+	// Verify tag is present.
+	data, readErr := os.ReadFile(canonicalFile)
+	if readErr != nil {
+		t.Fatalf("read canonical file: %v", readErr)
+	}
+	newContent := string(data)
+	if !strings.Contains(newContent, "new-tag") {
+		t.Errorf("new tag not present in file:\n%s", newContent)
+	}
+	// Existing tags should still be there.
+	if !strings.Contains(newContent, "existing-tag") {
+		t.Errorf("existing-tag missing after add_tag:\n%s", newContent)
+	}
+	if !strings.Contains(newContent, "another-tag") {
+		t.Errorf("another-tag missing after add_tag:\n%s", newContent)
+	}
+	// Body text unchanged.
+	if !strings.Contains(newContent, "Body text unchanged.") {
+		t.Errorf("body text was changed:\n%s", newContent)
+	}
+	// Other frontmatter fields unchanged.
+	if !strings.Contains(newContent, "status: canonical") {
+		t.Errorf("status field changed:\n%s", newContent)
+	}
+
+	// Edge in DB.
+	var count int
+	if err := conn.QueryRow(`SELECT COUNT(*) FROM edges WHERE dst_id = ? AND kind = 'derived_from'`, sporeID).Scan(&count); err != nil {
+		t.Fatalf("edge count query: %v", err)
+	}
+	if count != 1 {
+		t.Errorf("derived_from edges: want 1, got %d", count)
+	}
+}
+
+// ─── Test 7: idempotent add_tag ───────────────────────────────────────────────
+
+func TestApply_AddTag_Idempotent(t *testing.T) {
+	conn := openTestDB(t)
+	installRoot := t.TempDir()
+	spaceRoot := filepath.Join(installRoot, "spaces", "test-space")
+
+	canonicalContent := `---
+mdpp: "0.1"
+id: concept.target
+type: concept
+space: hypha://test/space
+status: canonical
+tags: [existing-tag, already-there]
+---
+
+# Target Concept
+
+Body text.
+`
+	canonicalFile := makeCanonicalFile(t,
+		filepath.Join(installRoot, "spaces"),
+		"test-space/concepts/target.md",
+		canonicalContent,
+	)
+
+	sporeID := "spore.2026-05-25.test.agent07"
+	agentID := "agent://test/agent"
+	proposedWritesYAML := `proposed_writes:
+  - kind: add_tag
+    target: hypha://test/space/concepts/target
+    tag: already-there
+`
+	makeSporeFile(t, spaceRoot, sporeID, agentID, "unreviewed", proposedWritesYAML)
+
+	result, err := Apply(conn, installRoot, spaceRoot, sporeID, "identity://odvcencio")
+	if err != nil {
+		t.Fatalf("Apply returned error: %v", err)
+	}
+
+	// Tag already present → skipped, not failed.
+	if len(result.AppliedWrites) != 0 {
+		t.Errorf("AppliedWrites: want 0, got %d", len(result.AppliedWrites))
+	}
+	if len(result.SkippedWrites) != 1 {
+		t.Fatalf("SkippedWrites: want 1, got %d", len(result.SkippedWrites))
+	}
+	sw := result.SkippedWrites[0]
+	if sw.Kind != "add_tag" {
+		t.Errorf("SkippedWrite.Kind: want 'add_tag', got %q", sw.Kind)
+	}
+	if sw.Reason != "tag already present" {
+		t.Errorf("SkippedWrite.Reason: want 'tag already present', got %q", sw.Reason)
+	}
+	if result.NewSporeStatus != "partial" {
+		t.Errorf("NewSporeStatus: want 'partial', got %q", result.NewSporeStatus)
+	}
+
+	// File must be unchanged.
+	data, readErr := os.ReadFile(canonicalFile)
+	if readErr != nil {
+		t.Fatalf("read canonical file: %v", readErr)
+	}
+	if string(data) != canonicalContent {
+		t.Errorf("file was modified despite tag already present;\ngot:\n%s\nwant:\n%s", data, canonicalContent)
 	}
 }
 
