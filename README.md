@@ -1,12 +1,28 @@
 # Hyphae
 
-A federated Markdown++ knowledge graph for agents.
+A federated Markdown++ knowledge graph for agents (and the humans they work with).
 
-Hyphae is the shared memory layer ephemeral and persistent agents report into
-and reason from. The source of truth is `.md` files on disk; the graph is
-derived; every edge carries provenance. Spaces federate. Contributions land
-as **spores** in a space inbox and become canonical via an explicit **graft**
-operation.
+Hyphae is an efficient, OSS knowledge base — usable as a drop-in for the kinds
+of tools teams reach for when they want a personal or shared vault of plain
+`.md` notes, but built from the ground up to be read and written by agents as
+a first-class concern.
+
+- **Plain `.md` files** — your knowledge stays portable, diffable, and editable
+  in any tool that opens markdown.
+- **Typed objects + a real graph** under the surface — concepts, decisions,
+  initiatives, lessons, specs, plans, spores — addressable by stable URIs.
+- **Token-budgeted recall by default** — BM25 over SQLite FTS5, no embeddings
+  required to start. Agents reach for it because each call costs ~hundreds of
+  tokens, not thousands.
+- **Contribution protocol** — ephemeral agents submit **spores** to a space
+  inbox; humans or trusted agents **graft** them into canonical knowledge.
+  Every contribution carries identity, provenance, and a receipt.
+- **Federated, local-first** — each space is a directory and (optionally) a
+  git repo. Spaces subscribe to each other; the org gets a shared memory layer
+  that survives any one machine or contributor.
+
+The source of truth is `.md` files on disk; the graph is derived; every edge
+carries provenance.
 
 ## Status
 
@@ -25,10 +41,10 @@ Today you can:
 Coming next (v0.1.1+): Ed25519 signing, graft engine, HTTP API, alignment
 (`change:assess`), pulse aggregation.
 
-The full spec — concepts, decisions, initiatives, protocols, integrations,
-skills — lives at `~/.hyphae/spaces/m31labs-hyphae/`, dogfooded as a Hyphae
-space. See [`concepts/install-layout.md`](https://github.com/M31-Labs/hyphae/wiki)
-for the `~/.hyphae/` convention.
+The canonical Hyphae space (concepts, decisions, initiatives, protocols, skills)
+is installed under `~/.hyphae/spaces/m31labs-hyphae/`. The binary in this repo
+operates on whatever space tree you point it at via `HYPHAE_HOME` (default
+`~/.hyphae`).
 
 ## Install
 
@@ -101,9 +117,9 @@ Hyphae knowledge lives in a centralized install root, not in source repos:
   .index/hyphae.db                        derived SQLite index (rebuildable)
 ```
 
-This repo is the **binary**. The **knowledge** lives in `~/.hyphae/`. See
-[`decisions/0006-install-layout.md`](https://github.com/M31-Labs/hyphae/wiki)
-for the rationale.
+This repo is the **binary**. The **knowledge** lives in `~/.hyphae/` —
+deliberately outside any source repo, so it can be backed up, synced, and
+federated independently of any one codebase.
 
 ## Architecture
 
