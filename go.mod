@@ -3,13 +3,13 @@ module github.com/odvcencio/hyphae
 go 1.26
 
 require (
+	github.com/google/uuid v1.6.0
 	github.com/odvcencio/mdpp v0.0.0
 	modernc.org/sqlite v1.34.5
 )
 
 require (
 	github.com/dustin/go-humanize v1.0.1 // indirect
-	github.com/google/uuid v1.6.0 // indirect
 	github.com/mattn/go-isatty v0.0.20 // indirect
 	github.com/ncruces/go-strftime v0.1.9 // indirect
 	github.com/odvcencio/gotreesitter v0.18.0 // indirect

@@ -8,10 +8,12 @@ package spore
 import (
 	"bytes"
 	"crypto/sha256"
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strings"
 	"time"
 	"unicode"
@@ -634,8 +636,16 @@ func reconstructSource(s types.Spore) []byte {
 			if w.Target != "" {
 				sb.WriteString(fmt.Sprintf("    target: %s\n", w.Target))
 			}
-			if heading, ok := w.Payload["heading"].(string); ok && heading != "" {
-				sb.WriteString(fmt.Sprintf("    heading: %q\n", heading))
+			// Emit every payload key (sorted for determinism). This preserves
+			// arbitrary fields the consumer cares about — `body`, `heading`,
+			// any others — without spore having to know each one by name.
+			keys := make([]string, 0, len(w.Payload))
+			for k := range w.Payload {
+				keys = append(keys, k)
+			}
+			sort.Strings(keys)
+			for _, k := range keys {
+				writePayloadField(&sb, k, w.Payload[k])
 			}
 		}
 	}
@@ -645,4 +655,29 @@ func reconstructSource(s types.Spore) []byte {
 		sb.WriteString(s.Body)
 	}
 	return []byte(sb.String())
+}
+
+// writePayloadField emits a `<indent>key: value` line under proposed_writes.
+// Multi-line strings use YAML's literal block scalar (`|`); single-line
+// strings use double-quoted form (escapes handled by %q); non-string values
+// fall back to JSON. Indented under "    " to nest under the proposed_writes
+// list item.
+func writePayloadField(sb *strings.Builder, key string, value any) {
+	switch v := value.(type) {
+	case string:
+		if strings.Contains(v, "\n") {
+			sb.WriteString(fmt.Sprintf("    %s: |\n", key))
+			for _, line := range strings.Split(strings.TrimRight(v, "\n"), "\n") {
+				sb.WriteString(fmt.Sprintf("      %s\n", line))
+			}
+			return
+		}
+		sb.WriteString(fmt.Sprintf("    %s: %q\n", key, v))
+	default:
+		data, err := json.Marshal(v)
+		if err != nil {
+			return
+		}
+		sb.WriteString(fmt.Sprintf("    %s: %s\n", key, data))
+	}
 }

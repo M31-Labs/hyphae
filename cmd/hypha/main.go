@@ -1,14 +1,19 @@
 // Command hypha is the Hyphae CLI.
 //
-// v0.1 surface:
+// v0.1.1 surface:
 //
-//	hypha index rebuild              walk install root, populate SQLite
-//	hypha recall <query>             FTS5 search, summary+anchors output
-//	hypha spore submit <file>        validate, write to inbox, emit receipt
-//	hypha cap issue ...              issue a local (unsigned) capability token
+//	hypha index    rebuild              walk install root, populate SQLite
+//	hypha recall   <query>              FTS5 search, summary+anchors output
+//	hypha spore    submit <file>        validate, write to inbox, emit + persist receipt
+//	hypha cap      issue ...            issue a local capability token + persist receipt
+//	hypha identity init --name X ...    generate an Ed25519 identity + .key sidecar
+//	hypha identity list                 list identities in the org catalog
+//	hypha graft    <spore-id> --as <id> apply spore proposed_writes to canonical files
+//	hypha receipts list [filters]       query the audit log
 package main
 
 import (
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -20,19 +25,26 @@ import (
 
 	"github.com/odvcencio/hyphae/internal/capability"
 	"github.com/odvcencio/hyphae/internal/db"
+	"github.com/odvcencio/hyphae/internal/graft"
+	"github.com/odvcencio/hyphae/internal/identity"
 	"github.com/odvcencio/hyphae/internal/parser"
 	"github.com/odvcencio/hyphae/internal/recall"
+	"github.com/odvcencio/hyphae/internal/receipts"
 	"github.com/odvcencio/hyphae/internal/spore"
 	"github.com/odvcencio/hyphae/internal/types"
 )
 
-const usage = `hypha — Hyphae v0.1 CLI
+const usage = `hypha — Hyphae v0.1.1 CLI
 
 Usage:
-  hypha index   rebuild [--root <path>]
-  hypha recall  <query> [--limit N] [--max-tokens N] [--shape headline|summary+anchors] [--format json|text]
-  hypha spore   submit <file>
-  hypha cap     issue --subject <uri> --space <uri> [--permissions p1,p2] [--expires 24h]
+  hypha index    rebuild [--root <path>]
+  hypha recall   <query> [--limit N] [--max-tokens N] [--shape headline|summary+anchors] [--format json|text]
+  hypha spore    submit <file>
+  hypha cap      issue --subject <uri> --space <uri> [--permissions p1,p2] [--expires 24h]
+  hypha identity init --name <name> --authority <auth> --space <uri> [--expires 1y]
+  hypha identity list
+  hypha graft    <spore-id> --as <identity-uri> [--space <hypha-uri>]
+  hypha receipts list [--space <uri>] [--subject <uri>] [--action <name>] [--since 24h] [--limit N]
 
 Environment:
   HYPHAE_HOME    install root (default: $HOME/.hyphae)
@@ -63,6 +75,12 @@ func run(args []string) error {
 		return cmdSpore(rest)
 	case "cap":
 		return cmdCap(rest)
+	case "identity":
+		return cmdIdentity(rest)
+	case "graft":
+		return cmdGraft(rest)
+	case "receipts":
+		return cmdReceipts(rest)
 	default:
 		return fmt.Errorf("unknown command %q (try `hypha help`)", group)
 	}
@@ -212,6 +230,16 @@ func cmdSpore(args []string) error {
 		return fmt.Errorf("submit: %w", err)
 	}
 
+	// Persist the receipt to the audit log.
+	if conn, dbErr := openIndex(root); dbErr == nil {
+		defer conn.Close()
+		if wErr := receipts.Write(conn, receipt); wErr != nil && !errors.Is(wErr, receipts.ErrAlreadyExists) {
+			fmt.Fprintf(os.Stderr, "warn: failed to persist receipt: %v\n", wErr)
+		}
+	} else {
+		fmt.Fprintf(os.Stderr, "warn: receipt not persisted (index unavailable: %v)\n", dbErr)
+	}
+
 	enc := json.NewEncoder(os.Stdout)
 	enc.SetIndent("", "  ")
 	if err := enc.Encode(map[string]any{
@@ -274,12 +302,262 @@ func cmdCap(args []string) error {
 		return err
 	}
 
+	// Record an audit receipt for the issuance.
+	rcpt := types.Receipt{
+		ID:              "hypha-receipt:" + time.Now().UTC().Format("2006-01-02") + ":capissue-" + cap.ID,
+		SpaceID:         cap.SpaceID,
+		SubjectID:       cap.Subject,
+		SubjectKind:     "agent",
+		Action:          "cap:issue",
+		Status:          "issued",
+		ContentHash:     "",
+		IdentityID:      cap.IssuedBy,
+		CreatedAt:       cap.IssuedAt,
+		PermissionsUsed: []string{"permission:grant"},
+		NextState:       "active",
+	}
+	if wErr := receipts.Write(conn, rcpt); wErr != nil && !errors.Is(wErr, receipts.ErrAlreadyExists) {
+		fmt.Fprintf(os.Stderr, "warn: failed to persist cap:issue receipt: %v\n", wErr)
+	}
+
 	enc := json.NewEncoder(os.Stdout)
 	enc.SetIndent("", "  ")
 	return enc.Encode(map[string]any{
 		"token":      cap.ID,
 		"capability": cap,
 	})
+}
+
+// --- identity --------------------------------------------------------------
+
+func cmdIdentity(args []string) error {
+	if len(args) == 0 {
+		return errors.New("usage: hypha identity init|list")
+	}
+	switch args[0] {
+	case "init":
+		return cmdIdentityInit(args[1:])
+	case "list":
+		return cmdIdentityList(args[1:])
+	default:
+		return fmt.Errorf("unknown identity subcommand %q", args[0])
+	}
+}
+
+func cmdIdentityInit(args []string) error {
+	fs := flag.NewFlagSet("identity init", flag.ContinueOnError)
+	name := fs.String("name", "", "bare username (e.g. odvcencio)")
+	authority := fs.String("authority", "", "URI authority (e.g. m31labs)")
+	space := fs.String("space", "", "owning space URI (e.g. hypha://m31labs/hyphae)")
+	if err := fs.Parse(reorderFlagsFirst(args)); err != nil {
+		return err
+	}
+	if *name == "" || *authority == "" || *space == "" {
+		return errors.New("--name, --authority, and --space are required")
+	}
+
+	root, err := resolveRoot("")
+	if err != nil {
+		return err
+	}
+	dir := filepath.Join(root, ".catalog", "identities")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return fmt.Errorf("mkdir %s: %w", dir, err)
+	}
+
+	id, priv, err := identity.Generate(*authority, *name, *space)
+	if err != nil {
+		return fmt.Errorf("generate: %w", err)
+	}
+	mdPath, keyPath, err := identity.Save(dir, id, priv)
+	if err != nil {
+		return fmt.Errorf("save: %w", err)
+	}
+
+	enc := json.NewEncoder(os.Stdout)
+	enc.SetIndent("", "  ")
+	return enc.Encode(map[string]any{
+		"identity":     id,
+		"identityFile": mdPath,
+		"privateKey":   keyPath + " (mode 0600)",
+	})
+}
+
+func cmdIdentityList(args []string) error {
+	_ = args
+	root, err := resolveRoot("")
+	if err != nil {
+		return err
+	}
+	dir := filepath.Join(root, ".catalog", "identities")
+
+	list, err := identity.List(dir)
+	if err != nil {
+		return err
+	}
+	if len(list) == 0 {
+		fmt.Fprintf(os.Stderr, "no identities found at %s\n", dir)
+		return nil
+	}
+	enc := json.NewEncoder(os.Stdout)
+	enc.SetIndent("", "  ")
+	return enc.Encode(list)
+}
+
+// --- graft -----------------------------------------------------------------
+
+func cmdGraft(args []string) error {
+	if len(args) == 0 {
+		return errors.New("usage: hypha graft <spore-id> --as <identity-uri> [--space <hypha-uri>]")
+	}
+	fs := flag.NewFlagSet("graft", flag.ContinueOnError)
+	grafter := fs.String("as", "", "grafter identity URI (recorded in the receipt)")
+	spaceURI := fs.String("space", "", "space URI override (auto-detected from inbox if omitted)")
+	if err := fs.Parse(reorderFlagsFirst(args)); err != nil {
+		return err
+	}
+	if fs.NArg() == 0 {
+		return errors.New("usage: hypha graft <spore-id> --as <identity-uri> [--space <hypha-uri>]")
+	}
+	sporeID := fs.Arg(0)
+	if *grafter == "" {
+		return errors.New("--as <identity-uri> is required")
+	}
+
+	root, err := resolveRoot("")
+	if err != nil {
+		return err
+	}
+	conn, err := openIndex(root)
+	if err != nil {
+		return err
+	}
+	defer conn.Close()
+
+	// Find the spore's space root: either explicit --space, or scan all spaces.
+	var spaceRoot string
+	if *spaceURI != "" {
+		spaceRoot, err = spaceURIToPath(root, *spaceURI)
+		if err != nil {
+			return err
+		}
+	} else {
+		spaceRoot, err = findSporeSpaceRoot(root, sporeID)
+		if err != nil {
+			return err
+		}
+	}
+
+	result, err := graft.Apply(conn, root, spaceRoot, sporeID, *grafter)
+	if err != nil {
+		return fmt.Errorf("graft: %w", err)
+	}
+
+	// Persist the graft receipt to the audit log.
+	if wErr := receipts.Write(conn, result.Receipt); wErr != nil && !errors.Is(wErr, receipts.ErrAlreadyExists) {
+		fmt.Fprintf(os.Stderr, "warn: failed to persist graft receipt: %v\n", wErr)
+	}
+
+	enc := json.NewEncoder(os.Stdout)
+	enc.SetIndent("", "  ")
+	if err := enc.Encode(result); err != nil {
+		return err
+	}
+	fmt.Fprintf(os.Stderr, "\nGrafted %s → status: %s (applied %d, skipped %d)\n",
+		result.SporeID, result.NewSporeStatus, len(result.AppliedWrites), len(result.SkippedWrites))
+	return nil
+}
+
+// findSporeSpaceRoot scans every space's inbox/agents/ for a spore whose
+// frontmatter id matches sporeID. Returns the space root on first match.
+func findSporeSpaceRoot(root, sporeID string) (string, error) {
+	spaces, err := listSpaces(root)
+	if err != nil {
+		return "", err
+	}
+	for _, s := range spaces {
+		inbox := filepath.Join(s.Path, "inbox", "agents")
+		entries, err := os.ReadDir(inbox)
+		if err != nil {
+			continue
+		}
+		for _, e := range entries {
+			if e.IsDir() || !strings.HasSuffix(e.Name(), ".md") {
+				continue
+			}
+			data, err := os.ReadFile(filepath.Join(inbox, e.Name()))
+			if err != nil {
+				continue
+			}
+			if bytesContainsID(data, sporeID) {
+				return s.Path, nil
+			}
+		}
+	}
+	return "", fmt.Errorf("spore %q not found in any installed space's inbox/agents/ (try --space)", sporeID)
+}
+
+// bytesContainsID looks for a frontmatter `id: <sporeID>` line. Simple
+// substring match is enough for v0.1.1 — collision risk is negligible.
+func bytesContainsID(data []byte, sporeID string) bool {
+	return strings.Contains(string(data), "id: "+sporeID+"\n") ||
+		strings.Contains(string(data), "id: "+sporeID+"\r\n")
+}
+
+// --- receipts list ---------------------------------------------------------
+
+func cmdReceipts(args []string) error {
+	if len(args) == 0 || args[0] != "list" {
+		return errors.New("usage: hypha receipts list [--space <uri>] [--subject <uri>] [--action <name>] [--since 24h] [--limit N]")
+	}
+	fs := flag.NewFlagSet("receipts list", flag.ContinueOnError)
+	spaceID := fs.String("space", "", "filter by space URI")
+	subject := fs.String("subject", "", "filter by subject id")
+	action := fs.String("action", "", "filter by action (e.g. spore:create, graft, cap:issue)")
+	since := fs.String("since", "", "Go duration; receipts created within the last N units")
+	limit := fs.Int("limit", 50, "max results")
+	if err := fs.Parse(reorderFlagsFirst(args[1:])); err != nil {
+		return err
+	}
+
+	var sinceT time.Time
+	if *since != "" {
+		d, err := time.ParseDuration(*since)
+		if err != nil {
+			return fmt.Errorf("--since %q: %w", *since, err)
+		}
+		sinceT = time.Now().UTC().Add(-d)
+	}
+
+	root, err := resolveRoot("")
+	if err != nil {
+		return err
+	}
+	conn, err := openIndex(root)
+	if err != nil {
+		return err
+	}
+	defer conn.Close()
+
+	out, err := receipts.List(conn, receipts.ListFilter{
+		SpaceID:   *spaceID,
+		SubjectID: *subject,
+		Action:    *action,
+		Since:     sinceT,
+		Limit:     *limit,
+	})
+	if err != nil {
+		return err
+	}
+
+	enc := json.NewEncoder(os.Stdout)
+	enc.SetIndent("", "  ")
+	return enc.Encode(out)
+}
+
+// openIndex opens the SQLite index at the default path under root.
+func openIndex(root string) (*sql.DB, error) {
+	return db.Open(filepath.Join(root, ".index", "hyphae.db"))
 }
 
 // --- helpers ---------------------------------------------------------------

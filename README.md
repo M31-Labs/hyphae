@@ -26,7 +26,7 @@ carries provenance.
 
 ## Status
 
-**v0.1** — design phase complete, first cut of the binary works end-to-end.
+**v0.1.1** — the contribution loop closes end-to-end.
 
 Today you can:
 
@@ -34,11 +34,21 @@ Today you can:
   index over every space's mdpp files.
 - `hypha recall <query>` — BM25-ranked, token-budgeted full-text search
   returning a compact `summary + anchors` response.
-- `hypha spore submit <file>` — validate, write to a space inbox, and emit
-  a content-hashed receipt.
-- `hypha cap issue` — issue a scoped local capability token.
+- `hypha spore submit <file>` — validate, write to a space inbox, emit a
+  content-hashed receipt, and persist it to the audit log.
+- `hypha graft <spore-id> --as <identity>` — apply a spore's
+  `proposed_writes` to canonical files using bounded mdpp edits, record
+  `derived_from` edges, update spore status in-place, persist the receipt.
+- `hypha identity init` / `hypha identity list` — Ed25519 keypair
+  generation and listing.
+- `hypha cap issue` — scoped local capability token, persisted with a
+  matching receipt.
+- `hypha receipts list` — query the audit log by space, subject, action,
+  time window.
 
-Coming next (v0.1.1+): Ed25519 signing, graft engine, HTTP API, alignment
+Coming next (v0.1.2+): Ed25519 spore signing on submit + verification on
+intake, mdpp.fmt after graft, additional `proposed_write` kinds
+(`replace_block`, `create_file`, `add_tag`), HTTP API, alignment
 (`change:assess`), pulse aggregation.
 
 The canonical Hyphae space (concepts, decisions, initiatives, protocols, skills)
