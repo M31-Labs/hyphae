@@ -10,6 +10,7 @@ import (
 
 	"github.com/odvcencio/gosx"
 	"github.com/odvcencio/gosx/server"
+	"github.com/odvcencio/hyphae/cmd/hypha-viz/graphsurface"
 	"github.com/odvcencio/hyphae/internal/db"
 )
 
@@ -31,7 +32,7 @@ func buildTestApp(t *testing.T) (*server.App, *os.File) {
 	app.SetPublicDir("")
 
 	app.Route("/", func(r *http.Request) gosx.Node {
-		return BuildGraphPage()
+		return BuildGraphPage(graphsurface.GraphProps{})
 	})
 	app.API("GET /api/graph", handleGraph(conn))
 	app.API("GET /api/search", handleSearch(conn))

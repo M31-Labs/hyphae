@@ -1,8 +1,12 @@
+//go:build !js
+
 package main
 
 import (
 	"github.com/odvcencio/gosx"
+	"github.com/odvcencio/gosx/engine/surface"
 	"github.com/odvcencio/gosx/server"
+	"github.com/odvcencio/hyphae/cmd/hypha-viz/graphsurface"
 )
 
 // pageCSS is the embedded stylesheet for the knowledge graph viewer.
@@ -230,222 +234,33 @@ html, body {
 #statusbar span { flex-shrink: 0; }
 `
 
-// Node type colors — earth-tone palette, distinguishable but quiet.
-const pageJS = `
+// panelJS contains the search-dropdown and detail-panel DOM scripting.
+// This is intentionally kept as hand-authored JS for v0.1 because those
+// sections are pure DOM manipulation with no canvas involvement. They will
+// be rewritten as a //gosx:island in v0.1.4.
+//
+// What was removed from the original pageJS:
+//   - All force-directed layout code (tick, loop, startLoop, initPositions)
+//   - All canvas drawing code (draw, resize, TYPE_COLORS, EDGE_* constants)
+//   - All mouse/wheel/dblclick listeners on the canvas element
+//   - loadGraph() — the graph data is now SSR-embedded in the surface props
+//
+// What remains:
+//   - loadDetail() and renderDetail() — fetched on node click (v0.1.4 TODO)
+//   - recenterOn() — triggers a page reload with a new center; for v0.1 this
+//     only reloads the panel. A full graph-reload hook will land with the island.
+//   - updateStatus() — updates the status bar counts
+//   - Search dropdown (searchInput / searchResults)
+//   - escHtml helper
+//   - Boot: updateStatus() with zero counts (counts come from the WASM surface
+//     after it fetches /api/graph; the status bridge is a v0.1.4 TODO)
+const panelJS = `
 (function() {
-const TYPE_COLORS = {
-  concept:     '#7b5c3a',
-  decision:    '#5a7b3a',
-  initiative:  '#3a5c7b',
-  lesson:      '#7b3a5c',
-  spec:        '#5c7b3a',
-  plan:        '#3a7b5c',
-  spore:       '#7b6b3a',
-  skill:       '#3a6b7b',
-  protocol:    '#6b3a7b',
-  integration: '#7b3a3a',
-  readme:      '#9a8870',
-  identity:    '#6b7b3a',
-};
-const DEFAULT_COLOR = '#9a8870';
-const EDGE_COLOR       = 'rgba(120,100,75,0.25)';
-const EDGE_GRAFT_COLOR = 'rgba(160,90,40,0.55)';
-const GRAFT_KINDS = ['derived_from', 'graft'];
 
-// State
-let nodes = [], edges = [];
-let pos = {};
-let vel = {};
-let selected = null;
+// ---- Detail panel ----------------------------------------------------------
+
 let center = null;
-let transform = { x: 0, y: 0, scale: 1 };
-let dragging = false, dragNode = null, lastMouse = null;
-let animFrame = null;
 let statusNodes = 0, statusEdges = 0;
-
-const canvas = document.getElementById('graph-canvas');
-const ctx    = canvas.getContext('2d');
-const wrap   = document.getElementById('canvas-wrap');
-
-function resize() {
-  canvas.width  = wrap.clientWidth;
-  canvas.height = wrap.clientHeight;
-  draw();
-}
-
-// ---- Layout: simple force-directed ----------------------------------------
-
-const REPEL = 4500;
-const ATTRACT = 0.012;
-const DAMPING = 0.82;
-const IDEAL_EDGE = 120;
-
-function initPositions() {
-  const w = canvas.width || 800, h = canvas.height || 600;
-  nodes.forEach((n, i) => {
-    if (!pos[n.id]) {
-      const angle = (i / Math.max(nodes.length, 1)) * Math.PI * 2;
-      const r = Math.min(w, h) * 0.3;
-      pos[n.id] = { x: w / 2 + r * Math.cos(angle), y: h / 2 + r * Math.sin(angle) };
-    }
-    vel[n.id] = vel[n.id] || { x: 0, y: 0 };
-  });
-}
-
-function tick() {
-  const fx = {}, fy = {};
-  nodes.forEach(n => { fx[n.id] = 0; fy[n.id] = 0; });
-
-  // Repulsion
-  for (let i = 0; i < nodes.length; i++) {
-    for (let j = i + 1; j < nodes.length; j++) {
-      const a = nodes[i], b = nodes[j];
-      const pa = pos[a.id], pb = pos[b.id];
-      if (!pa || !pb) continue;
-      const dx = pa.x - pb.x, dy = pa.y - pb.y;
-      const dist = Math.sqrt(dx*dx + dy*dy) || 1;
-      const force = REPEL / (dist * dist);
-      const ux = dx / dist, uy = dy / dist;
-      fx[a.id] += ux * force; fy[a.id] += uy * force;
-      fx[b.id] -= ux * force; fy[b.id] -= uy * force;
-    }
-  }
-
-  // Attraction along edges
-  edges.forEach(e => {
-    const pa = pos[e.from], pb = pos[e.to];
-    if (!pa || !pb) return;
-    const dx = pb.x - pa.x, dy = pb.y - pa.y;
-    const dist = Math.sqrt(dx*dx + dy*dy) || 1;
-    const force = ATTRACT * (dist - IDEAL_EDGE);
-    const ux = dx / dist, uy = dy / dist;
-    fx[e.from] += ux * force; fy[e.from] += uy * force;
-    fx[e.to]   -= ux * force; fy[e.to]   -= uy * force;
-  });
-
-  // Center gravity
-  const cx = canvas.width / 2, cy = canvas.height / 2;
-  nodes.forEach(n => {
-    const p = pos[n.id];
-    if (!p) return;
-    fx[n.id] += (cx - p.x) * 0.004;
-    fy[n.id] += (cy - p.y) * 0.004;
-  });
-
-  // Integrate
-  let moving = false;
-  nodes.forEach(n => {
-    if (dragNode && dragNode === n.id) return;
-    const v = vel[n.id] || { x: 0, y: 0 };
-    v.x = (v.x + fx[n.id]) * DAMPING;
-    v.y = (v.y + fy[n.id]) * DAMPING;
-    vel[n.id] = v;
-    const p = pos[n.id];
-    if (!p) return;
-    p.x += v.x;
-    p.y += v.y;
-    if (Math.abs(v.x) + Math.abs(v.y) > 0.1) moving = true;
-  });
-  return moving;
-}
-
-function loop() {
-  const moving = tick();
-  draw();
-  if (moving) {
-    animFrame = requestAnimationFrame(loop);
-  } else {
-    animFrame = null;
-  }
-}
-
-function startLoop() {
-  if (animFrame) return;
-  animFrame = requestAnimationFrame(loop);
-}
-
-// ---- Draw ------------------------------------------------------------------
-
-const NODE_RADIUS = 7;
-const SELECTED_RADIUS = 10;
-
-function draw() {
-  const w = canvas.width, h = canvas.height;
-  ctx.clearRect(0, 0, w, h);
-
-  ctx.save();
-  ctx.translate(transform.x, transform.y);
-  ctx.scale(transform.scale, transform.scale);
-
-  // Draw edges
-  edges.forEach(e => {
-    const pa = pos[e.from], pb = pos[e.to];
-    if (!pa || !pb) return;
-    const isGraft = GRAFT_KINDS.includes(e.kind);
-    ctx.beginPath();
-    ctx.moveTo(pa.x, pa.y);
-    ctx.lineTo(pb.x, pb.y);
-    ctx.strokeStyle = isGraft ? EDGE_GRAFT_COLOR : EDGE_COLOR;
-    ctx.lineWidth = isGraft ? 1.5 : 1;
-    ctx.stroke();
-  });
-
-  // Draw nodes
-  nodes.forEach(n => {
-    const p = pos[n.id];
-    if (!p) return;
-    const isSel = selected === n.id;
-    const r = isSel ? SELECTED_RADIUS : NODE_RADIUS;
-    const color = TYPE_COLORS[n.type] || DEFAULT_COLOR;
-
-    ctx.beginPath();
-    ctx.arc(p.x, p.y, r, 0, Math.PI * 2);
-    ctx.fillStyle = isSel ? color : color + 'cc';
-    ctx.fill();
-    if (isSel) {
-      ctx.strokeStyle = color;
-      ctx.lineWidth = 2;
-      ctx.stroke();
-    }
-
-    // Label only when zoomed in enough or selected
-    if (transform.scale > 0.8 || isSel) {
-      ctx.fillStyle = isSel ? '#2c2a26' : '#5a5550';
-      ctx.font = isSel ? 'bold 11px sans-serif' : '10px sans-serif';
-      ctx.textAlign = 'center';
-      ctx.fillText(n.label.length > 24 ? n.label.slice(0, 22) + '…' : n.label, p.x, p.y + r + 12);
-    }
-  });
-
-  ctx.restore();
-}
-
-// ---- Load data -------------------------------------------------------------
-
-async function loadGraph(centerID, depth) {
-  let url = '/api/graph';
-  const params = [];
-  if (centerID) params.push('center=' + encodeURIComponent(centerID));
-  if (depth)    params.push('depth=' + depth);
-  if (params.length) url += '?' + params.join('&');
-
-  try {
-    const res = await fetch(url);
-    const data = await res.json();
-    nodes = data.nodes || [];
-    edges = data.edges || [];
-    statusNodes = nodes.length;
-    statusEdges = edges.length;
-    center = centerID || null;
-    pos = {};
-    vel = {};
-    initPositions();
-    updateStatus();
-    startLoop();
-  } catch (e) {
-    console.error('graph load error', e);
-  }
-}
 
 async function loadDetail(id) {
   try {
@@ -470,7 +285,7 @@ function renderDetail(data) {
 
   const obj = data.object;
   panel.querySelector('.detail-type').textContent  = obj.type || '';
-  panel.querySelector('.detail-title').textContent = obj.title || obj.id || id;
+  panel.querySelector('.detail-title').textContent = obj.title || obj.id || '';
   panel.querySelector('.detail-summary').textContent = obj.summary || '';
 
   // Back-links
@@ -507,7 +322,9 @@ function renderDetail(data) {
 function recenterOn(id) {
   center = id;
   updateStatus();
-  loadGraph(id, 2);
+  // v0.1.4 TODO: signal the Graph surface to reload via /api/graph?center=id.
+  // For now, a full page navigation reloads with the new center.
+  window.location.href = '/?center=' + encodeURIComponent(id);
 }
 
 function updateStatus() {
@@ -516,77 +333,16 @@ function updateStatus() {
   document.getElementById('status-center').textContent = center ? 'center: ' + center : '';
 }
 
-// ---- Mouse interaction -----------------------------------------------------
+// v0.1: The Graph surface WASM will update statusNodes/statusEdges once it
+// has fetched the graph. Bridge hook exposed for the future island:
+//   window.__hypha_status_update = (nodes, edges) => { statusNodes = nodes; statusEdges = edges; updateStatus(); };
+window.__hypha_status_update = function(n, e) {
+  statusNodes = n; statusEdges = e; updateStatus();
+};
 
-function screenToWorld(x, y) {
-  return {
-    x: (x - transform.x) / transform.scale,
-    y: (y - transform.y) / transform.scale,
-  };
-}
-
-function nodeAtPoint(wx, wy) {
-  let best = null, bestDist = (SELECTED_RADIUS + 4) / transform.scale;
-  nodes.forEach(n => {
-    const p = pos[n.id];
-    if (!p) return;
-    const dx = p.x - wx, dy = p.y - wy;
-    const dist = Math.sqrt(dx*dx + dy*dy);
-    if (dist < bestDist) { bestDist = dist; best = n; }
-  });
-  return best;
-}
-
-canvas.addEventListener('mousedown', e => {
-  const w = screenToWorld(e.offsetX, e.offsetY);
-  const hit = nodeAtPoint(w.x, w.y);
-  if (hit) {
-    dragNode = hit.id;
-    selected = hit.id;
-    loadDetail(hit.id);
-    draw();
-  } else {
-    dragging = true;
-    lastMouse = { x: e.clientX, y: e.clientY };
-  }
-});
-
-canvas.addEventListener('mousemove', e => {
-  if (dragNode) {
-    const w = screenToWorld(e.offsetX, e.offsetY);
-    pos[dragNode] = { x: w.x, y: w.y };
-    vel[dragNode] = { x: 0, y: 0 };
-    draw();
-  } else if (dragging && lastMouse) {
-    transform.x += e.clientX - lastMouse.x;
-    transform.y += e.clientY - lastMouse.y;
-    lastMouse = { x: e.clientX, y: e.clientY };
-    draw();
-  }
-});
-
-canvas.addEventListener('mouseup', () => {
-  if (dragNode) { startLoop(); dragNode = null; }
-  dragging = false; lastMouse = null;
-});
-
-canvas.addEventListener('wheel', e => {
-  e.preventDefault();
-  const factor = e.deltaY < 0 ? 1.1 : 0.9;
-  const mx = e.offsetX, my = e.offsetY;
-  transform.x = mx - factor * (mx - transform.x);
-  transform.y = my - factor * (my - transform.y);
-  transform.scale *= factor;
-  transform.scale = Math.max(0.1, Math.min(transform.scale, 5));
-  draw();
-}, { passive: false });
-
-// Double-click to recenter
-canvas.addEventListener('dblclick', e => {
-  const w = screenToWorld(e.offsetX, e.offsetY);
-  const hit = nodeAtPoint(w.x, w.y);
-  if (hit) recenterOn(hit.id);
-});
+// v0.1: Exposed for future panel<->canvas wiring (see graph_surface.go onUp).
+//   window.__hypha_select_node = (id) => { loadDetail(id); };
+window.__hypha_select_node = function(id) { loadDetail(id); };
 
 // ---- Search ----------------------------------------------------------------
 
@@ -640,32 +396,10 @@ function escHtml(s) {
 
 // ---- Boot ------------------------------------------------------------------
 
-window.addEventListener('resize', resize);
-resize();
-loadGraph('', 0);
+updateStatus();
 })();
 `
 
-// GraphPage renders the full HTML page for the knowledge graph viewer.
-// It uses GoSX's server.HTMLDocument as the document shell and builds
-// the page layout using plain gosx.Node trees — no .gsx, no WASM.
-func GraphPage() gosx.Node {
-	return gosx.Fragment(
-		// App shell
-		gosx.El("div", gosx.Attrs(gosx.Attr("id", "app")),
-			// Toolbar
-			toolbarNode(),
-			// Canvas wrap
-			canvasWrapNode(),
-			// Detail panel
-			panelNode(),
-			// Status bar
-			statusbarNode(),
-		),
-		// Search results dropdown (positioned absolutely)
-		gosx.El("div", gosx.Attrs(gosx.Attr("id", "search-results"))),
-	)
-}
 
 func toolbarNode() gosx.Node {
 	return gosx.El("div", gosx.Attrs(gosx.Attr("id", "toolbar")),
@@ -680,11 +414,12 @@ func toolbarNode() gosx.Node {
 	)
 }
 
-func canvasWrapNode() gosx.Node {
+func canvasWrapNode(props graphsurface.GraphProps) gosx.Node {
+	graph := surface.NewRenderer("Graph")
 	return gosx.El("div", gosx.Attrs(gosx.Attr("id", "canvas-wrap")),
-		gosx.El("canvas", gosx.Attrs(gosx.Attr("id", "graph-canvas"))),
+		graph.Mount(props),
 		gosx.El("div", gosx.Attrs(gosx.Attr("id", "canvas-hint")),
-			gosx.Text("Scroll to zoom · drag to pan · click node to inspect · double-click to recenter"),
+			gosx.Text("Scroll to zoom · drag to pan · click to inspect · double-click to recenter"),
 		),
 	)
 }
@@ -719,15 +454,33 @@ func statusbarNode() gosx.Node {
 	)
 }
 
-// headNode builds the <head> inline content: CSS + deferred JS.
-func headNode() gosx.Node {
+// headNode builds the <head> inline content: CSS + WASM preload + deferred panel JS.
+// graph is passed in so PageHead() can emit the correct WASM preload link.
+func headNode(graph *surface.Renderer) gosx.Node {
 	return gosx.Fragment(
 		gosx.El("style", gosx.RawHTML(pageCSS)),
-		gosx.El("script", gosx.Attrs(gosx.Attr("defer", "defer")), gosx.RawHTML(pageJS)),
+		graph.PageHead(),
+		gosx.El("script", gosx.Attrs(gosx.Attr("defer", "defer")), gosx.RawHTML(panelJS)),
 	)
 }
 
 // BuildGraphPage wraps GraphPage in GoSX's HTMLDocument shell.
-func BuildGraphPage() gosx.Node {
-	return server.HTMLDocument("Hyphae — Knowledge Graph", headNode(), GraphPage())
+// props are used to embed the graph data into the canvas surface placeholder.
+func BuildGraphPage(props graphsurface.GraphProps) gosx.Node {
+	graph := surface.NewRenderer("Graph")
+	return server.HTMLDocument("Hyphae — Knowledge Graph", headNode(graph), graphPageWithProps(props))
+}
+
+// graphPageWithProps is the internal version of GraphPage that receives props
+// so the canvas surface placeholder can embed the initial graph data.
+func graphPageWithProps(props graphsurface.GraphProps) gosx.Node {
+	return gosx.Fragment(
+		gosx.El("div", gosx.Attrs(gosx.Attr("id", "app")),
+			toolbarNode(),
+			canvasWrapNode(props),
+			panelNode(),
+			statusbarNode(),
+		),
+		gosx.El("div", gosx.Attrs(gosx.Attr("id", "search-results"))),
+	)
 }
