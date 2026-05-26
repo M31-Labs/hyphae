@@ -24,6 +24,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/odvcencio/hyphae/internal/assess"
 	"github.com/odvcencio/hyphae/internal/capability"
 	"github.com/odvcencio/hyphae/internal/db"
 	"github.com/odvcencio/hyphae/internal/graft"
@@ -51,6 +52,7 @@ Usage:
   hypha graph    related   <object-id> [--kind k1,k2] [--limit N]
   hypha graph    trace     <object-id> [--kind derived_from,cites] [--max-depth 4]
   hypha pulse    [--space <uri>] [--window 30d] [--ttl 5m] [--format json|text]
+  hypha assess   change --task <text> [--files p1,p2] [--diff-summary <text>] [--space <uri>] [--window 30d] [--format json|text]
   hypha receipts list [--space <uri>] [--subject <uri>] [--action <name>] [--since 24h] [--limit N]
 
 Separate binary for the browser visualization (GoSX-based):
@@ -95,6 +97,8 @@ func run(args []string) error {
 		return cmdGraph(rest)
 	case "pulse":
 		return cmdPulse(rest)
+	case "assess":
+		return cmdAssess(rest)
 	default:
 		return fmt.Errorf("unknown command %q (try `hypha help`)", group)
 	}
@@ -200,6 +204,104 @@ func nonEmpty(s, fallback string) string {
 		return fallback
 	}
 	return s
+}
+
+func cmdAssess(args []string) error {
+	if len(args) == 0 {
+		return errors.New("usage: hypha assess change --task <text> [--files p1,p2] [--diff-summary <text>] [...]")
+	}
+	sub, rest := args[0], args[1:]
+	switch sub {
+	case "change":
+		return cmdAssessChange(rest)
+	default:
+		return fmt.Errorf("unknown assess subcommand %q (try `change`)", sub)
+	}
+}
+
+func cmdAssessChange(args []string) error {
+	fs := flag.NewFlagSet("assess change", flag.ContinueOnError)
+	task := fs.String("task", "", "natural-language description of the proposed change")
+	filesCSV := fs.String("files", "", "comma-separated list of changed file paths")
+	diffSummary := fs.String("diff-summary", "", "short summary of the diff")
+	spaceURI := fs.String("space", "", "filter scoring to one space URI (default: all spaces)")
+	windowStr := fs.String("window", "30d", "Go duration window for recent-pressure aggregation")
+	budgetTokens := fs.Int("budget-tokens", 1200, "soft response token budget (advisory)")
+	format := fs.String("format", "json", "json | text")
+	if err := fs.Parse(reorderFlagsFirst(args)); err != nil {
+		return err
+	}
+
+	window, err := parseFlexDuration(*windowStr)
+	if err != nil {
+		return fmt.Errorf("--window %q: %w", *windowStr, err)
+	}
+
+	var files []string
+	for _, p := range strings.Split(*filesCSV, ",") {
+		if p = strings.TrimSpace(p); p != "" {
+			files = append(files, p)
+		}
+	}
+
+	root, err := resolveRoot("")
+	if err != nil {
+		return err
+	}
+	conn, err := openIndex(root)
+	if err != nil {
+		return err
+	}
+	defer conn.Close()
+
+	req := assess.ChangeRequest{
+		Task:         *task,
+		ChangedFiles: files,
+		DiffSummary:  *diffSummary,
+		Space:        *spaceURI,
+		Window:       window,
+		Budget:       types.Budget{MaxResponseTokens: *budgetTokens, Shape: types.ShapeCitedSpans},
+	}
+
+	res, err := assess.Change(conn, req)
+	if err != nil {
+		return err
+	}
+
+	switch *format {
+	case "json":
+		enc := json.NewEncoder(os.Stdout)
+		enc.SetIndent("", "  ")
+		return enc.Encode(res)
+	case "text":
+		printAssessText(os.Stdout, res)
+		return nil
+	default:
+		return fmt.Errorf("unknown --format %q", *format)
+	}
+}
+
+func printAssessText(w io.Writer, r assess.Result) {
+	fmt.Fprintf(w, "Alignment:      %s\n", r.Alignment)
+	fmt.Fprintf(w, "Score:          %.2f\n", r.Score)
+	fmt.Fprintf(w, "Recommendation: %s\n", r.Recommendation)
+	if len(r.MatchedInitiatives) > 0 {
+		fmt.Fprintln(w, "\nMatched initiatives:")
+		for _, m := range r.MatchedInitiatives {
+			fmt.Fprintf(w, "  - %s  (score %.2f)\n      %s — %s\n", m.ID, m.Score, nonEmpty(m.Title, "(no title)"), m.Reason)
+		}
+	}
+	if len(r.RecentPressure) > 0 {
+		fmt.Fprintln(w, "\nRecent pressure:")
+		for _, p := range r.RecentPressure {
+			fmt.Fprintf(w, "  - %s\n", p)
+		}
+	}
+	if r.HotZone != nil {
+		fmt.Fprintf(w, "\nHot zone: %s  (grafts/14d=%d, incidents/14d=%d)\n",
+			r.HotZone.Path, r.HotZone.Commits14d, r.HotZone.Incidents14d)
+	}
+	fmt.Fprintf(w, "\nTokens used: %d\n", r.TokensUsed)
 }
 
 // --- index rebuild ----------------------------------------------------------

@@ -49,6 +49,12 @@ Today you can:
 - `hypha pulse [--window 30d]` — time-windowed signal aggregation: top
   initiatives, hot zones, recent pressure, edge-kind distribution,
   activity counts. Cached in `pulse_cache`.
+- `hypha assess change --task "<text>" [--files p1,p2] [--diff-summary "<text>"]`
+  — alignment scoring (`change:assess`). Matches the proposed change against
+  active initiatives in the space, composes pulse signals for recent
+  pressure, and infers a path-prefix hot zone. Returns the JSON shape from
+  `concepts/initiative-alignment.md`: alignment category, score,
+  recommendation, matched initiatives, citations.
 - `hypha receipts list` — query the audit log by space, subject, action,
   time window.
 
@@ -58,10 +64,10 @@ For the browser visualization (separate binary, GoSX-based):
   knowledge graph, search bar, click-to-expand neighbors, object detail
   panel. Earth-tone palette, plain Go + GoSX, no JS build step.
 
-Coming next: HTTP API for cloud-agent spore submission, alignment
-(`change:assess`), peer federation (signed manifests + drift detection),
-Engine-backed graph rendering (Go-via-TinyGo for the canvas), mdpp.fmt
-after graft.
+Coming next: HTTP API for cloud-agent spore submission, peer federation
+(signed manifests + drift detection), `mdpp.fmt` after graft, `assess task`
+and `assess pr` shapes. Engine-backed graph rendering (Go-via-TinyGo for the
+canvas) is mid-flight; see `specs/gosx-engine-surface-completion.md`.
 
 The canonical Hyphae space (concepts, decisions, initiatives, protocols, skills)
 is installed under `~/.hyphae/spaces/m31labs-hyphae/`. The binary in this repo
