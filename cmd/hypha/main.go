@@ -22,6 +22,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 
@@ -500,10 +501,20 @@ func cmdRecall(args []string) error {
 // --- spore submit -----------------------------------------------------------
 
 func cmdSpore(args []string) error {
-	if len(args) == 0 || args[0] != "submit" {
-		return errors.New("usage: hypha spore submit <file> [--sign --as <identity-uri>]")
+	if len(args) == 0 {
+		return errors.New("usage: hypha spore submit <file> [...]  |  hypha spore list [...]")
 	}
-	rest := args[1:]
+	switch args[0] {
+	case "submit":
+		return cmdSporeSubmit(args[1:])
+	case "list":
+		return cmdSporeList(args[1:])
+	default:
+		return fmt.Errorf("unknown spore subcommand %q (try `submit`, `list`)", args[0])
+	}
+}
+
+func cmdSporeSubmit(rest []string) error {
 	fs := flag.NewFlagSet("spore submit", flag.ContinueOnError)
 	sign := fs.Bool("sign", false, "Ed25519-sign the spore before submission")
 	signer := fs.String("as", "", "signer identity URI (required with --sign)")
@@ -617,6 +628,122 @@ func identityResolver(root string) spore.IdentityResolver {
 		}
 		return identity.Load(dir, name)
 	}
+}
+
+// --- spore list -------------------------------------------------------------
+
+func cmdSporeList(args []string) error {
+	fs := flag.NewFlagSet("spore list", flag.ContinueOnError)
+	spaceFilter := fs.String("space", "", "filter by space URI (default: all installed spaces)")
+	statusFilter := fs.String("status", "", "filter by status (unreviewed, accepted, partial, rejected, ...)")
+	sinceStr := fs.String("since", "", "only spores submitted within this duration (e.g. 24h, 7d)")
+	limit := fs.Int("limit", 50, "max results")
+	format := fs.String("format", "text", "json | text")
+	if err := fs.Parse(reorderFlagsFirst(args)); err != nil {
+		return err
+	}
+
+	var sinceCutoff time.Time
+	if *sinceStr != "" {
+		d, derr := parseFlexDuration(*sinceStr)
+		if derr != nil {
+			return fmt.Errorf("--since %q: %w", *sinceStr, derr)
+		}
+		sinceCutoff = time.Now().UTC().Add(-d)
+	}
+
+	root, err := resolveRoot("")
+	if err != nil {
+		return err
+	}
+	spaces, err := listSpaces(root)
+	if err != nil {
+		return err
+	}
+
+	type sporeRow struct {
+		ID          string    `json:"id"`
+		Space       string    `json:"space"`
+		Status      string    `json:"status"`
+		Path        string    `json:"path"`
+		SubmittedAt time.Time `json:"submitted_at"`
+	}
+	var out []sporeRow
+
+	for _, sp := range spaces {
+		if *spaceFilter != "" && !spaceMatches(sp, *spaceFilter) {
+			continue
+		}
+		inboxDir := filepath.Join(sp.Path, "inbox", "agents")
+		entries, _ := os.ReadDir(inboxDir)
+		for _, ent := range entries {
+			if ent.IsDir() || !strings.HasSuffix(ent.Name(), ".md") {
+				continue
+			}
+			absPath := filepath.Join(inboxDir, ent.Name())
+			content, rerr := os.ReadFile(absPath)
+			if rerr != nil {
+				continue
+			}
+			s, _ := spore.Parse(content)
+			if s.ID == "" {
+				continue
+			}
+			if *statusFilter != "" && s.Status != *statusFilter {
+				continue
+			}
+			if !sinceCutoff.IsZero() && s.SubmittedAt.Before(sinceCutoff) {
+				continue
+			}
+			out = append(out, sporeRow{
+				ID:          s.ID,
+				Space:       s.SpaceID,
+				Status:      s.Status,
+				Path:        absPath,
+				SubmittedAt: s.SubmittedAt,
+			})
+		}
+	}
+
+	// Newest first.
+	sort.SliceStable(out, func(i, j int) bool {
+		return out[i].SubmittedAt.After(out[j].SubmittedAt)
+	})
+	if len(out) > *limit {
+		out = out[:*limit]
+	}
+
+	switch *format {
+	case "json":
+		enc := json.NewEncoder(os.Stdout)
+		enc.SetIndent("", "  ")
+		return enc.Encode(out)
+	case "text":
+		if len(out) == 0 {
+			fmt.Println("(no spores)")
+			return nil
+		}
+		for _, r := range out {
+			fmt.Printf("%s  %-12s  %s\n      %s\n",
+				r.SubmittedAt.Format("2006-01-02 15:04"),
+				nonEmpty(r.Status, "?"),
+				r.ID,
+				r.Path,
+			)
+		}
+		fmt.Fprintf(os.Stderr, "\n(%d spores)\n", len(out))
+		return nil
+	default:
+		return fmt.Errorf("unknown --format %q", *format)
+	}
+}
+
+// spaceMatches reports whether the filter (a hypha:// URI or bare authority/name)
+// matches a space entry.
+func spaceMatches(sp spaceEntry, filter string) bool {
+	f := strings.TrimPrefix(filter, "hypha://")
+	f = strings.TrimRight(f, "/")
+	return sp.URI == f || sp.URI == filter
 }
 
 // --- cap issue --------------------------------------------------------------

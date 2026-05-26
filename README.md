@@ -40,6 +40,8 @@ Today you can:
   select a slice. Closes the recall→read loop without URI→path translation.
 - `hypha spore submit <file> [--sign --as <id>]` — validate, optionally
   Ed25519-sign, write to inbox, emit + persist a content-hashed receipt.
+- `hypha spore list [--space --status --since --limit]` — enumerate inbox
+  spores across installed spaces, newest first, with filters.
 - `hypha graft <spore-id> --as <id> [--verify]` — apply a spore's
   `proposed_writes` (`append_section`, `insert_after`, `replace_block`,
   `create_file`, `add_tag`) via bounded mdpp edits, record `derived_from`
