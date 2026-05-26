@@ -78,23 +78,25 @@ func indexInTx(tx *sql.Tx, obj types.Object) error {
 	return nil
 }
 
-// sanitizeQuery strips FTS5 operator characters and returns a plain-term query.
-// For v0.1 we keep it simple: strip `"`, `*`, `(`, `)`, `:`, `-`, `^` then
-// collapse whitespace. Multiple words become an implicit-AND query via FTS5.
+// sanitizeQuery reduces the query to ASCII alphanumerics and spaces so every
+// remaining token is a plain FTS5 term. All FTS5 syntax characters (`.`,
+// `,`, `:`, `-`, `*`, `(`, `)`, etc.) are special and silently break the
+// query — strip rather than escape. Multiple words become an implicit-AND
+// query via FTS5.
 func sanitizeQuery(q string) string {
-	replacer := strings.NewReplacer(
-		`"`, " ",
-		`*`, " ",
-		`(`, " ",
-		`)`, " ",
-		`:`, " ",
-		`-`, " ",
-		`^`, " ",
-	)
-	cleaned := replacer.Replace(q)
-	// Collapse runs of whitespace into a single space.
-	fields := strings.Fields(cleaned)
-	return strings.Join(fields, " ")
+	var b strings.Builder
+	b.Grow(len(q))
+	for _, r := range q {
+		switch {
+		case r >= 'a' && r <= 'z',
+			r >= 'A' && r <= 'Z',
+			r >= '0' && r <= '9':
+			b.WriteRune(r)
+		default:
+			b.WriteByte(' ')
+		}
+	}
+	return strings.Join(strings.Fields(b.String()), " ")
 }
 
 // estimateTokens returns a rough token count for a string using the len/4 heuristic.
