@@ -4,9 +4,9 @@ go 1.26
 
 require (
 	github.com/google/uuid v1.6.0
-	github.com/odvcencio/gosx v0.18.30
 	github.com/odvcencio/mdpp v0.2.5
 	gopkg.in/yaml.v3 v3.0.1
+	m31labs.dev/gosx v0.18.30
 	modernc.org/sqlite v1.34.5
 )
 
@@ -44,4 +44,4 @@ require (
 
 replace m31labs.dev/mdpp => ../mdpp
 
-replace github.com/odvcencio/gosx => ../gosx
+replace m31labs.dev/gosx => ../gosx

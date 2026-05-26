@@ -4,7 +4,7 @@ import (
 	"math"
 	"math/rand"
 
-	"github.com/odvcencio/gosx/engine/surface"
+	"m31labs.dev/gosx/engine/surface"
 )
 
 // GraphNode is the JSON shape for a graph node in the surface props.

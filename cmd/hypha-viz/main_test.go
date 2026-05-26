@@ -8,8 +8,8 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/odvcencio/gosx"
-	"github.com/odvcencio/gosx/server"
+	"m31labs.dev/gosx"
+	"m31labs.dev/gosx/server"
 	"m31labs.dev/hyphae/cmd/hypha-viz/graphsurface"
 	"m31labs.dev/hyphae/internal/db"
 )

@@ -7,7 +7,7 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/odvcencio/gosx/server"
+	"m31labs.dev/gosx/server"
 	"m31labs.dev/hyphae/internal/recall"
 	"m31labs.dev/hyphae/internal/types"
 	"m31labs.dev/hyphae/internal/vizdata"

@@ -23,9 +23,9 @@ import (
 	"os"
 	"path/filepath"
 
-	"github.com/odvcencio/gosx"
-	"github.com/odvcencio/gosx/engine/surface"
-	"github.com/odvcencio/gosx/server"
+	"m31labs.dev/gosx"
+	"m31labs.dev/gosx/engine/surface"
+	"m31labs.dev/gosx/server"
 	"m31labs.dev/hyphae/cmd/hypha-viz/graphsurface"
 	"m31labs.dev/hyphae/internal/db"
 	"m31labs.dev/hyphae/internal/vizdata"

@@ -3,9 +3,9 @@
 package main
 
 import (
-	"github.com/odvcencio/gosx"
-	"github.com/odvcencio/gosx/engine/surface"
-	"github.com/odvcencio/gosx/server"
+	"m31labs.dev/gosx"
+	"m31labs.dev/gosx/engine/surface"
+	"m31labs.dev/gosx/server"
 	"m31labs.dev/hyphae/cmd/hypha-viz/graphsurface"
 )
 
