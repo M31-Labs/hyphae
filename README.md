@@ -26,8 +26,9 @@ carries provenance.
 
 ## Status
 
-**v0.1.3** — full read + contribute loop, Ed25519 signing, graph queries,
-pulse aggregation, and a GoSX-based browser visualization.
+**v0.1.4** — full read + contribute loop, Ed25519 signing, graph queries,
+pulse aggregation, alignment scoring (`change:assess`), spore-inbox listing,
+single-object fetch by id, and a GoSX-based browser visualization.
 
 Today you can:
 
@@ -38,6 +39,7 @@ Today you can:
 - `hypha show <id>` — fetch one object by id (or `hypha://` URI). Default
   prints the full file; `--path` / `--json` / `--frontmatter` / `--body`
   select a slice. Closes the recall→read loop without URI→path translation.
+- `hypha spaces list` — enumerate installed spaces under `$HYPHAE_HOME/spaces`.
 - `hypha spore submit <file> [--sign --as <id>]` — validate, optionally
   Ed25519-sign, write to inbox, emit + persist a content-hashed receipt.
 - `hypha spore list [--space --status --since --limit]` — enumerate inbox

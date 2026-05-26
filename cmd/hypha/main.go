@@ -40,12 +40,15 @@ import (
 	"github.com/odvcencio/hyphae/internal/types"
 )
 
-const usage = `hypha — Hyphae v0.1.3 CLI
+const usage = `hypha — Hyphae v0.1.4 CLI
 
 Usage:
   hypha index    rebuild [--root <path>]
   hypha recall   <query> [--limit N] [--max-tokens N] [--shape headline|summary+anchors] [--format json|text]
+  hypha show     <id-or-hypha-uri> [--path] [--json] [--frontmatter] [--body]
+  hypha spaces   list [--format json|text]
   hypha spore    submit <file> [--sign --as <identity-uri>]
+  hypha spore    list   [--space <uri>] [--status <state>] [--since 24h] [--limit N] [--format json|text]
   hypha cap      issue --subject <uri> --space <uri> [--permissions p1,p2] [--expires 24h]
   hypha identity init --name <name> --authority <auth> --space <uri> [--expires 1y]
   hypha identity list
@@ -56,7 +59,6 @@ Usage:
   hypha pulse    [--space <uri>] [--window 30d] [--ttl 5m] [--format json|text]
   hypha assess   change --task <text> [--files p1,p2] [--diff-summary <text>] [--space <uri>] [--window 30d] [--format json|text]
   hypha assess   task   --task <text> [--space <uri>] [--window 30d] [--format json|text]
-  hypha show     <id-or-hypha-uri> [--path] [--json] [--frontmatter] [--body]
   hypha receipts list [--space <uri>] [--subject <uri>] [--action <name>] [--since 24h] [--limit N]
 
 Separate binary for the browser visualization (GoSX-based):
@@ -105,6 +107,8 @@ func run(args []string) error {
 		return cmdAssess(rest)
 	case "show":
 		return cmdShow(rest)
+	case "spaces":
+		return cmdSpaces(rest)
 	default:
 		return fmt.Errorf("unknown command %q (try `hypha help`)", group)
 	}
@@ -1241,6 +1245,45 @@ func splitFrontmatter(content []byte) (frontmatter, body []byte) {
 	}
 	end := 4 + idx + len("\n---\n")
 	return content[:end], content[end:]
+}
+
+// --- spaces ----------------------------------------------------------------
+
+func cmdSpaces(args []string) error {
+	if len(args) == 0 || args[0] != "list" {
+		return errors.New("usage: hypha spaces list [--format json|text]")
+	}
+	fs := flag.NewFlagSet("spaces list", flag.ContinueOnError)
+	format := fs.String("format", "text", "json | text")
+	if err := fs.Parse(reorderFlagsFirst(args[1:])); err != nil {
+		return err
+	}
+	root, err := resolveRoot("")
+	if err != nil {
+		return err
+	}
+	spaces, err := listSpaces(root)
+	if err != nil {
+		return err
+	}
+	switch *format {
+	case "json":
+		enc := json.NewEncoder(os.Stdout)
+		enc.SetIndent("", "  ")
+		return enc.Encode(spaces)
+	case "text":
+		if len(spaces) == 0 {
+			fmt.Println("(no spaces installed)")
+			return nil
+		}
+		for _, sp := range spaces {
+			fmt.Printf("  hypha://%s\n      %s\n", sp.URI, sp.Path)
+		}
+		fmt.Fprintf(os.Stderr, "\n(%d space(s))\n", len(spaces))
+		return nil
+	default:
+		return fmt.Errorf("unknown --format %q", *format)
+	}
 }
 
 // --- graph -----------------------------------------------------------------
