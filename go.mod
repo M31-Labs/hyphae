@@ -16,7 +16,7 @@ require (
 	github.com/mattn/go-isatty v0.0.20 // indirect
 	github.com/ncruces/go-strftime v0.1.9 // indirect
 	github.com/odvcencio/corkscrewdb v0.2.0 // indirect
-	github.com/odvcencio/gotreesitter v0.18.0 // indirect
+	github.com/odvcencio/gotreesitter v0.19.1 // indirect
 	github.com/odvcencio/manta v0.0.13 // indirect
 	github.com/odvcencio/mll v0.0.1 // indirect
 	github.com/odvcencio/turboquant v0.1.3 // indirect

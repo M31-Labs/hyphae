@@ -2,11 +2,24 @@
 
 A federated Markdown++ knowledge graph for agents (and the humans they work with).
 
+Hyphae is built on **[Markdown++ (mdpp)](https://github.com/M31-Labs/mdpp)** —
+a structural Markdown parser, renderer, formatter, and LSP server. Every
+spore, decision, concept, lesson, spec, plan, skill, trace, and analysis
+object in Hyphae is an mdpp document. The mdpp AST is what `hypha recall`,
+`hypha show`, `hypha graft`, and the indexer all operate on. When `hypha
+graft` applies a contribution, `m31labs.dev/mdpp/fmt` normalizes the
+touched file in-place so canonical state stays canonical. Hyphae is a
+load-bearing dogfood of mdpp.
+
 Hyphae is an efficient, OSS knowledge base — usable as a drop-in for the kinds
 of tools teams reach for when they want a personal or shared vault of plain
 `.md` notes, but built from the ground up to be read and written by agents as
 a first-class concern.
 
+- **Markdown++ as the substrate** — typed frontmatter, container directives,
+  admonitions, footnotes, math, diagrams, wikilinks, and a source-preserving
+  formatter, all owned by [mdpp](https://github.com/M31-Labs/mdpp). Hyphae
+  uses the mdpp Go API; no other Markdown library is imported.
 - **Plain `.md` files** — your knowledge stays portable, diffable, and editable
   in any tool that opens markdown.
 - **Typed objects + a real graph** under the surface — concepts, decisions,
