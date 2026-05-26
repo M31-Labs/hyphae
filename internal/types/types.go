@@ -25,7 +25,49 @@ const (
 	TypeReadme      ObjectType = "readme"
 	TypeIdentity    ObjectType = "identity"
 	TypeTrace       ObjectType = "trace"
+	TypeAnalysis    ObjectType = "analysis"
 )
+
+// AnalysisKind enumerates the kinds of code-intelligence analyses hyphae
+// materializes from canopy. The kind is a frontmatter field on the analysis
+// object; the type stays `analysis` for all kinds (same shape, different
+// discriminator).
+const (
+	AnalysisKindImpact    = "impact"    // canopy graph impact — reverse-call blast radius
+	AnalysisKindCallgraph = "callgraph" // canopy graph calls — forward call edges
+	AnalysisKindRefs      = "refs"      // canopy search refs — references to a symbol
+	AnalysisKindHotspot   = "hotspot"   // canopy analyze hotspot — complexity + churn
+	AnalysisKindDead      = "dead"      // canopy graph dead — zero-incoming-call symbols
+	AnalysisKindReview    = "review"    // canopy analyze review — changed-files-vs-base
+)
+
+// Analysis is a cached code-intelligence result from canopy, materialized as
+// an mdpp object under `<space-root>/.analyses/<kind>/<slug>@<commit>.md`.
+//
+// Local-by-default; never federates (the directory is gitignored). Freshness
+// is determined at read time by comparing `Commit` to the source repo's
+// current HEAD and `TargetFiles` mtimes to `ComputedAt`.
+type Analysis struct {
+	ID          string
+	Kind        string // one of AnalysisKind* constants
+	SpaceID     string
+	Target      string // file path, symbol, or "repo" for repo-wide kinds
+	TargetFiles []string
+	Commit      string // git rev hyphae ran canopy at
+	ComputedAt  time.Time
+	Tool        string // "canopy"
+	ToolVersion string
+	Stale       bool // set true at read-time on staleness; not persisted
+
+	// Kind-agnostic summary counts hyphae extracts for quick recall display.
+	TotalAffected int      // impact / callgraph / refs total
+	TopFiles      []string // top-N file paths involved
+	TopSymbols    []string // top-N symbol names involved
+
+	RawJSON  string // verbatim canopy JSON output
+	Body     string // rendered markdown body
+	FilePath string
+}
 
 // TraceStatus values for the trace lifecycle (per decision 0009).
 const (

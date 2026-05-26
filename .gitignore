@@ -25,3 +25,6 @@ profile.*
 
 # gosx engine-surface build cache (transient, regenerated at hypha-viz startup)
 /.gosx/
+
+# canopy code-intelligence cache (transient, rebuilt by `canopy index build`)
+/.canopy/

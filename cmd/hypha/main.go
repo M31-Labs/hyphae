@@ -21,11 +21,13 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"sort"
 	"strings"
 	"time"
 
+	"m31labs.dev/hyphae/internal/analyze"
 	"m31labs.dev/hyphae/internal/assess"
 	"m31labs.dev/hyphae/internal/capability"
 	"m31labs.dev/hyphae/internal/db"
@@ -64,6 +66,10 @@ Usage:
   hypha trace    tick  <trace-id> "<checkpoint>" [--space <uri>]
   hypha trace    done  <trace-id> [--status succeeded|failed|killed|superseded] [--link-spore <id>] [--space <uri>]
   hypha trace    list  [--active] [--agent <uri>] [--space <uri>] [--format json|text]
+  hypha analyze  <kind> [target] [--space <uri>] [--source <path>] [--diff-ref <ref>] [--max-depth N] [--refresh]
+                       kinds: impact, callgraph, refs, hotspot, dead, review
+  hypha analyze  list  [--kind <k>] [--space <uri>] [--target-file <path>] [--format json|text]
+  hypha analyze  refresh <id> [--space <uri>] [--source <path>]
   hypha receipts list [--space <uri>] [--subject <uri>] [--action <name>] [--since 24h] [--limit N]
 
 Separate binary for the browser visualization (GoSX-based):
@@ -116,6 +122,8 @@ func run(args []string) error {
 		return cmdSpaces(rest)
 	case "trace":
 		return cmdTrace(rest)
+	case "analyze":
+		return cmdAnalyze(rest)
 	default:
 		return fmt.Errorf("unknown command %q (try `hypha help`)", group)
 	}
@@ -299,6 +307,7 @@ func cmdAssessChange(args []string) error {
 	filesCSV := fs.String("files", "", "comma-separated list of changed file paths")
 	diffSummary := fs.String("diff-summary", "", "short summary of the diff")
 	spaceURI := fs.String("space", "", "filter scoring to one space URI (default: all spaces)")
+	source := fs.String("source", "", "source repo path (enables canopy-cache enrichment; defaults via space convention)")
 	windowStr := fs.String("window", "30d", "Go duration window for recent-pressure aggregation")
 	budgetTokens := fs.Int("budget-tokens", 1200, "soft response token budget (advisory)")
 	format := fs.String("format", "json", "json | text")
@@ -335,6 +344,18 @@ func cmdAssessChange(args []string) error {
 		Space:        *spaceURI,
 		Window:       window,
 		Budget:       types.Budget{MaxResponseTokens: *budgetTokens, Shape: types.ShapeCitedSpans},
+	}
+
+	// Best-effort opportunistic canopy enrichment: if --space resolves to an
+	// installed space and (--source or convention) gives us a source repo,
+	// assess.Change will fold cached impact analyses into hot_zone.
+	if *spaceURI != "" {
+		if sr, _, err := resolveSpaceForTrace(root, *spaceURI); err == nil {
+			req.SpaceRoot = sr
+		}
+		if sp, err := resolveSourceForSpace(*spaceURI, *source); err == nil {
+			req.SourcePath = sp
+		}
 	}
 
 	res, err := assess.Change(conn, req)
@@ -1529,6 +1550,302 @@ func cmdTraceList(args []string) error {
 			}())
 	}
 	fmt.Fprintf(os.Stderr, "\n(%d traces)\n", len(out))
+	return nil
+}
+
+// --- analyze ---------------------------------------------------------------
+
+func cmdAnalyze(args []string) error {
+	if len(args) == 0 {
+		return errors.New("usage: hypha analyze <kind> [target] | list | refresh <id>")
+	}
+	switch args[0] {
+	case "list":
+		return cmdAnalyzeList(args[1:])
+	case "refresh":
+		return cmdAnalyzeRefresh(args[1:])
+	case "impact", "callgraph", "refs", "hotspot", "dead", "review":
+		return cmdAnalyzeRun(args[0], args[1:])
+	default:
+		return fmt.Errorf("unknown analyze kind/subcommand %q (try impact|callgraph|refs|hotspot|dead|review|list|refresh)", args[0])
+	}
+}
+
+// resolveSourceForSpace picks the source repo path for an installed space.
+// Convention: `~/work/<basename-of-space-uri>`. Override with --source.
+func resolveSourceForSpace(spaceURI, sourceFlag string) (string, error) {
+	if strings.TrimSpace(sourceFlag) != "" {
+		return sourceFlag, nil
+	}
+	rest := strings.TrimPrefix(spaceURI, "hypha://")
+	rest = strings.TrimRight(rest, "/")
+	parts := strings.SplitN(rest, "/", 2)
+	if len(parts) < 2 {
+		return "", fmt.Errorf("malformed space uri %q", spaceURI)
+	}
+	home, _ := os.UserHomeDir()
+	candidate := filepath.Join(home, "work", parts[1])
+	if _, err := os.Stat(filepath.Join(candidate, ".git")); err != nil {
+		return "", fmt.Errorf("no git repo at %s (pass --source <path>)", candidate)
+	}
+	return candidate, nil
+}
+
+func cmdAnalyzeRun(kind string, args []string) error {
+	fs := flag.NewFlagSet("analyze "+kind, flag.ContinueOnError)
+	spaceFlag := fs.String("space", "", "space URI (default: only installed space)")
+	source := fs.String("source", "", "source repo path (default: ~/work/<space-basename>)")
+	diffRef := fs.String("diff-ref", "", "git ref for kinds that diff (impact, review)")
+	maxDepth := fs.Int("max-depth", 0, "max reverse-call depth (impact, callgraph)")
+	refresh := fs.Bool("refresh", false, "ignore cached analysis and re-run canopy")
+	format := fs.String("format", "text", "json | text")
+	if err := fs.Parse(reorderFlagsFirst(args)); err != nil {
+		return err
+	}
+	target := ""
+	if fs.NArg() > 0 {
+		target = fs.Arg(0)
+	}
+
+	root, err := resolveRoot("")
+	if err != nil {
+		return err
+	}
+	spaceRoot, spaceURI, err := resolveSpaceForTrace(root, *spaceFlag)
+	if err != nil {
+		return err
+	}
+	sourcePath, err := resolveSourceForSpace(spaceURI, *source)
+	if err != nil {
+		return err
+	}
+
+	// Cache check (skip when --refresh).
+	if !*refresh {
+		existing, _ := analyze.List(spaceRoot, analyze.ListFilter{
+			Kind:       kind,
+			TargetFile: target,
+		})
+		if len(existing) > 0 {
+			// Pick newest matching target.
+			for _, a := range existing {
+				if a.Target == target || (target == "" && a.Target == "repo") {
+					checkAndAnnotateFreshness(&a, sourcePath)
+					return emitAnalysis(a, *format)
+				}
+			}
+		}
+	}
+
+	a, err := analyze.Run(analyze.RunOpts{
+		Kind:       kind,
+		Target:     target,
+		SourcePath: sourcePath,
+		SpaceRoot:  spaceRoot,
+		SpaceID:    spaceURI,
+		MaxDepth:   *maxDepth,
+		DiffRef:    *diffRef,
+	})
+	if err != nil {
+		return err
+	}
+	return emitAnalysis(a, *format)
+}
+
+func cmdAnalyzeList(args []string) error {
+	fs := flag.NewFlagSet("analyze list", flag.ContinueOnError)
+	kindFilter := fs.String("kind", "", "filter by kind (impact|callgraph|refs|hotspot|dead|review)")
+	targetFile := fs.String("target-file", "", "match analyses whose target_files include this path")
+	spaceFlag := fs.String("space", "", "space URI (default: all installed spaces)")
+	format := fs.String("format", "text", "json | text")
+	if err := fs.Parse(reorderFlagsFirst(args)); err != nil {
+		return err
+	}
+
+	root, err := resolveRoot("")
+	if err != nil {
+		return err
+	}
+	spaces, err := listSpaces(root)
+	if err != nil {
+		return err
+	}
+
+	type row struct {
+		ID            string    `json:"id"`
+		Kind          string    `json:"kind"`
+		Target        string    `json:"target"`
+		Commit        string    `json:"commit"`
+		ComputedAt    time.Time `json:"computed_at"`
+		Stale         bool      `json:"stale"`
+		TotalAffected int       `json:"total_affected,omitempty"`
+		Path          string    `json:"path"`
+	}
+	var out []row
+	for _, sp := range spaces {
+		if *spaceFlag != "" && !spaceMatches(sp, *spaceFlag) {
+			continue
+		}
+		list, lerr := analyze.List(sp.Path, analyze.ListFilter{Kind: *kindFilter, TargetFile: *targetFile})
+		if lerr != nil {
+			fmt.Fprintf(os.Stderr, "warn: list %s: %v\n", sp.URI, lerr)
+			continue
+		}
+		sourcePath, _ := resolveSourceForSpace("hypha://"+sp.URI, "")
+		for _, a := range list {
+			checkAndAnnotateFreshness(&a, sourcePath)
+			out = append(out, row{
+				ID:            a.ID,
+				Kind:          a.Kind,
+				Target:        a.Target,
+				Commit:        a.Commit,
+				ComputedAt:    a.ComputedAt,
+				Stale:         a.Stale,
+				TotalAffected: a.TotalAffected,
+				Path:          a.FilePath,
+			})
+		}
+	}
+
+	if *format == "json" {
+		enc := json.NewEncoder(os.Stdout)
+		enc.SetIndent("", "  ")
+		return enc.Encode(out)
+	}
+	if len(out) == 0 {
+		fmt.Println("(no analyses)")
+		return nil
+	}
+	for _, r := range out {
+		staleTag := ""
+		if r.Stale {
+			staleTag = "  STALE"
+		}
+		fmt.Printf("%s  %-10s  %s  @%s%s\n      %s\n",
+			r.ComputedAt.Format("2006-01-02 15:04"), r.Kind, r.Target, r.Commit, staleTag, r.ID)
+	}
+	fmt.Fprintf(os.Stderr, "\n(%d analyses)\n", len(out))
+	return nil
+}
+
+func cmdAnalyzeRefresh(args []string) error {
+	fs := flag.NewFlagSet("analyze refresh", flag.ContinueOnError)
+	spaceFlag := fs.String("space", "", "space URI (default: only installed space)")
+	source := fs.String("source", "", "source repo path (default: ~/work/<space-basename>)")
+	format := fs.String("format", "text", "json | text")
+	if err := fs.Parse(reorderFlagsFirst(args)); err != nil {
+		return err
+	}
+	if fs.NArg() == 0 {
+		return errors.New("usage: hypha analyze refresh <analysis-id>")
+	}
+	id := fs.Arg(0)
+
+	root, err := resolveRoot("")
+	if err != nil {
+		return err
+	}
+	spaces, err := listSpaces(root)
+	if err != nil {
+		return err
+	}
+	// Find the analysis across spaces.
+	var match types.Analysis
+	var spaceRoot, spaceURI string
+	for _, sp := range spaces {
+		if *spaceFlag != "" && !spaceMatches(sp, *spaceFlag) {
+			continue
+		}
+		list, _ := analyze.List(sp.Path, analyze.ListFilter{})
+		for _, a := range list {
+			if a.ID == id {
+				match = a
+				spaceRoot = sp.Path
+				spaceURI = "hypha://" + sp.URI
+				break
+			}
+		}
+		if match.ID != "" {
+			break
+		}
+	}
+	if match.ID == "" {
+		return fmt.Errorf("analyze refresh: no analysis with id %q", id)
+	}
+	sourcePath, err := resolveSourceForSpace(spaceURI, *source)
+	if err != nil {
+		return err
+	}
+	a, err := analyze.Run(analyze.RunOpts{
+		Kind:       match.Kind,
+		Target:     match.Target,
+		SourcePath: sourcePath,
+		SpaceRoot:  spaceRoot,
+		SpaceID:    spaceURI,
+	})
+	if err != nil {
+		return err
+	}
+	return emitAnalysis(a, *format)
+}
+
+// checkAndAnnotateFreshness updates a.Stale based on source-repo state.
+// Silently no-ops if the source path is missing or git isn't available.
+func checkAndAnnotateFreshness(a *types.Analysis, sourcePath string) {
+	if sourcePath == "" {
+		return
+	}
+	currentCommit, _ := func() (string, error) {
+		cmd := exec.Command("git", "rev-parse", "HEAD")
+		cmd.Dir = sourcePath
+		out, err := cmd.Output()
+		return strings.TrimSpace(string(out)), err
+	}()
+	mtimes := make(map[string]time.Time, len(a.TargetFiles))
+	for _, f := range a.TargetFiles {
+		if info, err := os.Stat(filepath.Join(sourcePath, f)); err == nil {
+			mtimes[f] = info.ModTime().UTC()
+		}
+	}
+	_ = analyze.CheckFreshness(a, analyze.FreshnessInputs{
+		CurrentCommit: currentCommit,
+		TargetMtimes:  mtimes,
+	})
+}
+
+func emitAnalysis(a types.Analysis, format string) error {
+	if format == "json" {
+		enc := json.NewEncoder(os.Stdout)
+		enc.SetIndent("", "  ")
+		return enc.Encode(a)
+	}
+	staleTag := ""
+	if a.Stale {
+		staleTag = "  [STALE — re-run with `hypha analyze refresh " + a.ID + "`]"
+	}
+	fmt.Printf("Analysis:    %s%s\n", a.ID, staleTag)
+	fmt.Printf("Kind:        %s\n", a.Kind)
+	fmt.Printf("Target:      %s\n", a.Target)
+	if a.Commit != "" {
+		fmt.Printf("Commit:      %s\n", a.Commit)
+	}
+	fmt.Printf("Computed at: %s\n", a.ComputedAt.Format(time.RFC3339))
+	if a.TotalAffected > 0 {
+		fmt.Printf("Affected:    %d symbols across %d files\n", a.TotalAffected, len(a.TopFiles))
+	}
+	if len(a.TopFiles) > 0 {
+		fmt.Println("\nTop files:")
+		for _, f := range a.TopFiles {
+			fmt.Printf("  - %s\n", f)
+		}
+	}
+	if len(a.TopSymbols) > 0 {
+		fmt.Println("\nTop symbols:")
+		for _, s := range a.TopSymbols {
+			fmt.Printf("  - %s\n", s)
+		}
+	}
+	fmt.Printf("\nFile: %s\n", a.FilePath)
 	return nil
 }
 

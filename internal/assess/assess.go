@@ -16,12 +16,14 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"os/exec"
 	"path"
 	"slices"
 	"sort"
 	"strings"
 	"time"
 
+	"m31labs.dev/hyphae/internal/analyze"
 	"m31labs.dev/hyphae/internal/pulse"
 	"m31labs.dev/hyphae/internal/types"
 )
@@ -58,6 +60,17 @@ type ChangeRequest struct {
 	Space        string        `json:"space,omitempty"`  // hypha:// URI; "" = all spaces
 	Window       time.Duration `json:"window,omitempty"` // default 30d
 	Budget       types.Budget  `json:"budget"`
+
+	// SpaceRoot enables opportunistic canopy-cache enrichment of the hot
+	// zone. When set (and the space has cached impact analyses for any
+	// ChangedFiles), the result HotZone is enriched with affected-symbol
+	// counts and top affected files. Never auto-runs canopy.
+	SpaceRoot string `json:"-"`
+	// SourcePath optionally identifies the source repo for staleness
+	// checks. If set, cached analyses are marked stale when HEAD differs
+	// from the analysis commit. Without it, cached results are returned
+	// as-is.
+	SourcePath string `json:"-"`
 }
 
 // MatchedInitiative is one initiative the change appears to align with.
@@ -74,6 +87,15 @@ type HotZone struct {
 	Path        string `json:"path"`
 	Commits14d  int    `json:"commits_14d"`
 	Incidents14d int   `json:"incidents_14d"`
+
+	// Optional canopy-derived enrichment. Populated when a fresh impact
+	// analysis is cached for any of req.ChangedFiles and req.SpaceRoot is
+	// set. Omitted from JSON when absent (existing callers see the same
+	// shape they did before).
+	AffectedSymbols int      `json:"affected_symbols,omitempty"`
+	AffectedFiles   []string `json:"affected_files,omitempty"`
+	AnalysisID      string   `json:"analysis_id,omitempty"`
+	AnalysisStale   bool     `json:"analysis_stale,omitempty"`
 }
 
 // Result is the full change:assess output. Maps directly to the JSON in
@@ -129,6 +151,22 @@ func Change(conn *sql.DB, req ChangeRequest) (Result, error) {
 	hotZone, err := hotZoneFor(conn, req.ChangedFiles, 14*24*time.Hour)
 	if err != nil {
 		return Result{}, fmt.Errorf("assess: hot zone: %w", err)
+	}
+
+	// Opportunistic canopy enrichment. Construct a HotZone shell if the
+	// path-prefix heuristic didn't yield one — canopy data is per-file, not
+	// per-prefix, so we still want to surface it. Best-effort; failures
+	// don't break scoring.
+	if req.SpaceRoot != "" && len(req.ChangedFiles) > 0 {
+		if hotZone == nil {
+			hotZone = &HotZone{}
+		}
+		enrichHotZoneFromCanopy(hotZone, req.SpaceRoot, req.SourcePath, req.ChangedFiles)
+		// If neither the prefix nor canopy yielded anything, drop the shell
+		// so we don't emit an empty hot_zone block.
+		if hotZone.Path == "" && hotZone.AffectedSymbols == 0 && hotZone.AnalysisID == "" {
+			hotZone = nil
+		}
 	}
 
 	alignment, score, recommendation := categorize(matched)
@@ -535,4 +573,103 @@ func categorize(matched []MatchedInitiative) (Alignment, float64, Recommendation
 func roundTo(f float64, places int) float64 {
 	shift := math.Pow(10, float64(places))
 	return math.Round(f*shift) / shift
+}
+
+// enrichHotZoneFromCanopy looks for cached impact analyses keyed on any of
+// changedFiles and merges their affected-symbol counts and top files into
+// the hot zone. Best-effort: missing cache, missing source, or stale
+// results are surfaced via fields without breaking the score.
+//
+// Decoupling: assess imports analyze (one-way dependency) and never invokes
+// canopy. The cache is populated by `hypha analyze impact` or
+// `assess change`'s caller running it ahead of time.
+func enrichHotZoneFromCanopy(hz *HotZone, spaceRoot, sourcePath string, changedFiles []string) {
+	if hz == nil || spaceRoot == "" || len(changedFiles) == 0 {
+		return
+	}
+
+	// Collect any impact analyses whose target_files intersect changedFiles.
+	candidates, err := analyze.List(spaceRoot, analyze.ListFilter{Kind: types.AnalysisKindImpact})
+	if err != nil {
+		return
+	}
+
+	type pick struct {
+		a   types.Analysis
+		hit string
+	}
+	var best []pick
+	for _, a := range candidates {
+		for _, f := range changedFiles {
+			if a.Target == f || stringSliceContains(a.TargetFiles, f) {
+				best = append(best, pick{a: a, hit: f})
+				break
+			}
+		}
+	}
+	if len(best) == 0 {
+		return
+	}
+
+	// Take the freshest hit per changed file. Newest ComputedAt wins.
+	type fileBest map[string]pick
+	freshest := fileBest{}
+	for _, p := range best {
+		cur, ok := freshest[p.hit]
+		if !ok || p.a.ComputedAt.After(cur.a.ComputedAt) {
+			freshest[p.hit] = p
+		}
+	}
+
+	// Sum across files; merge top files de-duped.
+	totalSymbols := 0
+	stale := false
+	seen := make(map[string]struct{})
+	var topFiles []string
+	var firstID string
+	currentCommit, _ := gitHead(sourcePath)
+	for _, p := range freshest {
+		a := p.a
+		fr := analyze.CheckFreshness(&a, analyze.FreshnessInputs{CurrentCommit: currentCommit})
+		if fr.Stale {
+			stale = true
+		}
+		if firstID == "" {
+			firstID = a.ID
+		}
+		totalSymbols += a.TotalAffected
+		for _, f := range a.TopFiles {
+			if _, ok := seen[f]; ok {
+				continue
+			}
+			seen[f] = struct{}{}
+			topFiles = append(topFiles, f)
+		}
+	}
+
+	hz.AffectedSymbols = totalSymbols
+	hz.AffectedFiles = topFiles
+	hz.AnalysisID = firstID
+	hz.AnalysisStale = stale
+}
+
+// gitHead returns short HEAD for the given source dir; empty on failure.
+// Local to the assess package to avoid a heavier dependency.
+func gitHead(workdir string) (string, error) {
+	cmd := exec.Command("git", "rev-parse", "HEAD")
+	cmd.Dir = workdir
+	out, err := cmd.Output()
+	if err != nil {
+		return "", err
+	}
+	return strings.TrimSpace(string(out)), nil
+}
+
+func stringSliceContains(s []string, v string) bool {
+	for _, e := range s {
+		if e == v {
+			return true
+		}
+	}
+	return false
 }
