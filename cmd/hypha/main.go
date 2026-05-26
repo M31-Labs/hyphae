@@ -37,10 +37,11 @@ import (
 	"m31labs.dev/hyphae/internal/recall"
 	"m31labs.dev/hyphae/internal/receipts"
 	"m31labs.dev/hyphae/internal/spore"
+	"m31labs.dev/hyphae/internal/trace"
 	"m31labs.dev/hyphae/internal/types"
 )
 
-const usage = `hypha — Hyphae v0.1.4 CLI
+const usage = `hypha — Hyphae v0.1.5 CLI
 
 Usage:
   hypha index    rebuild [--root <path>]
@@ -59,6 +60,10 @@ Usage:
   hypha pulse    [--space <uri>] [--window 30d] [--ttl 5m] [--format json|text]
   hypha assess   change --task <text> [--files p1,p2] [--diff-summary <text>] [--space <uri>] [--window 30d] [--format json|text]
   hypha assess   task   --task <text> [--space <uri>] [--window 30d] [--format json|text]
+  hypha trace    start --agent <uri> [--task <id>] [--phase <text>] [--space <uri>] [--format json|text]
+  hypha trace    tick  <trace-id> "<checkpoint>" [--space <uri>]
+  hypha trace    done  <trace-id> [--status succeeded|failed|killed|superseded] [--link-spore <id>] [--space <uri>]
+  hypha trace    list  [--active] [--agent <uri>] [--space <uri>] [--format json|text]
   hypha receipts list [--space <uri>] [--subject <uri>] [--action <name>] [--since 24h] [--limit N]
 
 Separate binary for the browser visualization (GoSX-based):
@@ -109,6 +114,8 @@ func run(args []string) error {
 		return cmdShow(rest)
 	case "spaces":
 		return cmdSpaces(rest)
+	case "trace":
+		return cmdTrace(rest)
 	default:
 		return fmt.Errorf("unknown command %q (try `hypha help`)", group)
 	}
@@ -1284,6 +1291,245 @@ func cmdSpaces(args []string) error {
 	default:
 		return fmt.Errorf("unknown --format %q", *format)
 	}
+}
+
+// --- trace -----------------------------------------------------------------
+
+func cmdTrace(args []string) error {
+	if len(args) == 0 {
+		return errors.New("usage: hypha trace start|tick|done|list [...]")
+	}
+	switch args[0] {
+	case "start":
+		return cmdTraceStart(args[1:])
+	case "tick":
+		return cmdTraceTick(args[1:])
+	case "done":
+		return cmdTraceDone(args[1:])
+	case "list":
+		return cmdTraceList(args[1:])
+	default:
+		return fmt.Errorf("unknown trace subcommand %q (try `start`, `tick`, `done`, `list`)", args[0])
+	}
+}
+
+// resolveSpaceForTrace picks the on-disk space root for trace I/O. If --space
+// is provided it must match an installed space; otherwise the user must have
+// exactly one installed space (or we error with a friendly message).
+func resolveSpaceForTrace(root, spaceFlag string) (spaceRoot, spaceURI string, err error) {
+	spaces, lerr := listSpaces(root)
+	if lerr != nil {
+		return "", "", lerr
+	}
+	if spaceFlag != "" {
+		want := strings.TrimPrefix(spaceFlag, "hypha://")
+		want = strings.TrimRight(want, "/")
+		for _, s := range spaces {
+			if s.URI == want {
+				return s.Path, "hypha://" + s.URI, nil
+			}
+		}
+		return "", "", fmt.Errorf("space %q not installed under %s/spaces", spaceFlag, root)
+	}
+	if len(spaces) == 0 {
+		return "", "", errors.New("no spaces installed; pass --space <uri>")
+	}
+	if len(spaces) > 1 {
+		return "", "", errors.New("multiple spaces installed; pass --space <uri>")
+	}
+	return spaces[0].Path, "hypha://" + spaces[0].URI, nil
+}
+
+func cmdTraceStart(args []string) error {
+	fs := flag.NewFlagSet("trace start", flag.ContinueOnError)
+	spaceFlag := fs.String("space", "", "space URI (required when multiple spaces are installed)")
+	agent := fs.String("agent", "", "agent URI emitting the trace (required)")
+	parent := fs.String("parent", "", "parent agent URI, if dispatched")
+	session := fs.String("session", "", "session identifier, if applicable")
+	taskRef := fs.String("task", "", "task identifier this trace covers")
+	phase := fs.String("phase", "", "short phase label")
+	format := fs.String("format", "text", "json | text")
+	if err := fs.Parse(reorderFlagsFirst(args)); err != nil {
+		return err
+	}
+	if strings.TrimSpace(*agent) == "" {
+		return errors.New("--agent <uri> is required")
+	}
+
+	root, err := resolveRoot("")
+	if err != nil {
+		return err
+	}
+	spaceRoot, spaceURI, err := resolveSpaceForTrace(root, *spaceFlag)
+	if err != nil {
+		return err
+	}
+
+	tr, err := trace.Start(trace.StartOpts{
+		SpaceRoot:    spaceRoot,
+		SpaceID:      spaceURI,
+		AgentID:      *agent,
+		AgentParent:  *parent,
+		AgentSession: *session,
+		TaskRef:      *taskRef,
+		Phase:        *phase,
+	})
+	if err != nil {
+		return err
+	}
+
+	if *format == "json" {
+		enc := json.NewEncoder(os.Stdout)
+		enc.SetIndent("", "  ")
+		return enc.Encode(tr)
+	}
+	fmt.Println(tr.ID)
+	fmt.Fprintf(os.Stderr, "  status:   %s\n  agent:    %s\n  started:  %s\n  file:     %s\n",
+		tr.Status, tr.AgentID, tr.Started.Format(time.RFC3339), tr.FilePath)
+	return nil
+}
+
+func cmdTraceTick(args []string) error {
+	fs := flag.NewFlagSet("trace tick", flag.ContinueOnError)
+	spaceFlag := fs.String("space", "", "space URI (default: only installed space)")
+	if err := fs.Parse(reorderFlagsFirst(args)); err != nil {
+		return err
+	}
+	if fs.NArg() < 2 {
+		return errors.New("usage: hypha trace tick <trace-id> \"<checkpoint message>\"")
+	}
+	traceID := fs.Arg(0)
+	msg := strings.Join(fs.Args()[1:], " ")
+
+	root, err := resolveRoot("")
+	if err != nil {
+		return err
+	}
+	spaceRoot, _, err := resolveSpaceForTrace(root, *spaceFlag)
+	if err != nil {
+		return err
+	}
+	if err := trace.Tick(spaceRoot, traceID, msg); err != nil {
+		return err
+	}
+	fmt.Fprintf(os.Stderr, "tick: %s  %s\n", traceID, msg)
+	return nil
+}
+
+func cmdTraceDone(args []string) error {
+	fs := flag.NewFlagSet("trace done", flag.ContinueOnError)
+	status := fs.String("status", "succeeded", "succeeded | failed | killed | superseded")
+	linked := fs.String("link-spore", "", "spore id to attribute the work log to (optional)")
+	spaceFlag := fs.String("space", "", "space URI (default: only installed space)")
+	format := fs.String("format", "text", "json | text")
+	if err := fs.Parse(reorderFlagsFirst(args)); err != nil {
+		return err
+	}
+	if fs.NArg() == 0 {
+		return errors.New("usage: hypha trace done <trace-id> [--status ...] [--link-spore <id>]")
+	}
+	traceID := fs.Arg(0)
+
+	root, err := resolveRoot("")
+	if err != nil {
+		return err
+	}
+	spaceRoot, _, err := resolveSpaceForTrace(root, *spaceFlag)
+	if err != nil {
+		return err
+	}
+	tr, err := trace.Done(spaceRoot, traceID, *status, *linked)
+	if err != nil {
+		return err
+	}
+
+	if *format == "json" {
+		enc := json.NewEncoder(os.Stdout)
+		enc.SetIndent("", "  ")
+		return enc.Encode(tr)
+	}
+	fmt.Fprintf(os.Stderr, "trace: %s\n  status:        %s\n  ticks:         %d\n  linked_spore:  %s\n  file:          %s\n",
+		tr.ID, tr.Status, len(tr.Ticks), nonEmpty(tr.LinkedSpore, "(none)"), tr.FilePath)
+	return nil
+}
+
+func cmdTraceList(args []string) error {
+	fs := flag.NewFlagSet("trace list", flag.ContinueOnError)
+	activeOnly := fs.Bool("active", false, "only currently-open traces")
+	agent := fs.String("agent", "", "exact agent URI match")
+	spaceFlag := fs.String("space", "", "space URI (default: all installed spaces)")
+	format := fs.String("format", "text", "json | text")
+	if err := fs.Parse(reorderFlagsFirst(args)); err != nil {
+		return err
+	}
+
+	root, err := resolveRoot("")
+	if err != nil {
+		return err
+	}
+	spaces, err := listSpaces(root)
+	if err != nil {
+		return err
+	}
+
+	type row struct {
+		ID        string    `json:"id"`
+		Space     string    `json:"space"`
+		Agent     string    `json:"agent"`
+		Status    string    `json:"status"`
+		Started   time.Time `json:"started"`
+		LastTick  time.Time `json:"last_tick"`
+		Ticks     int       `json:"ticks"`
+		Phase     string    `json:"phase,omitempty"`
+		Path      string    `json:"path"`
+	}
+	var out []row
+
+	for _, sp := range spaces {
+		if *spaceFlag != "" && !spaceMatches(sp, *spaceFlag) {
+			continue
+		}
+		traces, terr := trace.List(sp.Path, trace.ListFilter{ActiveOnly: *activeOnly, Agent: *agent})
+		if terr != nil {
+			fmt.Fprintf(os.Stderr, "warn: list %s: %v\n", sp.URI, terr)
+			continue
+		}
+		for _, t := range traces {
+			out = append(out, row{
+				ID:       t.ID,
+				Space:    t.SpaceID,
+				Agent:    t.AgentID,
+				Status:   t.Status,
+				Started:  t.Started,
+				LastTick: t.LastTick,
+				Ticks:    len(t.Ticks),
+				Phase:    t.Phase,
+				Path:     t.FilePath,
+			})
+		}
+	}
+
+	if *format == "json" {
+		enc := json.NewEncoder(os.Stdout)
+		enc.SetIndent("", "  ")
+		return enc.Encode(out)
+	}
+	if len(out) == 0 {
+		fmt.Println("(no traces)")
+		return nil
+	}
+	for _, r := range out {
+		fmt.Printf("%s  %-10s  ticks=%-2d  %s\n      agent=%s%s\n",
+			r.LastTick.Format("2006-01-02 15:04"), r.Status, r.Ticks, r.ID, r.Agent,
+			func() string {
+				if r.Phase != "" {
+					return "  phase=" + r.Phase
+				}
+				return ""
+			}())
+	}
+	fmt.Fprintf(os.Stderr, "\n(%d traces)\n", len(out))
+	return nil
 }
 
 // --- graph -----------------------------------------------------------------

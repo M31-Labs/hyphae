@@ -24,7 +24,43 @@ const (
 	TypeIntegration ObjectType = "integration"
 	TypeReadme      ObjectType = "readme"
 	TypeIdentity    ObjectType = "identity"
+	TypeTrace       ObjectType = "trace"
 )
+
+// TraceStatus values for the trace lifecycle (per decision 0009).
+const (
+	TraceStatusOpen       = "open"
+	TraceStatusSucceeded  = "succeeded"
+	TraceStatusFailed     = "failed"
+	TraceStatusKilled     = "killed"
+	TraceStatusSuperseded = "superseded"
+)
+
+// Trace is the in-flight, checkpoint-emitted record of how a piece of work
+// happened. Spores say *what* was done; receipts say *it happened, signed*;
+// traces say *how the work went*. See concept.trace + decision.0009.
+type Trace struct {
+	ID           string
+	SpaceID      string
+	AgentID      string
+	AgentParent  string
+	AgentSession string
+	TaskRef      string
+	Phase        string
+	Status       string
+	Started      time.Time
+	LastTick     time.Time
+	LinkedSpore  string
+	Ticks        []Tick
+	Body         string // free-form body (e.g. compacted work-log after `done`)
+	FilePath     string
+}
+
+// Tick is one checkpoint within a Trace.
+type Tick struct {
+	At      time.Time
+	Message string
+}
 
 // Object is the indexed form of a Hyphae artifact.
 type Object struct {
