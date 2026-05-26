@@ -22,3 +22,6 @@ profile.*
 
 # Orchard-stack internal metadata (not part of the public mirror)
 /.graft/
+
+# gosx engine-surface build cache (transient, regenerated at hypha-viz startup)
+/.gosx/
