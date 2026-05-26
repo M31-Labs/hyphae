@@ -537,3 +537,203 @@ func TestUnknownSigner(t *testing.T) {
 		t.Errorf("expected 'unknown signer' in error, got: %v", err)
 	}
 }
+
+// TestProposedWriteRejectsPayloadWrapper guards against the dogfood failure
+// mode where a caller nests write-kind-specific fields under a `payload:` key
+// (e.g. for create_file). Submit silently accepted this; graft then skipped
+// at apply time with "create_file payload missing 'path'". Surface at submit.
+func TestProposedWriteRejectsPayloadWrapper(t *testing.T) {
+	doc := []byte(`---
+mdpp: "0.1"
+id: spore.2026-05-25.test-agent.pw01
+type: spore
+space: hypha://m31labs/hyphae
+status: unreviewed
+created: 2026-05-25T10:00:00Z
+
+agent:
+  id: agent://test/runner
+  kind: ephemeral
+
+confidence: medium
+
+source_refs:
+  - hypha://m31labs/hyphae/concepts/spore
+
+proposed_writes:
+  - kind: create_file
+    target: hypha://m31labs/hyphae
+    payload:
+      path: skills/new-skill.md
+      body: "---\nid: skill.new\n---\n# Body\n"
+---
+
+# Body
+`)
+	_, errs := spore.Parse(doc)
+	if len(errs) == 0 {
+		t.Fatal("expected validation error for proposed_writes[0].payload wrapper, got none")
+	}
+	found := false
+	for _, e := range errs {
+		if strings.Contains(e.Field, "proposed_writes[0]") && strings.Contains(e.Message, "payload") {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Errorf("expected error mentioning payload wrapper on proposed_writes[0], got: %v", errs)
+	}
+}
+
+// TestProposedWriteCreateFileRequiresPathAndBody verifies that submit refuses
+// a create_file write missing 'path' or 'body' instead of deferring the
+// error to graft.
+func TestProposedWriteCreateFileRequiresPathAndBody(t *testing.T) {
+	cases := []struct {
+		name      string
+		writeYAML string
+		want      string
+	}{
+		{
+			name: "missing-path",
+			writeYAML: `proposed_writes:
+  - kind: create_file
+    target: hypha://m31labs/hyphae
+    body: "x"`,
+			want: "path",
+		},
+		{
+			name: "missing-body",
+			writeYAML: `proposed_writes:
+  - kind: create_file
+    target: hypha://m31labs/hyphae
+    path: skills/x.md`,
+			want: "body",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			doc := []byte(fmt.Sprintf(`---
+mdpp: "0.1"
+id: spore.2026-05-25.test-agent.cf01
+type: spore
+space: hypha://m31labs/hyphae
+status: unreviewed
+created: 2026-05-25T10:00:00Z
+
+agent:
+  id: agent://test/runner
+  kind: ephemeral
+
+confidence: medium
+
+source_refs:
+  - hypha://m31labs/hyphae/concepts/spore
+
+%s
+---
+
+# Body
+`, tc.writeYAML))
+			_, errs := spore.Parse(doc)
+			if len(errs) == 0 {
+				t.Fatalf("expected validation error for missing %s, got none", tc.want)
+			}
+			found := false
+			for _, e := range errs {
+				if strings.Contains(e.Field, "proposed_writes[0]") &&
+					(strings.Contains(e.Field, tc.want) || strings.Contains(e.Message, tc.want)) {
+					found = true
+					break
+				}
+			}
+			if !found {
+				t.Errorf("expected error mentioning %q on proposed_writes[0], got: %v", tc.want, errs)
+			}
+		})
+	}
+}
+
+// TestProposedEdgeRejectsSrcMismatch guards against the dogfood failure mode
+// where proposed_edges[i].src does not equal the spore's own id. Graft would
+// persist dangling edges keyed off the YAML's stale src. Surface at submit.
+func TestProposedEdgeRejectsSrcMismatch(t *testing.T) {
+	doc := []byte(`---
+mdpp: "0.1"
+id: spore.2026-05-25.test-agent.em01
+type: spore
+space: hypha://m31labs/hyphae
+status: unreviewed
+created: 2026-05-25T10:00:00Z
+
+agent:
+  id: agent://test/runner
+  kind: ephemeral
+
+confidence: medium
+
+source_refs:
+  - hypha://m31labs/hyphae/concepts/spore
+
+proposed_edges:
+  - kind: cites
+    src: spore.2026-05-25.test-agent.em01-stale
+    dst: concept.spore
+    confidence: 1.0
+---
+
+# Body
+`)
+	_, errs := spore.Parse(doc)
+	if len(errs) == 0 {
+		t.Fatal("expected validation error for proposed_edges[0].src mismatch, got none")
+	}
+	found := false
+	for _, e := range errs {
+		if strings.Contains(e.Field, "proposed_edges[0].src") {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Errorf("expected error on proposed_edges[0].src, got: %v", errs)
+	}
+}
+
+// TestProposedEdgeAcceptsMatchingSrc is the positive case for the prior test:
+// when src == spore.id, validation must pass.
+func TestProposedEdgeAcceptsMatchingSrc(t *testing.T) {
+	doc := []byte(`---
+mdpp: "0.1"
+id: spore.2026-05-25.test-agent.em02
+type: spore
+space: hypha://m31labs/hyphae
+status: unreviewed
+created: 2026-05-25T10:00:00Z
+
+agent:
+  id: agent://test/runner
+  kind: ephemeral
+
+confidence: medium
+
+source_refs:
+  - hypha://m31labs/hyphae/concepts/spore
+
+proposed_edges:
+  - kind: cites
+    src: spore.2026-05-25.test-agent.em02
+    dst: concept.spore
+    confidence: 1.0
+---
+
+# Body
+`)
+	_, errs := spore.Parse(doc)
+	for _, e := range errs {
+		if strings.Contains(e.Field, "proposed_edges") {
+			t.Errorf("unexpected validation error on proposed_edges: %v", e)
+		}
+	}
+}

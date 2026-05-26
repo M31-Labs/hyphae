@@ -74,6 +74,17 @@ var validWriteKinds = map[string]bool{
 	"add_tag":        true,
 }
 
+// requiredWritePayloadKeys names the payload fields each write kind requires.
+// Submit-time validation refuses the spore if any are missing so graft never
+// sees a malformed proposed_write at apply time.
+var requiredWritePayloadKeys = map[string][]string{
+	"create_file":    {"path", "body"},
+	"append_section": {"heading"},
+	"insert_after":   {"heading"},
+	"replace_block":  {"heading"},
+	"add_tag":        {"tag"},
+}
+
 // valid proposed_edge kind values.
 var validEdgeKinds = map[string]bool{
 	"supports":     true,
@@ -237,6 +248,8 @@ func Parse(source []byte) (types.Spore, []ValidationError) {
 		TokenCount:     tokenCount,
 		SubmittedAt:    createdAt,
 	}
+
+	errs = append(errs, validateProposedEdgesAgainstSpore(s)...)
 
 	return s, errs
 }
@@ -480,6 +493,33 @@ func parseProposedWrites(raw any) ([]types.ProposedWrite, []ValidationError) {
 				payload[k] = v
 			}
 		}
+		// Reject a literal "payload:" key — write-kind-specific fields go as
+		// direct siblings of kind/target, not nested. Common dogfood typo;
+		// without this check, graft skips silently at apply time.
+		if _, hasPayloadWrapper := payload["payload"]; hasPayloadWrapper {
+			errs = append(errs, ValidationError{
+				Field:   fmt.Sprintf("proposed_writes[%d]", i),
+				Message: "unexpected 'payload' key; write-kind-specific fields (path, body, heading, tag, ...) go as direct siblings of kind/target",
+			})
+		}
+		// Enforce kind-specific required keys so submit fails closed instead
+		// of letting graft skip with an opaque "missing 'path'" message.
+		for _, key := range requiredWritePayloadKeys[kind] {
+			v, present := payload[key]
+			if !present {
+				errs = append(errs, ValidationError{
+					Field:   fmt.Sprintf("proposed_writes[%d].%s", i, key),
+					Message: fmt.Sprintf("required for kind %q", kind),
+				})
+				continue
+			}
+			if s, ok := v.(string); ok && strings.TrimSpace(s) == "" {
+				errs = append(errs, ValidationError{
+					Field:   fmt.Sprintf("proposed_writes[%d].%s", i, key),
+					Message: fmt.Sprintf("must not be empty for kind %q", kind),
+				})
+			}
+		}
 		out = append(out, types.ProposedWrite{
 			Kind:    kind,
 			Target:  target,
@@ -535,6 +575,24 @@ func parseProposedEdges(raw any) ([]types.ProposedEdge, []ValidationError) {
 		})
 	}
 	return out, errs
+}
+
+// validateProposedEdgesAgainstSpore enforces consistency between the spore's
+// own id and the src field of every proposed_edge. A spore can only emit
+// edges *from itself*; any src mismatch is almost always a stale copy-paste
+// or an id-rewrite that drifted out of sync, and graft would otherwise
+// persist dangling edges. Runs after Parse populates s.ID.
+func validateProposedEdgesAgainstSpore(s types.Spore) []ValidationError {
+	var errs []ValidationError
+	for i, e := range s.ProposedEdges {
+		if e.SrcID != "" && e.SrcID != s.ID {
+			errs = append(errs, ValidationError{
+				Field:   fmt.Sprintf("proposed_edges[%d].src", i),
+				Message: fmt.Sprintf("must equal spore id %q, got %q", s.ID, e.SrcID),
+			})
+		}
+	}
+	return errs
 }
 
 // floatField safely retrieves a float64 from a map.
