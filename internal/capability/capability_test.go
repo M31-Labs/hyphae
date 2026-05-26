@@ -5,8 +5,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/odvcencio/hyphae/internal/db"
-	"github.com/odvcencio/hyphae/internal/types"
+	"m31labs.dev/hyphae/internal/db"
+	"m31labs.dev/hyphae/internal/types"
 )
 
 func TestIssueAndVerify(t *testing.T) {

@@ -22,8 +22,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/odvcencio/hyphae/internal/pulse"
-	"github.com/odvcencio/hyphae/internal/types"
+	"m31labs.dev/hyphae/internal/pulse"
+	"m31labs.dev/hyphae/internal/types"
 )
 
 // ErrInvalidRequest is returned when ChangeRequest has neither a task nor a

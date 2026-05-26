@@ -7,9 +7,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/odvcencio/hyphae/internal/db"
-	"github.com/odvcencio/hyphae/internal/receipts"
-	"github.com/odvcencio/hyphae/internal/types"
+	"m31labs.dev/hyphae/internal/db"
+	"m31labs.dev/hyphae/internal/receipts"
+	"m31labs.dev/hyphae/internal/types"
 )
 
 // openTestDB opens a fresh SQLite DB in the test's temp directory.

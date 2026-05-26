@@ -5,7 +5,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/odvcencio/hyphae/internal/identity"
+	"m31labs.dev/hyphae/internal/identity"
 )
 
 // TestRoundTrip verifies Generate → Save → Load + LoadPrivate → Sign → Verify.

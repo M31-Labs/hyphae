@@ -8,7 +8,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/odvcencio/hyphae/internal/db"
+	"m31labs.dev/hyphae/internal/db"
 )
 
 // openTestDB opens an in-process SQLite DB via db.Open at a temp path.

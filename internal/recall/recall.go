@@ -8,7 +8,7 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/odvcencio/hyphae/internal/types"
+	"m31labs.dev/hyphae/internal/types"
 )
 
 // Anchor is the recall-response form of a citation.

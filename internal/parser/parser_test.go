@@ -4,7 +4,7 @@ import (
 	"os"
 	"testing"
 
-	"github.com/odvcencio/hyphae/internal/types"
+	"m31labs.dev/hyphae/internal/types"
 )
 
 const (

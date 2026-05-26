@@ -8,7 +8,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/odvcencio/hyphae/internal/identity"
+	"m31labs.dev/hyphae/internal/identity"
 	"github.com/odvcencio/mdpp"
 	"gopkg.in/yaml.v3"
 )

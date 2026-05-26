@@ -7,8 +7,8 @@ import (
 	"database/sql"
 	"fmt"
 
-	"github.com/odvcencio/hyphae/internal/graph"
-	"github.com/odvcencio/hyphae/internal/types"
+	"m31labs.dev/hyphae/internal/graph"
+	"m31labs.dev/hyphae/internal/types"
 )
 
 // Node is the JSON shape returned by /api/graph for a graph node.

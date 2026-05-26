@@ -8,9 +8,9 @@ import (
 	"strings"
 
 	"github.com/odvcencio/gosx/server"
-	"github.com/odvcencio/hyphae/internal/recall"
-	"github.com/odvcencio/hyphae/internal/types"
-	"github.com/odvcencio/hyphae/internal/vizdata"
+	"m31labs.dev/hyphae/internal/recall"
+	"m31labs.dev/hyphae/internal/types"
+	"m31labs.dev/hyphae/internal/vizdata"
 )
 
 // handleGraph handles GET /api/graph[?center=&depth=&kind=&limit=].

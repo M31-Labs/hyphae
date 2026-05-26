@@ -14,7 +14,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/odvcencio/hyphae/internal/types"
+	"m31labs.dev/hyphae/internal/types"
 )
 
 // ErrAlreadyExists is returned by Write when a receipt with the same ID

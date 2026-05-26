@@ -7,8 +7,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/odvcencio/hyphae/internal/db"
-	"github.com/odvcencio/hyphae/internal/pulse"
+	"m31labs.dev/hyphae/internal/db"
+	"m31labs.dev/hyphae/internal/pulse"
 )
 
 // helpers --------------------------------------------------------------------

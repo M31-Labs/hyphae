@@ -9,9 +9,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/odvcencio/hyphae/internal/identity"
-	"github.com/odvcencio/hyphae/internal/spore"
-	"github.com/odvcencio/hyphae/internal/types"
+	"m31labs.dev/hyphae/internal/identity"
+	"m31labs.dev/hyphae/internal/spore"
+	"m31labs.dev/hyphae/internal/types"
 )
 
 // validSporeDoc is a minimal valid spore document modelled on the example in

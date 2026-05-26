@@ -13,7 +13,7 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/odvcencio/hyphae/internal/types"
+	"m31labs.dev/hyphae/internal/types"
 )
 
 // Issue persists a new capability and returns it. expires is the lifetime

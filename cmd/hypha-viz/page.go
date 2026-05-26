@@ -6,7 +6,7 @@ import (
 	"github.com/odvcencio/gosx"
 	"github.com/odvcencio/gosx/engine/surface"
 	"github.com/odvcencio/gosx/server"
-	"github.com/odvcencio/hyphae/cmd/hypha-viz/graphsurface"
+	"m31labs.dev/hyphae/cmd/hypha-viz/graphsurface"
 )
 
 // pageCSS is the embedded stylesheet for the knowledge graph viewer.

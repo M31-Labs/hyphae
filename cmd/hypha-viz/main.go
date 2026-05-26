@@ -26,9 +26,9 @@ import (
 	"github.com/odvcencio/gosx"
 	"github.com/odvcencio/gosx/engine/surface"
 	"github.com/odvcencio/gosx/server"
-	"github.com/odvcencio/hyphae/cmd/hypha-viz/graphsurface"
-	"github.com/odvcencio/hyphae/internal/db"
-	"github.com/odvcencio/hyphae/internal/vizdata"
+	"m31labs.dev/hyphae/cmd/hypha-viz/graphsurface"
+	"m31labs.dev/hyphae/internal/db"
+	"m31labs.dev/hyphae/internal/vizdata"
 )
 
 const usageText = `hypha-viz — Hyphae knowledge-graph visualization server

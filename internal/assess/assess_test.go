@@ -7,10 +7,10 @@ import (
 	"testing"
 	"time"
 
-	"github.com/odvcencio/hyphae/internal/assess"
-	"github.com/odvcencio/hyphae/internal/db"
-	"github.com/odvcencio/hyphae/internal/recall"
-	"github.com/odvcencio/hyphae/internal/types"
+	"m31labs.dev/hyphae/internal/assess"
+	"m31labs.dev/hyphae/internal/db"
+	"m31labs.dev/hyphae/internal/recall"
+	"m31labs.dev/hyphae/internal/types"
 )
 
 // --- fixture helpers --------------------------------------------------------

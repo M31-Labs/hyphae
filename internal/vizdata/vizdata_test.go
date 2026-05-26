@@ -5,8 +5,8 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/odvcencio/hyphae/internal/db"
-	"github.com/odvcencio/hyphae/internal/vizdata"
+	"m31labs.dev/hyphae/internal/db"
+	"m31labs.dev/hyphae/internal/vizdata"
 )
 
 func openTestDB(t *testing.T) *sql.DB {

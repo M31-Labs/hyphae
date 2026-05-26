@@ -10,8 +10,8 @@ import (
 
 	"github.com/odvcencio/gosx"
 	"github.com/odvcencio/gosx/server"
-	"github.com/odvcencio/hyphae/cmd/hypha-viz/graphsurface"
-	"github.com/odvcencio/hyphae/internal/db"
+	"m31labs.dev/hyphae/cmd/hypha-viz/graphsurface"
+	"m31labs.dev/hyphae/internal/db"
 )
 
 // buildTestApp creates a GoSX app backed by a temp DB for smoke testing.
