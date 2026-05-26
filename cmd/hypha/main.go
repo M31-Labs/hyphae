@@ -14,6 +14,7 @@ package main
 
 import (
 	"bytes"
+	"crypto/sha256"
 	"database/sql"
 	"encoding/json"
 	"errors"
@@ -41,9 +42,10 @@ import (
 	"m31labs.dev/hyphae/internal/spore"
 	"m31labs.dev/hyphae/internal/trace"
 	"m31labs.dev/hyphae/internal/types"
+	mdppfmt "m31labs.dev/mdpp/fmt"
 )
 
-const usage = `hypha — Hyphae v0.1.5 CLI
+const usage = `hypha — Hyphae v0.1.6 CLI
 
 Usage:
   hypha index    rebuild [--root <path>]
@@ -52,25 +54,30 @@ Usage:
   hypha spaces   list [--format json|text]
   hypha spore    submit <file> [--sign --as <identity-uri>]
   hypha spore    list   [--space <uri>] [--status <state>] [--since 24h] [--limit N] [--format json|text]
+  hypha spore    accept <spore-id> --as <identity> [--reason "..."] [--space <uri>]
+  hypha spore    reject <spore-id> --as <identity> [--reason "..."] [--space <uri>]
   hypha cap      issue --subject <uri> --space <uri> [--permissions p1,p2] [--expires 24h]
   hypha identity init --name <name> --authority <auth> --space <uri> [--expires 1y]
   hypha identity list
-  hypha graft    <spore-id> --as <identity-uri> [--space <hypha-uri>] [--verify]
+  hypha graft    <spore-id> --as <identity-uri> [--space <hypha-uri>] [--verify] [--no-fmt]
   hypha graph    backlinks <object-id> [--kind k1,k2] [--limit N]
   hypha graph    related   <object-id> [--kind k1,k2] [--limit N]
   hypha graph    trace     <object-id> [--kind derived_from,cites] [--max-depth 4]
   hypha pulse    [--space <uri>] [--window 30d] [--ttl 5m] [--format json|text]
-  hypha assess   change --task <text> [--files p1,p2] [--diff-summary <text>] [--space <uri>] [--window 30d] [--format json|text]
-  hypha assess   task   --task <text> [--space <uri>] [--window 30d] [--format json|text]
-  hypha trace    start --agent <uri> [--task <id>] [--phase <text>] [--space <uri>] [--format json|text]
-  hypha trace    tick  <trace-id> "<checkpoint>" [--space <uri>]
-  hypha trace    done  <trace-id> [--status succeeded|failed|killed|superseded] [--link-spore <id>] [--space <uri>]
-  hypha trace    list  [--active] [--agent <uri>] [--space <uri>] [--format json|text]
+  hypha assess   change --task <text> [--files p1,p2] [--diff-summary <text>] [--space <uri>] [--source <path>] [--format json|text]
+  hypha assess   task   --task <text> [--space <uri>] [--format json|text]
+  hypha assess   pr     --task <text> --base <ref> [--space <uri>] [--source <path>] [--format json|text]
+  hypha trace    start  --agent <uri> [--task <id>] [--phase <text>] [--space <uri>]
+  hypha trace    tick   <trace-id> "<checkpoint>" [--space <uri>]
+  hypha trace    done   <trace-id> [--status succeeded|failed|killed|superseded] [--link-spore <id>] [--space <uri>]
+  hypha trace    list   [--active] [--agent <uri>] [--space <uri>] [--format json|text]
+  hypha trace    history [--similar <q>] [--task <id>] [--agent <uri>] [--include-open] [--limit N] [--space <uri>]
+  hypha trace    tail   [--id <trace-id>] [--agent <uri>] [--interval 1s] [--timeout 5m] [--space <uri>]
   hypha analyze  <kind> [target] [--space <uri>] [--source <path>] [--diff-ref <ref>] [--max-depth N] [--refresh]
                        kinds: impact, callgraph, refs, hotspot, dead, review
-  hypha analyze  list  [--kind <k>] [--space <uri>] [--target-file <path>] [--format json|text]
+  hypha analyze  list   [--kind <k>] [--space <uri>] [--target-file <path>] [--format json|text]
   hypha analyze  refresh <id> [--space <uri>] [--source <path>]
-  hypha receipts list [--space <uri>] [--subject <uri>] [--action <name>] [--since 24h] [--limit N]
+  hypha receipts list   [--space <uri>] [--subject <uri>] [--action <name>] [--since 24h] [--limit N]
 
 Separate binary for the browser visualization (GoSX-based):
   hypha-viz       [--addr 127.0.0.1:7777] [--root <hyphae-home>]
@@ -233,7 +240,7 @@ func nonEmpty(s, fallback string) string {
 
 func cmdAssess(args []string) error {
 	if len(args) == 0 {
-		return errors.New("usage: hypha assess change|task --task <text> [...]")
+		return errors.New("usage: hypha assess change|task|pr [...]")
 	}
 	sub, rest := args[0], args[1:]
 	switch sub {
@@ -241,9 +248,148 @@ func cmdAssess(args []string) error {
 		return cmdAssessChange(rest)
 	case "task":
 		return cmdAssessTask(rest)
+	case "pr":
+		return cmdAssessPR(rest)
 	default:
-		return fmt.Errorf("unknown assess subcommand %q (try `change`, `task`)", sub)
+		return fmt.Errorf("unknown assess subcommand %q (try `change`, `task`, `pr`)", sub)
 	}
+}
+
+// cmdAssessPR derives a file list and diff summary from a git ref range,
+// then runs the assess.Change scorer. Thin convenience over `assess change`.
+// With --space and an installed canopy index, also folds cached impact
+// analyses into hot_zone (same as `assess change`).
+func cmdAssessPR(args []string) error {
+	fs := flag.NewFlagSet("assess pr", flag.ContinueOnError)
+	task := fs.String("task", "", "natural-language description of the PR (required)")
+	base := fs.String("base", "origin/main", "git ref to diff against")
+	source := fs.String("source", "", "source repo path (defaults via space convention; otherwise cwd)")
+	spaceURI := fs.String("space", "", "space URI (default: all spaces)")
+	windowStr := fs.String("window", "30d", "Go duration window for recent-pressure aggregation")
+	budgetTokens := fs.Int("budget-tokens", 1500, "soft response token budget")
+	format := fs.String("format", "json", "json | text")
+	if err := fs.Parse(reorderFlagsFirst(args)); err != nil {
+		return err
+	}
+	if strings.TrimSpace(*task) == "" {
+		return errors.New("assess pr requires --task <text>")
+	}
+
+	window, err := parseFlexDuration(*windowStr)
+	if err != nil {
+		return fmt.Errorf("--window %q: %w", *windowStr, err)
+	}
+
+	// Resolve source path.
+	root, err := resolveRoot("")
+	if err != nil {
+		return err
+	}
+	srcPath := *source
+	if srcPath == "" && *spaceURI != "" {
+		if p, err := resolveSourceForSpace(*spaceURI, ""); err == nil {
+			srcPath = p
+		}
+	}
+	if srcPath == "" {
+		cwd, _ := os.Getwd()
+		srcPath = cwd
+	}
+
+	// Derive --files via `git diff --name-only <base>...HEAD`.
+	files, err := gitChangedFiles(srcPath, *base)
+	if err != nil {
+		return fmt.Errorf("assess pr: derive files from %s: %w", *base, err)
+	}
+	if len(files) == 0 {
+		return fmt.Errorf("assess pr: no changed files vs %s (nothing to score)", *base)
+	}
+
+	// Derive a diff-summary from `git diff --stat <base>...HEAD` (one line).
+	diffSummary, _ := gitDiffStat(srcPath, *base)
+
+	conn, err := openIndex(root)
+	if err != nil {
+		return err
+	}
+	defer conn.Close()
+
+	req := assess.ChangeRequest{
+		Task:         *task,
+		ChangedFiles: files,
+		DiffSummary:  diffSummary,
+		Space:        *spaceURI,
+		Window:       window,
+		Budget:       types.Budget{MaxResponseTokens: *budgetTokens, Shape: types.ShapeCitedSpans},
+		SourcePath:   srcPath,
+	}
+	if *spaceURI != "" {
+		if sr, _, err := resolveSpaceForTrace(root, *spaceURI); err == nil {
+			req.SpaceRoot = sr
+		}
+	}
+
+	res, err := assess.Change(conn, req)
+	if err != nil {
+		return err
+	}
+
+	if *format == "json" {
+		enc := json.NewEncoder(os.Stdout)
+		enc.SetIndent("", "  ")
+		// Include the derived inputs in the JSON for traceability.
+		envelope := map[string]any{
+			"task":          *task,
+			"base_ref":      *base,
+			"changed_files": files,
+			"diff_summary":  diffSummary,
+			"result":        res,
+		}
+		return enc.Encode(envelope)
+	}
+	fmt.Printf("Base ref:      %s\n", *base)
+	fmt.Printf("Changed files: %d\n", len(files))
+	if diffSummary != "" {
+		fmt.Printf("Diff summary:  %s\n", diffSummary)
+	}
+	fmt.Println()
+	printAssessText(os.Stdout, res)
+	return nil
+}
+
+// gitChangedFiles returns the file paths changed between base...HEAD.
+func gitChangedFiles(workdir, base string) ([]string, error) {
+	cmd := exec.Command("git", "diff", "--name-only", base+"...HEAD")
+	cmd.Dir = workdir
+	out, err := cmd.Output()
+	if err != nil {
+		// Fall back: maybe base is the current diff (e.g. "HEAD").
+		cmd2 := exec.Command("git", "diff", "--name-only", base)
+		cmd2.Dir = workdir
+		out, err = cmd2.Output()
+		if err != nil {
+			return nil, err
+		}
+	}
+	var files []string
+	for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
+		line = strings.TrimSpace(line)
+		if line != "" {
+			files = append(files, line)
+		}
+	}
+	return files, nil
+}
+
+// gitDiffStat returns a single-line diff summary ("4 files changed, 23 insertions(+), 8 deletions(-)").
+func gitDiffStat(workdir, base string) (string, error) {
+	cmd := exec.Command("git", "diff", "--shortstat", base+"...HEAD")
+	cmd.Dir = workdir
+	out, err := cmd.Output()
+	if err != nil {
+		return "", err
+	}
+	return strings.TrimSpace(string(out)), nil
 }
 
 // cmdAssessTask runs the alignment scorer with task-only input (no files,
@@ -393,8 +539,23 @@ func printAssessText(w io.Writer, r assess.Result) {
 		}
 	}
 	if r.HotZone != nil {
-		fmt.Fprintf(w, "\nHot zone: %s  (grafts/14d=%d, incidents/14d=%d)\n",
-			r.HotZone.Path, r.HotZone.Commits14d, r.HotZone.Incidents14d)
+		hz := r.HotZone
+		fmt.Fprintln(w, "\nHot zone:")
+		if hz.Path != "" {
+			fmt.Fprintf(w, "  path:         %s\n", hz.Path)
+		}
+		fmt.Fprintf(w, "  grafts/14d:   %d\n", hz.Commits14d)
+		fmt.Fprintf(w, "  incidents/14d:%d\n", hz.Incidents14d)
+		if hz.AffectedSymbols > 0 {
+			fmt.Fprintf(w, "  affected:     %d symbols, %d files\n", hz.AffectedSymbols, len(hz.AffectedFiles))
+		}
+		if hz.AnalysisID != "" {
+			stale := ""
+			if hz.AnalysisStale {
+				stale = " (STALE)"
+			}
+			fmt.Fprintf(w, "  analysis:     %s%s\n", hz.AnalysisID, stale)
+		}
 	}
 	fmt.Fprintf(w, "\nTokens used: %d\n", r.TokensUsed)
 }
@@ -592,16 +753,219 @@ func cmdRecall(args []string) error {
 
 func cmdSpore(args []string) error {
 	if len(args) == 0 {
-		return errors.New("usage: hypha spore submit <file> [...]  |  hypha spore list [...]")
+		return errors.New("usage: hypha spore submit|list|accept|reject [...]")
 	}
 	switch args[0] {
 	case "submit":
 		return cmdSporeSubmit(args[1:])
 	case "list":
 		return cmdSporeList(args[1:])
+	case "accept":
+		return cmdSporeReview(args[1:], "accepted")
+	case "reject":
+		return cmdSporeReview(args[1:], "rejected")
 	default:
-		return fmt.Errorf("unknown spore subcommand %q (try `submit`, `list`)", args[0])
+		return fmt.Errorf("unknown spore subcommand %q (try `submit`, `list`, `accept`, `reject`)", args[0])
 	}
+}
+
+// cmdSporeReview flips an unreviewed spore to `accepted` or `rejected`,
+// writes a receipt, and updates the file in place. No canonical writes —
+// that's still `hypha graft`'s job. Useful for queuing spores for later
+// graft, or formally rejecting a contribution without applying it.
+func cmdSporeReview(args []string, newStatus string) error {
+	fs := flag.NewFlagSet("spore review", flag.ContinueOnError)
+	spaceFlag := fs.String("space", "", "space URI containing the spore")
+	asURI := fs.String("as", "", "reviewer identity URI (recorded in the receipt)")
+	reason := fs.String("reason", "", "optional human-readable reason (recorded in metadata)")
+	format := fs.String("format", "json", "json | text")
+	if err := fs.Parse(reorderFlagsFirst(args)); err != nil {
+		return err
+	}
+	if fs.NArg() == 0 {
+		return fmt.Errorf("usage: hypha spore %s <spore-id> --as <identity> [--reason \"...\"] [--space <uri>]", newStatus)
+	}
+	sporeID := fs.Arg(0)
+	if strings.TrimSpace(*asURI) == "" {
+		return errors.New("--as <identity-uri> is required")
+	}
+
+	root, err := resolveRoot("")
+	if err != nil {
+		return err
+	}
+
+	// Locate the spore file across spaces (or in the named space).
+	var spacePath, spaceURI string
+	if *spaceFlag != "" {
+		sr, su, err := resolveSpaceForTrace(root, *spaceFlag)
+		if err != nil {
+			return err
+		}
+		spacePath = sr
+		spaceURI = su
+	} else {
+		sr, err := findSporeSpaceRoot(root, sporeID)
+		if err != nil {
+			return err
+		}
+		spacePath = sr
+		// Derive space URI from path basename ("m31labs-hyphae" → "hypha://m31labs/hyphae").
+		spaceURI = spaceURIFromDir(spacePath)
+	}
+	sporePath, err := findSporeFilePath(spacePath, sporeID)
+	if err != nil {
+		return err
+	}
+
+	// Read, flip status, write back. Only allow flips from unreviewed.
+	data, err := os.ReadFile(sporePath)
+	if err != nil {
+		return err
+	}
+	cur, ok := readFrontmatterField(data, "status")
+	if !ok {
+		return fmt.Errorf("spore review: %s has no status field", sporeID)
+	}
+	if cur != "unreviewed" {
+		return fmt.Errorf("spore review: status is %q (only unreviewed spores can be reviewed); for already-graphed spores use `hypha graft`", cur)
+	}
+	updated := writeFrontmatterField(data, "status", newStatus)
+	if err := os.WriteFile(sporePath, updated, 0o644); err != nil {
+		return fmt.Errorf("spore review: write %s: %w", sporePath, err)
+	}
+
+	// Persist a receipt.
+	action := "spore:" + newStatus // "spore:accepted" or "spore:rejected"
+	metadata := ""
+	if strings.TrimSpace(*reason) != "" {
+		if b, err := json.Marshal(map[string]string{"reason": *reason}); err == nil {
+			metadata = string(b)
+		}
+	}
+	hash := sha256.Sum256(updated)
+	receipt := types.Receipt{
+		ID:              fmt.Sprintf("hypha-receipt:%s:%s:%s", action, time.Now().UTC().Format("2006-01-02"), shortHash(hash[:])),
+		SpaceID:         spaceURI,
+		SubjectID:       sporeID,
+		SubjectKind:     "spore",
+		Action:          action,
+		Status:          "ok",
+		ContentHash:     fmt.Sprintf("%x", hash[:]),
+		IdentityID:      *asURI,
+		CreatedAt:       time.Now().UTC(),
+		PermissionsUsed: []string{"spore:review"},
+		NextState:       newStatus,
+		MetadataJSON:    metadata,
+	}
+	if conn, dbErr := openIndex(root); dbErr == nil {
+		defer conn.Close()
+		if wErr := receipts.Write(conn, receipt); wErr != nil && !errors.Is(wErr, receipts.ErrAlreadyExists) {
+			fmt.Fprintf(os.Stderr, "warn: persist receipt: %v\n", wErr)
+		}
+	}
+
+	out := map[string]any{
+		"spore_id":     sporeID,
+		"status_was":   cur,
+		"status_now":   newStatus,
+		"reviewer":     *asURI,
+		"path":         sporePath,
+		"receipt_id":   receipt.ID,
+		"content_hash": receipt.ContentHash,
+	}
+	if *format == "json" {
+		enc := json.NewEncoder(os.Stdout)
+		enc.SetIndent("", "  ")
+		return enc.Encode(out)
+	}
+	fmt.Printf("Spore %s: %s → %s\n", sporeID, cur, newStatus)
+	fmt.Printf("  Reviewer: %s\n", *asURI)
+	fmt.Printf("  Receipt:  %s\n", receipt.ID)
+	fmt.Printf("  Path:     %s\n", sporePath)
+	return nil
+}
+
+// readFrontmatterField extracts the value of a top-level `key: value` field
+// from a YAML frontmatter block (the bytes between the first two `---`).
+// Returns ("", false) on miss.
+func readFrontmatterField(data []byte, key string) (string, bool) {
+	s := string(data)
+	if !strings.HasPrefix(s, "---\n") {
+		return "", false
+	}
+	rest := s[len("---\n"):]
+	end := strings.Index(rest, "\n---\n")
+	if end < 0 {
+		end = strings.Index(rest, "\n---\r\n")
+	}
+	if end < 0 {
+		return "", false
+	}
+	for _, line := range strings.Split(rest[:end], "\n") {
+		if !strings.HasPrefix(line, key+":") {
+			continue
+		}
+		v := strings.TrimSpace(strings.TrimPrefix(line, key+":"))
+		v = strings.Trim(v, `"`)
+		return v, true
+	}
+	return "", false
+}
+
+// writeFrontmatterField replaces (or appends, on miss) the value of a
+// top-level field in the YAML frontmatter block. Pure text edit; preserves
+// surrounding formatting.
+func writeFrontmatterField(data []byte, key, value string) []byte {
+	s := string(data)
+	if !strings.HasPrefix(s, "---\n") {
+		return data
+	}
+	rest := s[len("---\n"):]
+	end := strings.Index(rest, "\n---\n")
+	if end < 0 {
+		return data
+	}
+	fmBlock := rest[:end]
+	var nb strings.Builder
+	nb.WriteString("---\n")
+	replaced := false
+	for _, line := range strings.Split(fmBlock, "\n") {
+		if !replaced && strings.HasPrefix(line, key+":") {
+			fmt.Fprintf(&nb, "%s: %s\n", key, value)
+			replaced = true
+			continue
+		}
+		nb.WriteString(line)
+		nb.WriteString("\n")
+	}
+	if !replaced {
+		fmt.Fprintf(&nb, "%s: %s\n", key, value)
+	}
+	nb.WriteString("---\n")
+	nb.WriteString(rest[end+len("\n---\n"):])
+	return []byte(nb.String())
+}
+
+// spaceURIFromDir reconstructs a hypha:// URI from a space dir path.
+// "/home/.../spaces/m31labs-hyphae" → "hypha://m31labs/hyphae".
+func spaceURIFromDir(spaceDir string) string {
+	base := filepath.Base(spaceDir)
+	// First "-" separates authority from name in our scaffold convention.
+	if idx := strings.Index(base, "-"); idx > 0 {
+		return "hypha://" + base[:idx] + "/" + base[idx+1:]
+	}
+	return "hypha://" + base
+}
+
+// shortHash returns the first 7 hex chars of a SHA digest.
+func shortHash(sum []byte) string {
+	const hexdigits = "0123456789abcdef"
+	out := make([]byte, 0, 7)
+	for _, b := range sum[:4] { // 4 bytes = 8 hex chars; trim to 7
+		out = append(out, hexdigits[b>>4], hexdigits[b&0x0f])
+	}
+	return string(out[:7])
 }
 
 func cmdSporeSubmit(rest []string) error {
@@ -998,6 +1362,7 @@ func cmdGraft(args []string) error {
 	grafter := fs.String("as", "", "grafter identity URI (recorded in the receipt)")
 	spaceURI := fs.String("space", "", "space URI override (auto-detected from inbox if omitted)")
 	verify := fs.Bool("verify", false, "verify Ed25519 signature on the spore before applying")
+	noFmt := fs.Bool("no-fmt", false, "skip the mdpp.fmt pass on touched canonical files (formatting on by default)")
 	if err := fs.Parse(reorderFlagsFirst(args)); err != nil {
 		return err
 	}
@@ -1054,6 +1419,19 @@ func cmdGraft(args []string) error {
 		return fmt.Errorf("graft: %w", err)
 	}
 
+	// mdpp.fmt pass on touched files: normalize canonical state so the
+	// post-graft tree stays canonical. Best-effort — failures are logged
+	// but don't unwind the graft (the apply already persisted).
+	if !*noFmt {
+		for _, p := range result.TouchedFiles {
+			if changed, ferr := formatMdppFile(p); ferr != nil {
+				fmt.Fprintf(os.Stderr, "warn: mdpp.fmt %s: %v\n", p, ferr)
+			} else if changed {
+				fmt.Fprintf(os.Stderr, "fmt: %s\n", p)
+			}
+		}
+	}
+
 	// Persist the graft receipt to the audit log.
 	if wErr := receipts.Write(conn, result.Receipt); wErr != nil && !errors.Is(wErr, receipts.ErrAlreadyExists) {
 		fmt.Fprintf(os.Stderr, "warn: failed to persist graft receipt: %v\n", wErr)
@@ -1067,6 +1445,27 @@ func cmdGraft(args []string) error {
 	fmt.Fprintf(os.Stderr, "\nGrafted %s → status: %s (applied %d, skipped %d)\n",
 		result.SporeID, result.NewSporeStatus, len(result.AppliedWrites), len(result.SkippedWrites))
 	return nil
+}
+
+// formatMdppFile runs mdpp.fmt on a single file and rewrites it if the
+// output differs. Returns (changed, error). Safe to call on any .md file —
+// mdpp.fmt is idempotent and preserves protected fences.
+func formatMdppFile(path string) (bool, error) {
+	src, err := os.ReadFile(path)
+	if err != nil {
+		return false, err
+	}
+	out, err := mdppfmt.Format(src)
+	if err != nil {
+		return false, err
+	}
+	if bytes.Equal(src, out) {
+		return false, nil
+	}
+	if err := os.WriteFile(path, out, 0o644); err != nil {
+		return false, err
+	}
+	return true, nil
 }
 
 // findSporeSpaceRoot scans every space's inbox/agents/ for a spore whose
@@ -1318,7 +1717,7 @@ func cmdSpaces(args []string) error {
 
 func cmdTrace(args []string) error {
 	if len(args) == 0 {
-		return errors.New("usage: hypha trace start|tick|done|list [...]")
+		return errors.New("usage: hypha trace start|tick|done|list|history|tail [...]")
 	}
 	switch args[0] {
 	case "start":
@@ -1329,8 +1728,12 @@ func cmdTrace(args []string) error {
 		return cmdTraceDone(args[1:])
 	case "list":
 		return cmdTraceList(args[1:])
+	case "history":
+		return cmdTraceHistory(args[1:])
+	case "tail":
+		return cmdTraceTail(args[1:])
 	default:
-		return fmt.Errorf("unknown trace subcommand %q (try `start`, `tick`, `done`, `list`)", args[0])
+		return fmt.Errorf("unknown trace subcommand %q (try `start`, `tick`, `done`, `list`, `history`, `tail`)", args[0])
 	}
 }
 
@@ -1551,6 +1954,274 @@ func cmdTraceList(args []string) error {
 	}
 	fmt.Fprintf(os.Stderr, "\n(%d traces)\n", len(out))
 	return nil
+}
+
+// cmdTraceHistory queries the FTS5 index for closed traces matching --similar
+// (free-text), optionally filtered by --task or --agent. Methodology recall:
+// "how was a similar problem approached before."
+func cmdTraceHistory(args []string) error {
+	fs := flag.NewFlagSet("trace history", flag.ContinueOnError)
+	similar := fs.String("similar", "", "free-text query against trace bodies")
+	taskRef := fs.String("task", "", "filter to traces with this task_ref")
+	agent := fs.String("agent", "", "filter to traces from this agent URI")
+	includeOpen := fs.Bool("include-open", false, "include currently-open traces (default: closed only)")
+	limit := fs.Int("limit", 10, "max results")
+	spaceFlag := fs.String("space", "", "scope FTS to one space URI")
+	format := fs.String("format", "text", "json | text")
+	if err := fs.Parse(reorderFlagsFirst(args)); err != nil {
+		return err
+	}
+	if *similar == "" && *taskRef == "" && *agent == "" {
+		return errors.New("usage: hypha trace history [--similar <q>] [--task <id>] [--agent <uri>]")
+	}
+
+	root, err := resolveRoot("")
+	if err != nil {
+		return err
+	}
+	spaces, err := listSpaces(root)
+	if err != nil {
+		return err
+	}
+
+	// If --similar is set, do a typed FTS5 query first; otherwise scan all
+	// trace files via the trace package.
+	type row struct {
+		ID       string    `json:"id"`
+		Space    string    `json:"space"`
+		Agent    string    `json:"agent"`
+		Status   string    `json:"status"`
+		TaskRef  string    `json:"task_ref,omitempty"`
+		Phase    string    `json:"phase,omitempty"`
+		Ticks    int       `json:"ticks"`
+		LastTick time.Time `json:"last_tick"`
+		Path     string    `json:"path"`
+		Snippet  string    `json:"snippet,omitempty"`
+	}
+	var out []row
+
+	var fts5Matches map[string]float64 // id → BM25 rank (lower is better)
+	if *similar != "" {
+		conn, derr := openIndex(root)
+		if derr != nil {
+			return derr
+		}
+		defer conn.Close()
+
+		sanitized := sanitizeTraceQuery(*similar)
+		if sanitized != "" {
+			ftsSQL := `
+SELECT f.id, bm25(objects_fts, 3.0, 2.0, 2.0, 1.0) AS rank
+FROM objects_fts f
+WHERE objects_fts MATCH ?
+  AND f.type = 'trace'
+ORDER BY rank
+LIMIT ?`
+			rows, qerr := conn.Query(ftsSQL, sanitized, *limit*5)
+			if qerr != nil {
+				return fmt.Errorf("trace history: fts: %w", qerr)
+			}
+			defer rows.Close()
+			fts5Matches = make(map[string]float64)
+			for rows.Next() {
+				var id string
+				var rank float64
+				if err := rows.Scan(&id, &rank); err != nil {
+					return err
+				}
+				fts5Matches[id] = rank
+			}
+		}
+	}
+
+	for _, sp := range spaces {
+		if *spaceFlag != "" && !spaceMatches(sp, *spaceFlag) {
+			continue
+		}
+		traces, lerr := trace.List(sp.Path, trace.ListFilter{Agent: *agent})
+		if lerr != nil {
+			continue
+		}
+		for _, t := range traces {
+			if !*includeOpen && t.Status == types.TraceStatusOpen {
+				continue
+			}
+			if *taskRef != "" && t.TaskRef != *taskRef {
+				continue
+			}
+			if *similar != "" {
+				if _, ok := fts5Matches[t.ID]; !ok {
+					continue
+				}
+			}
+			out = append(out, row{
+				ID:       t.ID,
+				Space:    t.SpaceID,
+				Agent:    t.AgentID,
+				Status:   t.Status,
+				TaskRef:  t.TaskRef,
+				Phase:    t.Phase,
+				Ticks:    len(t.Ticks),
+				LastTick: t.LastTick,
+				Path:     t.FilePath,
+			})
+		}
+	}
+
+	// Order: if similar was given, by FTS rank (lower = better); else by recency.
+	if *similar != "" && fts5Matches != nil {
+		sort.SliceStable(out, func(i, j int) bool {
+			return fts5Matches[out[i].ID] < fts5Matches[out[j].ID]
+		})
+	} else {
+		sort.SliceStable(out, func(i, j int) bool { return out[i].LastTick.After(out[j].LastTick) })
+	}
+	if len(out) > *limit {
+		out = out[:*limit]
+	}
+
+	if *format == "json" {
+		enc := json.NewEncoder(os.Stdout)
+		enc.SetIndent("", "  ")
+		return enc.Encode(out)
+	}
+	if len(out) == 0 {
+		fmt.Println("(no matching traces)")
+		return nil
+	}
+	for _, r := range out {
+		fmt.Printf("%s  %-10s  ticks=%-2d  %s\n      agent=%s%s%s\n",
+			r.LastTick.Format("2006-01-02 15:04"), r.Status, r.Ticks, r.ID, r.Agent,
+			func() string {
+				if r.TaskRef != "" {
+					return "  task=" + r.TaskRef
+				}
+				return ""
+			}(),
+			func() string {
+				if r.Phase != "" {
+					return "  phase=" + r.Phase
+				}
+				return ""
+			}())
+	}
+	fmt.Fprintf(os.Stderr, "\n(%d traces)\n", len(out))
+	return nil
+}
+
+// sanitizeTraceQuery mirrors recall's strip-to-alphanum approach so FTS5 won't
+// choke on punctuation in user queries.
+func sanitizeTraceQuery(q string) string {
+	var b strings.Builder
+	b.Grow(len(q))
+	for _, r := range q {
+		switch {
+		case r >= 'a' && r <= 'z',
+			r >= 'A' && r <= 'Z',
+			r >= '0' && r <= '9':
+			b.WriteRune(r)
+		default:
+			b.WriteByte(' ')
+		}
+	}
+	return strings.Join(strings.Fields(b.String()), " ")
+}
+
+// cmdTraceTail polls trace files and prints new ticks as they arrive. No
+// fsnotify dependency — just compare ticks-len at a polling interval until
+// timeout / signal / max-ticks reached.
+func cmdTraceTail(args []string) error {
+	fs := flag.NewFlagSet("trace tail", flag.ContinueOnError)
+	traceID := fs.String("id", "", "specific trace id to tail (default: all open traces)")
+	agent := fs.String("agent", "", "tail only traces from this agent URI")
+	spaceFlag := fs.String("space", "", "scope to one space URI")
+	interval := fs.Duration("interval", time.Second, "polling interval")
+	timeout := fs.Duration("timeout", 5*time.Minute, "stop after this duration (0 = forever)")
+	if err := fs.Parse(reorderFlagsFirst(args)); err != nil {
+		return err
+	}
+
+	root, err := resolveRoot("")
+	if err != nil {
+		return err
+	}
+	spaces, err := listSpaces(root)
+	if err != nil {
+		return err
+	}
+
+	// Find traces to tail.
+	type tailTarget struct {
+		spaceRoot string
+		id        string
+		seen      int
+	}
+	var targets []tailTarget
+	collect := func() error {
+		targets = targets[:0]
+		for _, sp := range spaces {
+			if *spaceFlag != "" && !spaceMatches(sp, *spaceFlag) {
+				continue
+			}
+			traces, lerr := trace.List(sp.Path, trace.ListFilter{ActiveOnly: true, Agent: *agent})
+			if lerr != nil {
+				continue
+			}
+			for _, t := range traces {
+				if *traceID != "" && t.ID != *traceID {
+					continue
+				}
+				targets = append(targets, tailTarget{spaceRoot: sp.Path, id: t.ID, seen: len(t.Ticks)})
+			}
+		}
+		return nil
+	}
+	if err := collect(); err != nil {
+		return err
+	}
+	if len(targets) == 0 {
+		fmt.Println("(no open traces to tail)")
+		return nil
+	}
+	for _, t := range targets {
+		fmt.Fprintf(os.Stderr, "tailing %s (initial ticks=%d)\n", t.id, t.seen)
+	}
+
+	deadline := time.Time{}
+	if *timeout > 0 {
+		deadline = time.Now().Add(*timeout)
+	}
+
+	ticker := time.NewTicker(*interval)
+	defer ticker.Stop()
+	for {
+		if !deadline.IsZero() && time.Now().After(deadline) {
+			fmt.Fprintln(os.Stderr, "(timeout reached)")
+			return nil
+		}
+		for i, t := range targets {
+			cur, err := trace.LoadByID(t.spaceRoot, t.id)
+			if err != nil {
+				continue
+			}
+			if len(cur.Ticks) > t.seen {
+				for _, tk := range cur.Ticks[t.seen:] {
+					fmt.Printf("%s  %s  %s\n", tk.At.Format(time.RFC3339), t.id, tk.Message)
+				}
+				targets[i].seen = len(cur.Ticks)
+			}
+			if cur.Status != types.TraceStatusOpen {
+				fmt.Fprintf(os.Stderr, "(%s closed with status=%s)\n", t.id, cur.Status)
+				// Drop this target.
+				targets = append(targets[:i], targets[i+1:]...)
+				if len(targets) == 0 {
+					return nil
+				}
+				break
+			}
+		}
+		<-ticker.C
+	}
 }
 
 // --- analyze ---------------------------------------------------------------

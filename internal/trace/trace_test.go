@@ -94,7 +94,7 @@ func TestTick_AppendsCheckpoint(t *testing.T) {
 	}
 	earlierLastTick := tr.LastTick
 
-	time.Sleep(1100 * time.Millisecond) // trace timestamps are RFC3339 second-precision; advance > 1s
+	time.Sleep(2100 * time.Millisecond) // trace timestamps are RFC3339 second-precision; >2s avoids boundary flake
 
 	if err := trace.Tick(space, tr.ID, "draw loop wired"); err != nil {
 		t.Fatalf("Tick: %v", err)

@@ -100,8 +100,9 @@ func Tick(spaceRoot, traceID, message string) error {
 
 // Done closes a trace, sets its terminal status, and compacts the checkpoint
 // list into a "Work log" section in the body. If linkedSpore is set, the
-// trace's linked_spore field is populated; auto-attaching the work log to
-// the spore file is out of scope for v0.1.4 (manual concat for now).
+// trace's `linked_spore` frontmatter field is populated; when the spore file
+// can be located on disk, the compacted work log is also appended to the
+// spore body (idempotent — no double-append if the section already exists).
 func Done(spaceRoot, traceID, status, linkedSpore string) (types.Trace, error) {
 	switch status {
 	case types.TraceStatusSucceeded, types.TraceStatusFailed,
@@ -122,7 +123,81 @@ func Done(spaceRoot, traceID, status, linkedSpore string) (types.Trace, error) {
 	if err := write(spaceRoot, &tr); err != nil {
 		return types.Trace{}, err
 	}
+	if linkedSpore != "" {
+		// Best-effort: locate the spore file under <space>/inbox/agents/ and
+		// append a Work log section to its body. Failures don't unwind the
+		// done() call — the trace itself is already persisted.
+		if sporePath, ok := findSporeFile(spaceRoot, linkedSpore); ok {
+			_ = appendWorkLogToSpore(sporePath, tr)
+		}
+	}
 	return tr, nil
+}
+
+// findSporeFile locates a spore file under spaceRoot/inbox/agents/ whose
+// frontmatter id matches sporeID. Returns (path, true) on hit.
+func findSporeFile(spaceRoot, sporeID string) (string, bool) {
+	dir := filepath.Join(spaceRoot, "inbox", "agents")
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return "", false
+	}
+	needle := []byte("id: " + sporeID)
+	for _, e := range entries {
+		if e.IsDir() || !strings.HasSuffix(e.Name(), ".md") {
+			continue
+		}
+		p := filepath.Join(dir, e.Name())
+		data, err := os.ReadFile(p)
+		if err != nil {
+			continue
+		}
+		// Only look in the frontmatter region (between first two ---).
+		head := data
+		if len(head) > 4096 {
+			head = head[:4096]
+		}
+		if bytesContains(head, needle) {
+			return p, true
+		}
+	}
+	return "", false
+}
+
+// appendWorkLogToSpore appends a "## Work log (trace …)" section to a spore
+// file's body. Idempotent: if a section with the same trace id already
+// exists, returns nil without modifying.
+func appendWorkLogToSpore(sporePath string, tr types.Trace) error {
+	data, err := os.ReadFile(sporePath)
+	if err != nil {
+		return err
+	}
+	heading := fmt.Sprintf("## Work log (%s)", tr.ID)
+	if bytesContains(data, []byte(heading)) {
+		return nil
+	}
+	var b strings.Builder
+	b.WriteString("\n")
+	b.WriteString(heading)
+	b.WriteString("\n\n")
+	fmt.Fprintf(&b, "_Compacted from trace `%s` (%s, ticks=%d, started=%s, last_tick=%s)._\n\n",
+		tr.ID, tr.Status, len(tr.Ticks),
+		tr.Started.UTC().Format(time.RFC3339),
+		tr.LastTick.UTC().Format(time.RFC3339),
+	)
+	for _, t := range tr.Ticks {
+		fmt.Fprintf(&b, "- %s  %s\n", t.At.UTC().Format(time.RFC3339), t.Message)
+	}
+	// Ensure trailing newline + appended block.
+	if len(data) > 0 && data[len(data)-1] != '\n' {
+		data = append(data, '\n')
+	}
+	data = append(data, []byte(b.String())...)
+	return os.WriteFile(sporePath, data, 0o644)
+}
+
+func bytesContains(haystack, needle []byte) bool {
+	return strings.Contains(string(haystack), string(needle))
 }
 
 // LoadByID resolves a trace id to a file path under spaceRoot/.trace and

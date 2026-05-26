@@ -26,9 +26,13 @@ carries provenance.
 
 ## Status
 
-**v0.1.4** — full read + contribute loop, Ed25519 signing, graph queries,
-pulse aggregation, alignment scoring (`change:assess`), spore-inbox listing,
-single-object fetch by id, and a GoSX-based browser visualization.
+**v0.1.6** — full read + contribute + review + audit + observe + analyze loop.
+Ed25519 signing, graph queries, pulse aggregation, alignment scoring
+(`change:assess` / `task` / `pr`), spore submit/list/accept/reject,
+single-object fetch (`show`), in-flight trace lifecycle (`start | tick |
+done | list | history | tail`), canopy-backed code intelligence (`analyze
+impact | callgraph | refs | hotspot | dead | review`), mdpp.fmt post-graft,
+GoSX-based browser viz (mid-flight).
 
 Today you can:
 
