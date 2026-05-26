@@ -19,7 +19,6 @@ import (
 	"flag"
 	"fmt"
 	"log"
-	"net/http"
 	"os"
 	"path/filepath"
 
@@ -103,9 +102,17 @@ func run(args []string) error {
 	// Load the initial graph data server-side so the surface props include
 	// nodes and edges; the WASM module receives them at mount time without a
 	// separate fetch round-trip.
-	app.Route("/", func(r *http.Request) gosx.Node {
+	//
+	// BuildGraphPage returns (body, head). The body is the page content; the
+	// head fragment (CSS, surface bootstrap scripts, panel JS) is injected
+	// via ctx.AddHead so the App's default document shell renders exactly one
+	// <!DOCTYPE html><html>...</html> wrapper (defect 5 fix).
+	app.Page("/", func(ctx *server.Context) gosx.Node {
 		props := loadInitialGraph(conn)
-		return BuildGraphPage(props)
+		body, head := BuildGraphPage(props)
+		ctx.AddHead(head)
+		ctx.SetMetadata(server.Metadata{Title: server.Title{Absolute: "Hyphae — Knowledge Graph"}})
+		return body
 	})
 
 	// API: full or subgraph JSON.

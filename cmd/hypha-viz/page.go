@@ -5,7 +5,6 @@ package main
 import (
 	"m31labs.dev/gosx"
 	"m31labs.dev/gosx/engine/surface"
-	"m31labs.dev/gosx/server"
 	"m31labs.dev/hyphae/cmd/hypha-viz/graphsurface"
 )
 
@@ -469,11 +468,17 @@ func headNode(graph *surface.Renderer) gosx.Node {
 	)
 }
 
-// BuildGraphPage wraps GraphPage in GoSX's HTMLDocument shell.
+// BuildGraphPage returns the page body fragment and the <head> assets it
+// needs. Callers must inject HeadAssets into the document head themselves —
+// the app's Page() handler bridges that via ctx.AddHead. Wrapping in
+// server.HTMLDocument here would double-wrap because the App always emits
+// its own <!DOCTYPE html><html>...</html> shell around the route result.
+// (Defect 5 / spec §E.)
+//
 // props are used to embed the graph data into the canvas surface placeholder.
-func BuildGraphPage(props graphsurface.GraphProps) gosx.Node {
+func BuildGraphPage(props graphsurface.GraphProps) (body, head gosx.Node) {
 	graph := surface.NewRenderer("Graph")
-	return server.HTMLDocument("Hyphae — Knowledge Graph", headNode(graph), graphPageWithProps(props))
+	return graphPageWithProps(props), headNode(graph)
 }
 
 // graphPageWithProps is the internal version of GraphPage that receives props

@@ -33,8 +33,11 @@ func buildTestApp(t *testing.T) (*server.App, *os.File) {
 	app := server.New()
 	app.SetPublicDir("")
 
-	app.Route("/", func(r *http.Request) gosx.Node {
-		return BuildGraphPage(graphsurface.GraphProps{})
+	app.Page("/", func(ctx *server.Context) gosx.Node {
+		body, head := BuildGraphPage(graphsurface.GraphProps{})
+		ctx.AddHead(head)
+		ctx.SetMetadata(server.Metadata{Title: server.Title{Absolute: "Hyphae — Knowledge Graph"}})
+		return body
 	})
 	app.API("GET /api/graph", handleGraph(conn))
 	app.API("GET /api/search", handleSearch(conn))
@@ -138,6 +141,39 @@ func TestObjectEndpoint(t *testing.T) {
 		}
 	}
 }
+
+// TestPageHasSingleDoctype verifies that GET / serves exactly one
+// <!DOCTYPE declaration. Defect 5 (spec §E) was a double-wrap: BuildGraphPage
+// called server.HTMLDocument itself and then App.renderPage wrapped the
+// resulting RawHTML in another <!DOCTYPE html><html>...</html> shell.
+func TestPageHasSingleDoctype(t *testing.T) {
+	app, f := buildTestApp(t)
+	if f != nil {
+		defer f.Close()
+	}
+	handler := app.Build()
+
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	w := httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("GET /: status = %d, want 200", w.Code)
+	}
+	body := w.Body.String()
+	count := strings.Count(body, "<!DOCTYPE")
+	if count != 1 {
+		t.Errorf("expected exactly 1 <!DOCTYPE, got %d\nfirst 300 bytes: %q", count, body[:min(300, len(body))])
+	}
+	htmlCount := strings.Count(body, "<html")
+	if htmlCount != 1 {
+		t.Errorf("expected exactly 1 <html tag, got %d", htmlCount)
+	}
+}
+
+// min is a local helper because the package targets Go where the builtin min
+// is available, but the receiver context for body slicing needs a guard
+// against short bodies.
+func min(a, b int) int { if a < b { return a }; return b }
 
 // TestEngineSurfaceRuntimeServed verifies that the //gosx:engine surface
 // runtime assets are wired into the app, closing defect 1 from
