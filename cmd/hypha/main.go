@@ -55,6 +55,7 @@ Usage:
   hypha graph    trace     <object-id> [--kind derived_from,cites] [--max-depth 4]
   hypha pulse    [--space <uri>] [--window 30d] [--ttl 5m] [--format json|text]
   hypha assess   change --task <text> [--files p1,p2] [--diff-summary <text>] [--space <uri>] [--window 30d] [--format json|text]
+  hypha assess   task   --task <text> [--space <uri>] [--window 30d] [--format json|text]
   hypha show     <id-or-hypha-uri> [--path] [--json] [--frontmatter] [--body]
   hypha receipts list [--space <uri>] [--subject <uri>] [--action <name>] [--since 24h] [--limit N]
 
@@ -213,14 +214,71 @@ func nonEmpty(s, fallback string) string {
 
 func cmdAssess(args []string) error {
 	if len(args) == 0 {
-		return errors.New("usage: hypha assess change --task <text> [--files p1,p2] [--diff-summary <text>] [...]")
+		return errors.New("usage: hypha assess change|task --task <text> [...]")
 	}
 	sub, rest := args[0], args[1:]
 	switch sub {
 	case "change":
 		return cmdAssessChange(rest)
+	case "task":
+		return cmdAssessTask(rest)
 	default:
-		return fmt.Errorf("unknown assess subcommand %q (try `change`)", sub)
+		return fmt.Errorf("unknown assess subcommand %q (try `change`, `task`)", sub)
+	}
+}
+
+// cmdAssessTask runs the alignment scorer with task-only input (no files,
+// no diff_summary). Same engine, same JSON shape — useful when you're
+// scoping a task before any diff exists.
+func cmdAssessTask(args []string) error {
+	fs := flag.NewFlagSet("assess task", flag.ContinueOnError)
+	task := fs.String("task", "", "natural-language description of the proposed task")
+	spaceURI := fs.String("space", "", "filter scoring to one space URI (default: all spaces)")
+	windowStr := fs.String("window", "30d", "Go duration window for recent-pressure aggregation")
+	budgetTokens := fs.Int("budget-tokens", 1200, "soft response token budget (advisory)")
+	format := fs.String("format", "json", "json | text")
+	if err := fs.Parse(reorderFlagsFirst(args)); err != nil {
+		return err
+	}
+	if strings.TrimSpace(*task) == "" {
+		return errors.New("assess task requires --task <text>")
+	}
+
+	window, err := parseFlexDuration(*windowStr)
+	if err != nil {
+		return fmt.Errorf("--window %q: %w", *windowStr, err)
+	}
+
+	root, err := resolveRoot("")
+	if err != nil {
+		return err
+	}
+	conn, err := openIndex(root)
+	if err != nil {
+		return err
+	}
+	defer conn.Close()
+
+	res, err := assess.Change(conn, assess.ChangeRequest{
+		Task:   *task,
+		Space:  *spaceURI,
+		Window: window,
+		Budget: types.Budget{MaxResponseTokens: *budgetTokens, Shape: types.ShapeCitedSpans},
+	})
+	if err != nil {
+		return err
+	}
+
+	switch *format {
+	case "json":
+		enc := json.NewEncoder(os.Stdout)
+		enc.SetIndent("", "  ")
+		return enc.Encode(res)
+	case "text":
+		printAssessText(os.Stdout, res)
+		return nil
+	default:
+		return fmt.Errorf("unknown --format %q", *format)
 	}
 }
 

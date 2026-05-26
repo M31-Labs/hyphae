@@ -60,6 +60,8 @@ Today you can:
   pressure, and infers a path-prefix hot zone. Returns the JSON shape from
   `concepts/initiative-alignment.md`: alignment category, score,
   recommendation, matched initiatives, citations.
+- `hypha assess task --task "<text>"` — same scorer, task-only input. Use
+  to scope a task *before* any diff exists.
 - `hypha receipts list` — query the audit log by space, subject, action,
   time window.
 
