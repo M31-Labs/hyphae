@@ -454,11 +454,16 @@ func statusbarNode() gosx.Node {
 	)
 }
 
-// headNode builds the <head> inline content: CSS + WASM preload + deferred panel JS.
-// graph is passed in so PageHead() can emit the correct WASM preload link.
+// headNode builds the <head> inline content: CSS + engine-surface runtime
+// scripts + WASM preload + deferred panel JS.
+//
+// surface.HeadAssets() injects the two script tags (wasm_exec.js + runtime.js)
+// that the engine-surface bootstrap depends on; without them the canvas
+// placeholder never mounts. graph.PageHead() emits the WASM preload link.
 func headNode(graph *surface.Renderer) gosx.Node {
 	return gosx.Fragment(
 		gosx.El("style", gosx.RawHTML(pageCSS)),
+		surface.HeadAssets(),
 		graph.PageHead(),
 		gosx.El("script", gosx.Attrs(gosx.Attr("defer", "defer")), gosx.RawHTML(panelJS)),
 	)

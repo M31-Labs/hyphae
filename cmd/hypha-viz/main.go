@@ -119,6 +119,10 @@ func run(args []string) error {
 
 	// Compose the surface WASM asset handler so /gosx/engines/*.wasm is served.
 	app.Mount("/gosx/engines/", surface.Handler())
+	// Serve the engine-surface JS bootstrap + wasm_exec.js shim so the canvas
+	// placeholder can actually mount in the browser. Without this, the surface
+	// placeholder lands in the DOM but no WASM is fetched (defect 1).
+	app.Mount("/gosx/surface/", surface.RuntimeHandler())
 
 	fmt.Printf("hypha-viz listening on http://%s\n", *addr)
 	fmt.Printf("  graph db: %s\n", dbPath)
