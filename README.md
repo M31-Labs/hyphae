@@ -35,6 +35,9 @@ Today you can:
   index (FTS5 + objects + anchors + edges) over every space.
 - `hypha recall <query>` — BM25-ranked, token-budgeted full-text search
   returning a compact `summary + anchors` response.
+- `hypha show <id>` — fetch one object by id (or `hypha://` URI). Default
+  prints the full file; `--path` / `--json` / `--frontmatter` / `--body`
+  select a slice. Closes the recall→read loop without URI→path translation.
 - `hypha spore submit <file> [--sign --as <id>]` — validate, optionally
   Ed25519-sign, write to inbox, emit + persist a content-hashed receipt.
 - `hypha graft <spore-id> --as <id> [--verify]` — apply a spore's

@@ -13,6 +13,7 @@
 package main
 
 import (
+	"bytes"
 	"database/sql"
 	"encoding/json"
 	"errors"
@@ -53,6 +54,7 @@ Usage:
   hypha graph    trace     <object-id> [--kind derived_from,cites] [--max-depth 4]
   hypha pulse    [--space <uri>] [--window 30d] [--ttl 5m] [--format json|text]
   hypha assess   change --task <text> [--files p1,p2] [--diff-summary <text>] [--space <uri>] [--window 30d] [--format json|text]
+  hypha show     <id-or-hypha-uri> [--path] [--json] [--frontmatter] [--body]
   hypha receipts list [--space <uri>] [--subject <uri>] [--action <name>] [--since 24h] [--limit N]
 
 Separate binary for the browser visualization (GoSX-based):
@@ -99,6 +101,8 @@ func run(args []string) error {
 		return cmdPulse(rest)
 	case "assess":
 		return cmdAssess(rest)
+	case "show":
+		return cmdShow(rest)
 	default:
 		return fmt.Errorf("unknown command %q (try `hypha help`)", group)
 	}
@@ -906,6 +910,152 @@ func findSporeFilePath(spaceRoot, sporeID string) (string, error) {
 		}
 	}
 	return "", fmt.Errorf("spore %q not found under %s", sporeID, inbox)
+}
+
+// --- show ------------------------------------------------------------------
+
+func cmdShow(args []string) error {
+	if len(args) == 0 {
+		return errors.New("usage: hypha show <id-or-hypha-uri> [--path] [--json] [--frontmatter] [--body]")
+	}
+	fs := flag.NewFlagSet("show", flag.ContinueOnError)
+	pathOnly := fs.Bool("path", false, "print only the resolved absolute file path")
+	jsonOut := fs.Bool("json", false, "print object metadata as JSON (id, type, space, path, title, status, tags, updated_at)")
+	frontOnly := fs.Bool("frontmatter", false, "print only the YAML frontmatter block")
+	bodyOnly := fs.Bool("body", false, "print only the markdown body (everything after the frontmatter)")
+	if err := fs.Parse(reorderFlagsFirst(args)); err != nil {
+		return err
+	}
+	if fs.NArg() == 0 {
+		return errors.New("usage: hypha show <id-or-hypha-uri> [--path] [--json] [--frontmatter] [--body]")
+	}
+	id := normalizeShowID(fs.Arg(0))
+
+	root, err := resolveRoot("")
+	if err != nil {
+		return err
+	}
+	conn, err := openIndex(root)
+	if err != nil {
+		return err
+	}
+	defer conn.Close()
+
+	var fileID, spaceID, typeStr, status, title, tagsJSON, summary, updatedAt string
+	err = conn.QueryRow(
+		`SELECT file_id, space_id, type, COALESCE(status, ''), COALESCE(title, ''),
+		        COALESCE(tags_json, '[]'), COALESCE(summary, ''), updated_at
+		 FROM objects WHERE id = ?`,
+		id,
+	).Scan(&fileID, &spaceID, &typeStr, &status, &title, &tagsJSON, &summary, &updatedAt)
+	if errors.Is(err, sql.ErrNoRows) {
+		return fmt.Errorf("show: no object with id %q (run `hypha index rebuild`?)", id)
+	}
+	if err != nil {
+		return fmt.Errorf("show: query: %w", err)
+	}
+
+	absPath, err := resolveObjectPath(root, spaceID, fileID)
+	if err != nil {
+		return fmt.Errorf("show: resolve path: %w", err)
+	}
+
+	if *pathOnly {
+		fmt.Println(absPath)
+		return nil
+	}
+
+	if *jsonOut {
+		var tags []string
+		_ = json.Unmarshal([]byte(tagsJSON), &tags)
+		out := map[string]any{
+			"id":         id,
+			"type":       typeStr,
+			"space_id":   spaceID,
+			"file_path":  absPath,
+			"status":     status,
+			"title":      title,
+			"tags":       tags,
+			"summary":    summary,
+			"updated_at": updatedAt,
+		}
+		enc := json.NewEncoder(os.Stdout)
+		enc.SetIndent("", "  ")
+		return enc.Encode(out)
+	}
+
+	content, err := os.ReadFile(absPath)
+	if err != nil {
+		return fmt.Errorf("show: read %s: %w", absPath, err)
+	}
+	front, body := splitFrontmatter(content)
+
+	switch {
+	case *frontOnly:
+		os.Stdout.Write(front)
+	case *bodyOnly:
+		os.Stdout.Write(body)
+	default:
+		os.Stdout.Write(content)
+	}
+	return nil
+}
+
+// normalizeShowID accepts either a bare object id ("concept.spore"), a
+// "hypha://<space>/object/<id>" recall URI, or a legacy "hypha://<space>/<id>"
+// path-style URI, and returns the bare id suitable for an objects lookup.
+func normalizeShowID(in string) string {
+	id := strings.TrimSpace(in)
+	if !strings.HasPrefix(id, "hypha://") {
+		return id
+	}
+	rest := strings.TrimPrefix(id, "hypha://")
+	if idx := strings.LastIndex(rest, "#"); idx >= 0 {
+		rest = rest[:idx]
+	}
+	parts := strings.Split(rest, "/")
+	// Find the last segment after an "object" marker, else just the last segment.
+	for i := len(parts) - 1; i >= 0; i-- {
+		if parts[i] == "object" && i+1 < len(parts) {
+			return strings.Join(parts[i+1:], "/")
+		}
+	}
+	return parts[len(parts)-1]
+}
+
+// resolveObjectPath joins installRoot/spaces/<authority>-<name>/<file_id>.
+// spaceID may be either a full "hypha://<authority>/<name>" URI or the bare
+// "<authority>/<name>" form (the indexer stores the bare form in objects.space_id).
+// file_id is the path relative to the space directory.
+func resolveObjectPath(installRoot, spaceID, fileID string) (string, error) {
+	rest := strings.TrimPrefix(spaceID, "hypha://")
+	rest = strings.TrimRight(rest, "/")
+	parts := strings.SplitN(rest, "/", 3)
+	if len(parts) < 2 {
+		return "", fmt.Errorf("space id missing authority/name: %q", spaceID)
+	}
+	dir := fmt.Sprintf("%s-%s", parts[0], parts[1])
+	return filepath.Join(installRoot, "spaces", dir, fileID), nil
+}
+
+// splitFrontmatter separates the leading YAML frontmatter (delimited by ---)
+// from the markdown body. If the document has no frontmatter, returns
+// (nil, content). Preserves trailing newlines on both sides.
+func splitFrontmatter(content []byte) (frontmatter, body []byte) {
+	if !bytes.HasPrefix(content, []byte("---\n")) && !bytes.HasPrefix(content, []byte("---\r\n")) {
+		return nil, content
+	}
+	// Find the closing "---" on its own line.
+	rest := content[4:]
+	idx := bytes.Index(rest, []byte("\n---\n"))
+	if idx < 0 {
+		idx = bytes.Index(rest, []byte("\n---\r\n"))
+	}
+	if idx < 0 {
+		return nil, content
+	}
+	end := 4 + idx + len("\n---\n")
+	return content[:end], content[end:]
 }
 
 // --- graph -----------------------------------------------------------------
