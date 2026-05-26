@@ -9,7 +9,7 @@ import (
 	"time"
 
 	"m31labs.dev/hyphae/internal/identity"
-	"github.com/odvcencio/mdpp"
+	"m31labs.dev/mdpp"
 	"gopkg.in/yaml.v3"
 )
 

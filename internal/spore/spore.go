@@ -19,7 +19,7 @@ import (
 	"unicode"
 
 	"m31labs.dev/hyphae/internal/types"
-	"github.com/odvcencio/mdpp"
+	"m31labs.dev/mdpp"
 )
 
 // ValidationError describes one required-field violation.

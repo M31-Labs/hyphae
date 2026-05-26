@@ -20,7 +20,7 @@ import (
 
 	"github.com/google/uuid"
 	"m31labs.dev/hyphae/internal/types"
-	"github.com/odvcencio/mdpp"
+	"m31labs.dev/mdpp"
 )
 
 // tagsFlowRe matches an inline flow-style tags line: tags: [a, b, c]

@@ -13,7 +13,7 @@ import (
 	"time"
 
 	"m31labs.dev/hyphae/internal/types"
-	"github.com/odvcencio/mdpp"
+	"m31labs.dev/mdpp"
 )
 
 // wikitextRe matches [[name]] and [[path|alias]] wikilink patterns.

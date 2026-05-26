@@ -25,7 +25,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/odvcencio/mdpp"
+	"m31labs.dev/mdpp"
 )
 
 // Identity is the public-facing record. Matches the .md frontmatter shape.
