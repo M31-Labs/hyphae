@@ -6,9 +6,11 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"m31labs.dev/gosx"
+	"m31labs.dev/gosx/engine/surface"
 	"m31labs.dev/gosx/server"
 	"m31labs.dev/hyphae/cmd/hypha-viz/graphsurface"
 	"m31labs.dev/hyphae/internal/db"
@@ -37,6 +39,12 @@ func buildTestApp(t *testing.T) (*server.App, *os.File) {
 	app.API("GET /api/graph", handleGraph(conn))
 	app.API("GET /api/search", handleSearch(conn))
 	app.API("GET /api/object/{id}", handleObject(conn))
+
+	// Match production wiring so engine-surface runtime assets are served
+	// from the test app too. Without these mounts /gosx/surface/runtime.js
+	// would 404 even when the bootstrap files exist (defect 1 regression test).
+	app.Mount("/gosx/engines/", surface.Handler())
+	app.Mount("/gosx/surface/", surface.RuntimeHandler())
 
 	// Return a temp file handle so the caller can inspect the path if needed.
 	f, _ := os.Open(dbPath)
@@ -127,6 +135,35 @@ func TestObjectEndpoint(t *testing.T) {
 		var payload map[string]any
 		if err := json.Unmarshal(w.Body.Bytes(), &payload); err != nil {
 			t.Fatalf("GET /api/object/nonexistent: invalid JSON: %v — body: %s", err, w.Body.String())
+		}
+	}
+}
+
+// TestEngineSurfaceRuntimeServed verifies that the //gosx:engine surface
+// runtime assets are wired into the app, closing defect 1 from
+// specs/gosx-engine-surface-completion.md. Without these mounts the browser
+// fetches 404s for /gosx/surface/runtime.js and never mounts the canvas.
+func TestEngineSurfaceRuntimeServed(t *testing.T) {
+	app, f := buildTestApp(t)
+	if f != nil {
+		defer f.Close()
+	}
+	handler := app.Build()
+
+	for _, path := range []string{"/gosx/surface/runtime.js", "/gosx/surface/wasm_exec.js"} {
+		req := httptest.NewRequest(http.MethodGet, path, nil)
+		w := httptest.NewRecorder()
+		handler.ServeHTTP(w, req)
+		if w.Code != http.StatusOK {
+			t.Errorf("GET %s: status = %d, want 200 — body: %s", path, w.Code, w.Body.String())
+			continue
+		}
+		ct := w.Result().Header.Get("Content-Type")
+		if !strings.HasPrefix(ct, "application/javascript") {
+			t.Errorf("GET %s: Content-Type = %q, want application/javascript prefix", path, ct)
+		}
+		if w.Body.Len() == 0 {
+			t.Errorf("GET %s: empty body", path)
 		}
 	}
 }
