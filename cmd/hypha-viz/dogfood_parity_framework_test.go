@@ -97,6 +97,9 @@ func runParityScenario(t *testing.T, s parityScenario) {
 	}
 
 	score := ssim(baseline.Image(), candidate.Image())
+	if testing.Verbose() {
+		t.Logf("scenario %q: SSIM = %.6f (threshold %.4f)", s.Name, score, s.SSIMThreshold)
+	}
 	if score < s.SSIMThreshold {
 		dumpFramebuffer("testdata/parity-failures", s.Name+"-baseline", baseline.Image())
 		dumpFramebuffer("testdata/parity-failures", s.Name+"-candidate", candidate.Image())
