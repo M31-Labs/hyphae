@@ -28,3 +28,6 @@ profile.*
 
 # canopy code-intelligence cache (transient, rebuilt by `canopy index build`)
 /.canopy/
+
+# Y.F parity test failure dumps (developer convenience; transient)
+/cmd/hypha-viz/testdata/parity-failures/
