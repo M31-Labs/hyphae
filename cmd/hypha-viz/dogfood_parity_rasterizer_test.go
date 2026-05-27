@@ -44,6 +44,7 @@ import (
 // "c" host receiver (bytecode path) or the canvas impl (native path).
 type canvasRasterizer struct {
 	img *image.RGBA
+	w, h int
 
 	// Drawing state stack. Save/Restore push/pop.
 	stack []rasterState
@@ -116,6 +117,8 @@ func newCanvasRasterizer(w, h int) *canvasRasterizer {
 	}
 	return &canvasRasterizer{
 		img:   img,
+		w:     w,
+		h:     h,
 		state: rasterState{transform: identity(), lineWidth: 1},
 	}
 }

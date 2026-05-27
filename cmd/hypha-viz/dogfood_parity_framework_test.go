@@ -96,7 +96,7 @@ func runParityScenario(t *testing.T, s parityScenario) {
 		t.Fatalf("scenario %q: renderCandidate failed: %v", s.Name, candErr)
 	}
 
-	score := ssim(baseline, candidate)
+	score := ssim(baseline.Image(), candidate.Image())
 	if score < s.SSIMThreshold {
 		t.Errorf("scenario %q: SSIM %.4f below threshold %.4f", s.Name, score, s.SSIMThreshold)
 	}
