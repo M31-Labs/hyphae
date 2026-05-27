@@ -27,7 +27,8 @@ import (
 // a missing method — reflect would silently turn a typo into a runtime
 // error).
 type candidateCanvasHost struct {
-	r *canvasRasterizer
+	r       *canvasRasterizer
+	callLog []string // for diagnostics on parity failures
 }
 
 func newCandidateCanvasHost(r *canvasRasterizer) *candidateCanvasHost {
@@ -38,6 +39,7 @@ func newCandidateCanvasHost(r *canvasRasterizer) *candidateCanvasHost {
 // handlers invoke gets a switch arm; unknown methods record a
 // diagnostic via the returned error.
 func (h *candidateCanvasHost) Call(method string, args []vm.Value) (vm.Value, error) {
+	h.callLog = append(h.callLog, method)
 	switch method {
 	case "Width":
 		return vm.IntVal(h.r.w), nil

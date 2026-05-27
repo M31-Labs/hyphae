@@ -17,7 +17,6 @@
 package main
 
 import (
-	"encoding/json"
 	"math/rand"
 
 	"m31labs.dev/gosx/engine/surface"
@@ -48,15 +47,12 @@ func renderBaseline(s parityScenario) (*canvasRasterizer, error) {
 	host := newCanvasRasterizer(s.Width, s.Height)
 	c := surface.NewCanvasFromHostImpl(&hostCanvasAdapter{r: host})
 
-	// Encode props as JSON and hand off via a Context the harness
-	// constructs the same way the JS-side bootstrap does at mount time.
-	propsJSON, err := json.Marshal(s.Props)
-	if err != nil {
-		return nil, err
-	}
-	ctx := surface.NewContext(propsJSON)
-
-	graphsurface.Mount(ctx, c)
+	// Seed state directly — skips the Mount handler's ctx.PropsInto
+	// bootstrap so the parity claim covers the drawing pipeline only.
+	// See SeedStateForParityTest's doc for the rationale (Mount's
+	// `&props` flow requires a sharper `&x` pass-through than Y.E
+	// provides).
+	graphsurface.SeedStateForParityTest(s.Props, s.Width, s.Height)
 	for i := 0; i < s.Steps; i++ {
 		graphsurface.StepFrame(c)
 	}

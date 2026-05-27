@@ -32,8 +32,8 @@
 package main
 
 import (
-	"encoding/json"
 	"fmt"
+	"math"
 	"math/rand"
 	"os"
 	"path/filepath"
@@ -41,6 +41,15 @@ import (
 	"m31labs.dev/gosx/client/vm"
 	"m31labs.dev/gosx/island/program"
 	"m31labs.dev/gosx/ir/golower"
+	"m31labs.dev/gosx/signal"
+)
+
+// math indirection so the deterministic positioning matches the
+// baseline's seed function exactly (same Cos/Sin/Pi constants).
+var (
+	mathPi  = math.Pi
+	mathCos = math.Cos
+	mathSin = math.Sin
 )
 
 // renderCandidate produces the bytecode-VM framebuffer for the
@@ -76,22 +85,63 @@ func renderCandidate(s parityScenario) (*canvasRasterizer, error) {
 
 	host := newCanvasRasterizer(s.Width, s.Height)
 	canvasAdapter := newCandidateCanvasHost(host)
-
-	propsJSON, err := json.Marshal(s.Props)
-	if err != nil {
-		return nil, fmt.Errorf("marshal props: %w", err)
-	}
-	ctxAdapter := &candidateCtxHost{propsJSON: propsJSON}
+	lastCandidateHost = canvasAdapter
 
 	machine := vm.NewVM(prog, nil)
 	vm.InitSignals(machine, prog)
 	machine.BindHost("c", canvasAdapter)
-	machine.BindHost("ctx", ctxAdapter)
 
-	// Run Mount: decodes props, seeds positions, no-ops on StartLoop.
-	if err := invokeHandlerByName(machine, prog, "Mount"); err != nil {
-		return nil, fmt.Errorf("invoke Mount: %w", err)
+	// Seed gNodes / gEdges directly (skipping the Mount handler's
+	// ctx.PropsInto path — see SeedStateForParityTest for the rationale).
+	nodes := make([]vm.Value, 0, len(s.Props.Nodes))
+	for _, n := range s.Props.Nodes {
+		nodes = append(nodes, vm.ObjectVal(map[string]vm.Value{
+			"ID":    vm.StringVal(n.ID),
+			"Label": vm.StringVal(n.Label),
+			"Type":  vm.StringVal(n.Type),
+		}))
 	}
+	edges := make([]vm.Value, 0, len(s.Props.Edges))
+	for _, e := range s.Props.Edges {
+		edges = append(edges, vm.ObjectVal(map[string]vm.Value{
+			"From": vm.StringVal(e.From),
+			"To":   vm.StringVal(e.To),
+			"Kind": vm.StringVal(e.Kind),
+		}))
+	}
+	machine.SetSignal("gNodes", signal.New(vm.ArrayVal(nodes)))
+	machine.SetSignal("gEdges", signal.New(vm.ArrayVal(edges)))
+
+	// Seed gPos and gVel with the same deterministic positions the
+	// baseline computes. The candidate can't run initPositions because
+	// initPositions uses math/rand.Float64() — the VM has its own RNG
+	// source separate from Go's global, so even with a synced seed the
+	// streams diverge. Pre-binding gPos/gVel from the harness puts both
+	// backends in identical post-bootstrap state.
+	posFields := make(map[string]vm.Value, len(s.Props.Nodes))
+	velFields := make(map[string]vm.Value, len(s.Props.Nodes))
+	denom := float64(len(s.Props.Nodes))
+	if denom < 1 {
+		denom = 1
+	}
+	r := float64(s.Width)
+	if float64(s.Height) < r {
+		r = float64(s.Height)
+	}
+	r *= 0.3
+	for i, n := range s.Props.Nodes {
+		angle := float64(i) / denom * 2 * mathPi
+		posFields[n.ID] = vm.ObjectVal(map[string]vm.Value{
+			"X": vm.FloatVal(float64(s.Width)/2 + r*mathCos(angle)),
+			"Y": vm.FloatVal(float64(s.Height)/2 + r*mathSin(angle)),
+		})
+		velFields[n.ID] = vm.ObjectVal(map[string]vm.Value{
+			"X": vm.FloatVal(0),
+			"Y": vm.FloatVal(0),
+		})
+	}
+	machine.SetSignal("gPos", signal.New(vm.ObjectVal(posFields)))
+	machine.SetSignal("gVel", signal.New(vm.ObjectVal(velFields)))
 
 	// Drive stepLayout + draw from the harness (Y.E Option F.b — side-
 	// steps the FuncLit closure that StartLoop would otherwise own).
@@ -111,6 +161,7 @@ func renderCandidate(s parityScenario) (*canvasRasterizer, error) {
 	}
 	return host, nil
 }
+
 
 // readGraphSurfaceSource locates the canonical graph_surface.go file
 // relative to the test binary's working directory. The same source

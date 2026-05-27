@@ -98,6 +98,25 @@ func runParityScenario(t *testing.T, s parityScenario) {
 
 	score := ssim(baseline.Image(), candidate.Image())
 	if score < s.SSIMThreshold {
+		dumpFramebuffer("testdata/parity-failures", s.Name+"-baseline", baseline.Image())
+		dumpFramebuffer("testdata/parity-failures", s.Name+"-candidate", candidate.Image())
+		t.Logf("scenario %q: candidate canvas host call log: %v", s.Name, lastCandidateCallLog())
 		t.Errorf("scenario %q: SSIM %.4f below threshold %.4f", s.Name, score, s.SSIMThreshold)
 	}
 }
+
+// lastCandidateCallLog returns the call log from the most-recent
+// candidate render. A diagnostic helper: when SSIM fails, we log it
+// to make "the bytecode VM never invoked draw" vs "it invoked draw
+// but in a different order" cleanly distinguishable.
+func lastCandidateCallLog() []string {
+	if lastCandidateHost == nil {
+		return nil
+	}
+	return lastCandidateHost.callLog
+}
+
+// lastCandidateHost retains a reference to the most-recently created
+// candidate host for diagnostic logging. Tests are sequential so this
+// is safe.
+var lastCandidateHost *candidateCanvasHost
