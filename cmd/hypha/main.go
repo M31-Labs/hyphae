@@ -45,7 +45,7 @@ import (
 	mdppfmt "m31labs.dev/mdpp/fmt"
 )
 
-const usage = `hypha — Hyphae v0.1.6 CLI
+const usage = `hypha — Hyphae v0.1.7 CLI
 
 Usage:
   hypha index    rebuild [--root <path>]

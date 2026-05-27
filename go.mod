@@ -5,7 +5,7 @@ go 1.26
 require (
 	github.com/google/uuid v1.6.0
 	gopkg.in/yaml.v3 v3.0.1
-	m31labs.dev/gosx v0.18.30
+	m31labs.dev/gosx v0.21.0
 	m31labs.dev/mdpp v0.3.0
 	modernc.org/sqlite v1.34.5
 )
@@ -34,7 +34,3 @@ require (
 	modernc.org/mathutil v1.6.0 // indirect
 	modernc.org/memory v1.8.0 // indirect
 )
-
-replace m31labs.dev/mdpp => ../mdpp
-
-replace m31labs.dev/gosx => ../gosx
