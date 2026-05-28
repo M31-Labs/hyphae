@@ -36,6 +36,7 @@ import (
 	"m31labs.dev/hyphae/internal/assess"
 	"m31labs.dev/hyphae/internal/atomicfs"
 	"m31labs.dev/hyphae/internal/capability"
+	"m31labs.dev/hyphae/internal/crdtconflict"
 	"m31labs.dev/hyphae/internal/crdtshadow"
 	"m31labs.dev/hyphae/internal/db"
 	"m31labs.dev/hyphae/internal/envelope"
@@ -97,6 +98,9 @@ Usage:
   hypha sync     import   [--space <uri>] [--in <file>] [--format text|json|compact]
   hypha sync     pull     --peer <ws-url> --space <uri> [--token X] [--once] [--timeout 30s] [--format text|json|compact]
   hypha hub      serve    [--addr 127.0.0.1:7777] [--require-auth]
+  hypha conflict list     --space <uri> [--format text|json|compact]
+  hypha conflict show     <id> --space <uri> [--format text|json|compact]
+  hypha conflict resolve  <id> --space <uri> --keep <actor-prefix> [--format text|json|compact]
   hypha peer     add      <uri> [--name <name>] [--format text|json|compact]
   hypha peer     list     [--format text|json|compact]
   hypha peer     remove   <name-or-uri> [--format text|json|compact]
@@ -201,6 +205,8 @@ func run(args []string) error {
 		return cmdPeer(rest)
 	case "hub":
 		return cmdHub(rest)
+	case "conflict":
+		return cmdConflict(rest)
 	case "mcp":
 		return cmdMCP(rest)
 	default:
@@ -374,6 +380,207 @@ func cmdSyncPull(args []string) error {
 		fmt.Fprintf(w, "  changes:  %d → %d (Δ %d)\n", stats.ChangesBefore, stats.ChangesAfter, stats.ChangesAfter-stats.ChangesBefore)
 		return nil
 	})
+}
+
+// --- conflict --------------------------------------------------------------
+
+func cmdConflict(args []string) error {
+	if len(args) == 0 {
+		return errors.New("usage: hypha conflict list|show|resolve [...]")
+	}
+	switch args[0] {
+	case "list":
+		return cmdConflictList(args[1:])
+	case "show":
+		return cmdConflictShow(args[1:])
+	case "resolve":
+		return cmdConflictResolve(args[1:])
+	default:
+		return fmt.Errorf("unknown conflict subcommand %q (try `list`, `show`, `resolve`)", args[0])
+	}
+}
+
+func cmdConflictList(args []string) error {
+	fs := flag.NewFlagSet("conflict list", flag.ContinueOnError)
+	spaceFlag := fs.String("space", "", "space URI (required)")
+	format := formatFlag(fs)
+	if err := fs.Parse(reorderFlagsFirst(args)); err != nil {
+		return err
+	}
+	if *spaceFlag == "" {
+		return errors.New("--space <uri> is required")
+	}
+	root, err := resolveRoot("")
+	if err != nil {
+		return err
+	}
+	sh, err := crdtshadow.Default.Get(mustResolveSpace(root, *spaceFlag), *spaceFlag)
+	if err != nil {
+		return err
+	}
+	conflicts, err := crdtconflict.Detect(sh.Store())
+	if err != nil {
+		return err
+	}
+	return emit("conflict list", conflicts, *format, func(w io.Writer, _ any) error {
+		if len(conflicts) == 0 {
+			fmt.Fprintln(w, "(no conflicts)")
+			return nil
+		}
+		for _, c := range conflicts {
+			actors := make([]string, 0, len(c.Entries))
+			for _, e := range c.Entries {
+				short := e.ActorID
+				if len(short) > 8 {
+					short = short[:8]
+				}
+				actors = append(actors, short)
+			}
+			scope := c.Prefix
+			tail := c.Tail
+			if scope == "" {
+				scope = "?"
+				tail = c.Key
+			}
+			fmt.Fprintf(w, "  %-32s  %s  [%s]\n", c.ID, scope+":"+tail, strings.Join(actors, ", "))
+		}
+		fmt.Fprintf(w, "\n(%d conflict(s))\n", len(conflicts))
+		return nil
+	})
+}
+
+func cmdConflictShow(args []string) error {
+	fs := flag.NewFlagSet("conflict show", flag.ContinueOnError)
+	spaceFlag := fs.String("space", "", "space URI (required)")
+	format := formatFlag(fs)
+	if err := fs.Parse(reorderFlagsFirst(args)); err != nil {
+		return err
+	}
+	if *spaceFlag == "" || fs.NArg() == 0 {
+		return errors.New("usage: hypha conflict show <id> --space <uri>")
+	}
+	needle := fs.Arg(0)
+	root, err := resolveRoot("")
+	if err != nil {
+		return err
+	}
+	sh, err := crdtshadow.Default.Get(mustResolveSpace(root, *spaceFlag), *spaceFlag)
+	if err != nil {
+		return err
+	}
+	conflicts, err := crdtconflict.Detect(sh.Store())
+	if err != nil {
+		return err
+	}
+	c, err := crdtconflict.Find(conflicts, needle)
+	if err != nil {
+		return err
+	}
+	payload := map[string]any{
+		"id":      c.ID,
+		"key":     c.Key,
+		"prefix":  c.Prefix,
+		"tail":    c.Tail,
+		"entries": c.Entries,
+	}
+	return emit("conflict show", payload, *format, func(w io.Writer, _ any) error {
+		fmt.Fprintf(w, "Conflict: %s\n", c.ID)
+		fmt.Fprintf(w, "  scope: %s : %s\n\n", c.Prefix, c.Tail)
+		for _, e := range c.Entries {
+			short := e.ActorID
+			if len(short) > 8 {
+				short = short[:8]
+			}
+			fmt.Fprintf(w, "  ── actor %s ──  %s  (%d bytes)\n", short, e.Time.Format(time.RFC3339), e.ValueLen)
+			fmt.Fprintf(w, "    change: %s\n", e.ChangeHash[:16])
+			if e.Message != "" {
+				fmt.Fprintf(w, "    msg:    %s\n", e.Message)
+			}
+			// Print a small preview of the value if it looks like text.
+			if e.ValueLen > 0 && e.ValueLen < 400 && isTextish(e.Value) {
+				fmt.Fprintf(w, "    bytes:\n")
+				for _, line := range strings.Split(strings.TrimRight(string(e.Value), "\n"), "\n") {
+					fmt.Fprintf(w, "      | %s\n", line)
+				}
+			}
+			fmt.Fprintln(w)
+		}
+		return nil
+	})
+}
+
+func cmdConflictResolve(args []string) error {
+	fs := flag.NewFlagSet("conflict resolve", flag.ContinueOnError)
+	spaceFlag := fs.String("space", "", "space URI (required)")
+	keep := fs.String("keep", "", "actor id (prefix) whose value should win")
+	format := formatFlag(fs)
+	if err := fs.Parse(reorderFlagsFirst(args)); err != nil {
+		return err
+	}
+	if *spaceFlag == "" || fs.NArg() == 0 || *keep == "" {
+		return errors.New("usage: hypha conflict resolve <id> --space <uri> --keep <actor-prefix>")
+	}
+	needle := fs.Arg(0)
+	root, err := resolveRoot("")
+	if err != nil {
+		return err
+	}
+	sh, err := crdtshadow.Default.Get(mustResolveSpace(root, *spaceFlag), *spaceFlag)
+	if err != nil {
+		return err
+	}
+	conflicts, err := crdtconflict.Detect(sh.Store())
+	if err != nil {
+		return err
+	}
+	c, err := crdtconflict.Find(conflicts, needle)
+	if err != nil {
+		return err
+	}
+	entry, err := crdtconflict.PickEntry(c, *keep)
+	if err != nil {
+		return err
+	}
+	if err := sh.ResolveConflict(c.Key, entry.Value); err != nil {
+		return err
+	}
+	// Re-materialize any canonical sections this affected.
+	materialized, _ := sh.MaterializeAll()
+
+	payload := map[string]any{
+		"id":                 c.ID,
+		"key":                c.Key,
+		"kept_actor":         entry.ActorID,
+		"kept_change":        entry.ChangeHash,
+		"materialized_files": materialized,
+	}
+	return emit("conflict resolve", payload, *format, func(w io.Writer, _ any) error {
+		fmt.Fprintf(w, "Resolved %s\n", c.ID)
+		short := entry.ActorID
+		if len(short) > 8 {
+			short = short[:8]
+		}
+		fmt.Fprintf(w, "  kept:     actor=%s change=%s\n", short, entry.ChangeHash[:16])
+		if len(materialized) > 0 {
+			fmt.Fprintf(w, "  files:    %d canonical file(s) re-materialized\n", len(materialized))
+			for _, p := range materialized {
+				fmt.Fprintf(w, "    - %s\n", p)
+			}
+		}
+		return nil
+	})
+}
+
+func isTextish(b []byte) bool {
+	for _, c := range b {
+		if c == '\n' || c == '\t' || c == '\r' {
+			continue
+		}
+		if c < 0x20 || c > 0x7e {
+			return false
+		}
+	}
+	return true
 }
 
 // --- hub -------------------------------------------------------------------

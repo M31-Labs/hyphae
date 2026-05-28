@@ -282,6 +282,22 @@ func (s *Shadow) RecordTrace(t TraceSummary) error {
 	return s.putBlobRoot(prefixTraces, t.ID, t, "trace:"+t.ID)
 }
 
+// ResolveConflict writes value to the flat key, producing a fresh
+// Put op that wins LWW over every existing entry. Used by
+// `hypha conflict resolve`. If the key is a canonical section,
+// MaterializeAll afterwards re-renders the file on disk.
+func (s *Shadow) ResolveConflict(key string, value []byte) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if err := s.doc.Put(crdt.Root, crdt.Prop(key), crdt.BytesValue(append([]byte{}, value...))); err != nil {
+		return fmt.Errorf("crdtshadow: resolve put: %w", err)
+	}
+	if _, err := s.doc.Commit("conflict-resolve:" + key); err != nil {
+		return fmt.Errorf("crdtshadow: resolve commit: %w", err)
+	}
+	return s.persistLocked(false)
+}
+
 // RecordCanonicalWrite mirrors the post-write contents of a canonical
 // file. Phase 5: decomposes the file into per-section CRDT entries
 // (frontmatter + preamble + one Bytes entry per heading slug) so that

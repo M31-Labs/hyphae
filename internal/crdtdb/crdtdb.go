@@ -213,6 +213,57 @@ func (s *Store) LoadAllInto(doc *crdt.Doc) (int, error) {
 	return len(chunks), nil
 }
 
+// DecodedChange is one change-log entry with its ops materialized.
+// Used by conflict detection — it walks every Put op to find
+// concurrent writes to the same flat key.
+type DecodedChange struct {
+	Hash    [32]byte
+	ActorID string
+	Seq     uint64
+	StartOp uint64
+	Time    time.Time
+	Message string
+	Deps    [][32]byte
+	Ops     []crdt.Op
+}
+
+// AllChanges decodes every stored change, returning them in
+// (start_op, hash) order so dependency ordering is respected.
+func (s *Store) AllChanges() ([]DecodedChange, error) {
+	rows, err := s.conn.Query(`
+		SELECT ops_blob FROM crdt_changes
+		ORDER BY start_op, hex(hash)`)
+	if err != nil {
+		return nil, fmt.Errorf("crdtdb: select all changes: %w", err)
+	}
+	defer rows.Close()
+	var out []DecodedChange
+	for rows.Next() {
+		var blob []byte
+		if err := rows.Scan(&blob); err != nil {
+			return nil, err
+		}
+		change, err := crdt.DecodeChangeChunk(blob)
+		if err != nil {
+			return nil, fmt.Errorf("crdtdb: decode change chunk: %w", err)
+		}
+		dc := DecodedChange{
+			Hash:    [32]byte(change.Hash),
+			ActorID: change.ActorID,
+			Seq:     change.Seq,
+			StartOp: change.StartOp,
+			Time:    change.Time.UTC(),
+			Message: change.Message,
+			Ops:     append([]crdt.Op{}, change.Ops...),
+		}
+		for _, dep := range change.Deps {
+			dc.Deps = append(dc.Deps, [32]byte(dep))
+		}
+		out = append(out, dc)
+	}
+	return out, rows.Err()
+}
+
 // HistoryRow is one change-log entry returned by History.
 type HistoryRow struct {
 	Hash    string    `json:"hash"`
