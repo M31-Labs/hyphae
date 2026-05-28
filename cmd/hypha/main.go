@@ -14,6 +14,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"crypto/sha256"
 	"database/sql"
 	"encoding/json"
@@ -21,11 +22,14 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"net/url"
 	"os"
 	"os/exec"
+	"os/signal"
 	"path/filepath"
 	"sort"
 	"strings"
+	"syscall"
 	"time"
 
 	"m31labs.dev/hyphae/internal/analyze"
@@ -37,6 +41,7 @@ import (
 	"m31labs.dev/hyphae/internal/envelope"
 	"m31labs.dev/hyphae/internal/graft"
 	"m31labs.dev/hyphae/internal/graph"
+	"m31labs.dev/hyphae/internal/hubsync"
 	"m31labs.dev/hyphae/internal/identity"
 	"m31labs.dev/hyphae/internal/mcp"
 	"m31labs.dev/hyphae/internal/parser"
@@ -90,6 +95,8 @@ Usage:
   hypha db       compact  --space <uri> [--format text|json|compact]
   hypha sync     export   --space <uri> [--out <file>] [--format text|json|compact]
   hypha sync     import   [--space <uri>] [--in <file>] [--format text|json|compact]
+  hypha sync     pull     --peer <ws-url> --space <uri> [--token X] [--once] [--timeout 30s] [--format text|json|compact]
+  hypha hub      serve    [--addr 127.0.0.1:7777] [--require-auth]
   hypha peer     add      <uri> [--name <name>] [--format text|json|compact]
   hypha peer     list     [--format text|json|compact]
   hypha peer     remove   <name-or-uri> [--format text|json|compact]
@@ -192,6 +199,8 @@ func run(args []string) error {
 		return cmdSync(rest)
 	case "peer":
 		return cmdPeer(rest)
+	case "hub":
+		return cmdHub(rest)
 	case "mcp":
 		return cmdMCP(rest)
 	default:
@@ -315,16 +324,143 @@ func mustResolveSpace(installRoot, spaceURI string) string {
 
 func cmdSync(args []string) error {
 	if len(args) == 0 {
-		return errors.New("usage: hypha sync export|import [...]")
+		return errors.New("usage: hypha sync export|import|pull [...]")
 	}
 	switch args[0] {
 	case "export":
 		return cmdSyncExport(args[1:])
 	case "import":
 		return cmdSyncImport(args[1:])
+	case "pull":
+		return cmdSyncPull(args[1:])
 	default:
-		return fmt.Errorf("unknown sync subcommand %q (try `export`, `import`)", args[0])
+		return fmt.Errorf("unknown sync subcommand %q (try `export`, `import`, `pull`)", args[0])
 	}
+}
+
+func cmdSyncPull(args []string) error {
+	fs := flag.NewFlagSet("sync pull", flag.ContinueOnError)
+	peer := fs.String("peer", "", "peer base URL, e.g. ws://kube.tailnet:7777 (required)")
+	spaceFlag := fs.String("space", "", "space URI (required)")
+	token := fs.String("token", "", "Bearer token if the hub requires auth")
+	once := fs.Bool("once", true, "single sync pass (default); pass --once=false to stay connected")
+	timeout := fs.Duration("timeout", 30*time.Second, "abort if the exchange doesn't finish in this duration")
+	format := formatFlag(fs)
+	if err := fs.Parse(reorderFlagsFirst(args)); err != nil {
+		return err
+	}
+	if *peer == "" || *spaceFlag == "" {
+		return errors.New("--peer and --space are required")
+	}
+	root, err := resolveRoot("")
+	if err != nil {
+		return err
+	}
+	sh, err := crdtshadow.Default.Get(mustResolveSpace(root, *spaceFlag), *spaceFlag)
+	if err != nil {
+		return err
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), *timeout)
+	defer cancel()
+	stats, err := hubsync.Pull(ctx, hubsync.SchemeForBase(*peer), *spaceFlag, *token, sh, *once)
+	if err != nil && !errors.Is(err, context.DeadlineExceeded) {
+		return err
+	}
+	return emit("sync pull", stats, *format, func(w io.Writer, _ any) error {
+		fmt.Fprintf(w, "Pulled from %s\n", *peer)
+		fmt.Fprintf(w, "  space:    %s\n", *spaceFlag)
+		fmt.Fprintf(w, "  frames:   sent=%d received=%d\n", stats.FramesSent, stats.FramesRecv)
+		fmt.Fprintf(w, "  bytes:    sent=%d received=%d\n", stats.BytesSent, stats.BytesReceived)
+		fmt.Fprintf(w, "  changes:  %d → %d (Δ %d)\n", stats.ChangesBefore, stats.ChangesAfter, stats.ChangesAfter-stats.ChangesBefore)
+		return nil
+	})
+}
+
+// --- hub -------------------------------------------------------------------
+
+func cmdHub(args []string) error {
+	if len(args) == 0 || args[0] != "serve" {
+		return errors.New("usage: hypha hub serve [flags]")
+	}
+	return cmdHubServe(args[1:])
+}
+
+func cmdHubServe(args []string) error {
+	fs := flag.NewFlagSet("hub serve", flag.ContinueOnError)
+	addr := fs.String("addr", "127.0.0.1:7777", "listen address")
+	requireAuth := fs.Bool("require-auth", false, "require a valid cap-token Bearer header on every connection")
+	if err := fs.Parse(reorderFlagsFirst(args)); err != nil {
+		return err
+	}
+
+	root, err := resolveRoot("")
+	if err != nil {
+		return err
+	}
+	spaces, err := listSpaces(root)
+	if err != nil {
+		return err
+	}
+
+	var authConn *sql.DB
+	if *requireAuth {
+		conn, dbErr := openIndex(root)
+		if dbErr != nil {
+			return fmt.Errorf("hub serve: open auth DB: %w", dbErr)
+		}
+		defer conn.Close()
+		authConn = conn
+	}
+
+	srv := hubsync.NewServer(root, crdtshadow.Default, authConn, *requireAuth)
+	registered := 0
+	for _, sp := range spaces {
+		uri := "hypha://" + sp.URI
+		if err := srv.Register(uri); err != nil {
+			fmt.Fprintf(os.Stderr, "warn: register %s: %v\n", uri, err)
+			continue
+		}
+		registered++
+	}
+	if registered == 0 {
+		return fmt.Errorf("hub serve: no spaces could be registered under %s", root)
+	}
+
+	// Graceful shutdown on SIGINT/SIGTERM.
+	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer cancel()
+
+	ready := make(chan string, 1)
+	errCh := make(chan error, 1)
+	go func() { errCh <- srv.Serve(ctx, *addr, ready) }()
+
+	select {
+	case actual := <-ready:
+		fmt.Fprintf(os.Stderr, "hub: listening on %s  (%d space(s))\n", actual, registered)
+		if *requireAuth {
+			fmt.Fprintln(os.Stderr, "hub: auth required (Bearer token)")
+		}
+		for _, sp := range spaces {
+			fmt.Fprintf(os.Stderr, "  hypha://%s → %s%s%s\n",
+				sp.URI,
+				schemeForListenAddr(actual),
+				hubsync.PathPrefix,
+				urlEscape("hypha://"+sp.URI),
+			)
+		}
+	case err := <-errCh:
+		return err
+	}
+
+	return <-errCh
+}
+
+func schemeForListenAddr(addr string) string {
+	return "ws://" + addr
+}
+
+func urlEscape(s string) string {
+	return url.PathEscape(s)
 }
 
 func cmdSyncExport(args []string) error {

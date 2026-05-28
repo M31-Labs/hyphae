@@ -4,6 +4,7 @@ go 1.26
 
 require (
 	github.com/google/uuid v1.6.0
+	github.com/gorilla/websocket v1.5.3
 	github.com/mattn/go-isatty v0.0.20
 	gopkg.in/yaml.v3 v3.0.1
 	m31labs.dev/gosx v0.21.0
