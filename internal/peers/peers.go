@@ -25,7 +25,7 @@ const Filename = ".peers.json"
 // Peer is one known remote endpoint.
 type Peer struct {
 	Name    string    `json:"name"`
-	URI     string    `json:"uri"`     // tailscale://node, https://host:port, etc.
+	URI     string    `json:"uri"`     // ws://host:port, https://host:port, etc.
 	AddedAt time.Time `json:"added_at"`
 }
 

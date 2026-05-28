@@ -11,6 +11,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"m31labs.dev/hyphae/internal/types"
@@ -113,6 +114,70 @@ func Verify(conn *sql.DB, token string) (*types.Capability, error) {
 		return nil, errors.New("capability: token expired")
 	}
 	return &c, nil
+}
+
+// List returns capabilities, newest first. spaceID, when non-empty, filters
+// to one space. includeRevoked controls whether revoked tokens are returned;
+// expired-but-not-revoked tokens are always included (the caller decides how
+// to present them). The token plaintext is the ID, so callers must treat the
+// returned IDs as secrets.
+func List(conn *sql.DB, spaceID string, includeRevoked bool) ([]types.Capability, error) {
+	q := `
+		SELECT id, subject_identity_id, space_id, permissions_json, limits_json,
+		       issued_by, issued_at, expires_at, revoked_at
+		FROM capabilities`
+	var (
+		clauses []string
+		args    []any
+	)
+	if spaceID != "" {
+		clauses = append(clauses, "space_id = ?")
+		args = append(args, spaceID)
+	}
+	if !includeRevoked {
+		clauses = append(clauses, "revoked_at IS NULL")
+	}
+	if len(clauses) > 0 {
+		q += " WHERE " + strings.Join(clauses, " AND ")
+	}
+	q += " ORDER BY issued_at DESC"
+
+	rows, err := conn.Query(q, args...)
+	if err != nil {
+		return nil, fmt.Errorf("capability: list: %w", err)
+	}
+	defer rows.Close()
+
+	var out []types.Capability
+	for rows.Next() {
+		var (
+			c                     types.Capability
+			permsJSON, limitsJSON string
+			issuedAt, expiresAt   string
+			revokedAt             sql.NullString
+		)
+		if err := rows.Scan(&c.ID, &c.Subject, &c.SpaceID, &permsJSON, &limitsJSON,
+			&c.IssuedBy, &issuedAt, &expiresAt, &revokedAt); err != nil {
+			return nil, fmt.Errorf("capability: list scan: %w", err)
+		}
+		if err := json.Unmarshal([]byte(permsJSON), &c.Permissions); err != nil {
+			return nil, fmt.Errorf("capability: list unmarshal perms: %w", err)
+		}
+		if limitsJSON != "" {
+			if err := json.Unmarshal([]byte(limitsJSON), &c.Limits); err != nil {
+				return nil, fmt.Errorf("capability: list unmarshal limits: %w", err)
+			}
+		}
+		c.IssuedAt, _ = time.Parse(time.RFC3339, issuedAt)
+		c.ExpiresAt, _ = time.Parse(time.RFC3339, expiresAt)
+		if revokedAt.Valid {
+			if t, err := time.Parse(time.RFC3339, revokedAt.String); err == nil {
+				c.RevokedAt = &t
+			}
+		}
+		out = append(out, c)
+	}
+	return out, rows.Err()
 }
 
 // Revoke marks a capability revoked. It remains in the DB for audit.

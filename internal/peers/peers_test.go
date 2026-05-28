@@ -15,11 +15,11 @@ func TestAddListRemove(t *testing.T) {
 		t.Errorf("expected empty list, got %d", len(list))
 	}
 
-	p, err := peers.Add(root, "kube", "tailscale://kube.tailnet")
+	p, err := peers.Add(root, "kube", "ws://kube.internal:7777")
 	if err != nil {
 		t.Fatalf("Add: %v", err)
 	}
-	if p.Name != "kube" || p.URI != "tailscale://kube.tailnet" {
+	if p.Name != "kube" || p.URI != "ws://kube.internal:7777" {
 		t.Errorf("Add returned wrong peer: %+v", p)
 	}
 	if p.AddedAt.IsZero() {
@@ -27,10 +27,10 @@ func TestAddListRemove(t *testing.T) {
 	}
 
 	// Re-add same URI → error.
-	if _, err := peers.Add(root, "another", "tailscale://kube.tailnet"); err == nil {
+	if _, err := peers.Add(root, "another", "ws://kube.internal:7777"); err == nil {
 		t.Error("re-add same URI should fail")
 	}
-	if _, err := peers.Add(root, "kube", "tailscale://other.tailnet"); err == nil {
+	if _, err := peers.Add(root, "kube", "ws://other.internal:7777"); err == nil {
 		t.Error("re-add same name should fail")
 	}
 
@@ -47,7 +47,7 @@ func TestAddListRemove(t *testing.T) {
 	}
 
 	// Remove by URI.
-	removed, err := peers.Remove(root, "tailscale://kube.tailnet")
+	removed, err := peers.Remove(root, "ws://kube.internal:7777")
 	if err != nil {
 		t.Fatalf("Remove by URI: %v", err)
 	}

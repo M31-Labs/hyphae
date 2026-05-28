@@ -97,7 +97,7 @@ Usage:
   hypha sync     export   --space <uri> [--out <file>] [--format text|json|compact]
   hypha sync     import   [--space <uri>] [--in <file>] [--format text|json|compact]
   hypha sync     pull     --peer <ws-url> --space <uri> [--token X] [--once] [--timeout 30s] [--format text|json|compact]
-  hypha hub      serve    [--addr 127.0.0.1:7777] [--require-auth]
+  hypha hub      serve    [--addr 127.0.0.1:7777] [--require-auth] [--admin] [--base-url <url>]
   hypha conflict list     --space <uri> [--format text|json|compact]
   hypha conflict show     <id> --space <uri> [--format text|json|compact]
   hypha conflict resolve  <id> --space <uri> --keep <actor-prefix> [--format text|json|compact]
@@ -118,8 +118,14 @@ Output formats:
   HYPHAE_FORMAT       env override for the auto-detected default.
 
 Environment:
-  HYPHAE_HOME    install root (default: $HOME/.hyphae)
-  HYPHAE_FORMAT  default output format when --format is not given
+  HYPHAE_HOME                  install root (default: $HOME/.hyphae)
+  HYPHAE_FORMAT                default output format when --format is not given
+  HYPHAE_GITHUB_CLIENT_ID      GitHub OAuth app client id. With CLIENT_SECRET
+                               and 'hub serve --admin --base-url', gates the
+                               admin UI behind GitHub login.
+  HYPHAE_GITHUB_CLIENT_SECRET  GitHub OAuth app client secret
+  HYPHAE_ADMIN_LOGINS          comma-separated GitHub logins allowed admin
+                               access (empty = no one); required for the gate
 `
 
 func main() {
@@ -346,7 +352,7 @@ func cmdSync(args []string) error {
 
 func cmdSyncPull(args []string) error {
 	fs := flag.NewFlagSet("sync pull", flag.ContinueOnError)
-	peer := fs.String("peer", "", "peer base URL, e.g. ws://kube.tailnet:7777 (required)")
+	peer := fs.String("peer", "", "peer base URL, e.g. ws://hub.internal:7777 (required)")
 	spaceFlag := fs.String("space", "", "space URI (required)")
 	token := fs.String("token", "", "Bearer token if the hub requires auth")
 	once := fs.Bool("once", true, "single sync pass (default); pass --once=false to stay connected")
@@ -596,6 +602,8 @@ func cmdHubServe(args []string) error {
 	fs := flag.NewFlagSet("hub serve", flag.ContinueOnError)
 	addr := fs.String("addr", "127.0.0.1:7777", "listen address")
 	requireAuth := fs.Bool("require-auth", false, "require a valid cap-token Bearer header on every connection")
+	admin := fs.Bool("admin", false, "mount the server-rendered admin UI at /admin (keys, peers, audit)")
+	baseURL := fs.String("base-url", "", "public base URL of this hub (e.g. https://hub.example.com), used for the GitHub OAuth callback")
 	if err := fs.Parse(reorderFlagsFirst(args)); err != nil {
 		return err
 	}
@@ -609,8 +617,10 @@ func cmdHubServe(args []string) error {
 		return err
 	}
 
+	// The admin surface needs the index DB (capabilities + receipts) even
+	// when --require-auth is off, so open it for either flag.
 	var authConn *sql.DB
-	if *requireAuth {
+	if *requireAuth || *admin {
 		conn, dbErr := openIndex(root)
 		if dbErr != nil {
 			return fmt.Errorf("hub serve: open auth DB: %w", dbErr)
@@ -633,6 +643,28 @@ func cmdHubServe(args []string) error {
 		return fmt.Errorf("hub serve: no spaces could be registered under %s", root)
 	}
 
+	// Mount the admin UI (+ optional GitHub OAuth gate) on the same mux.
+	var oauthEnabled bool
+	if *admin {
+		oauth := hubsync.NewOAuth(hubsync.OAuthConfig{
+			ClientID:     os.Getenv("HYPHAE_GITHUB_CLIENT_ID"),
+			ClientSecret: os.Getenv("HYPHAE_GITHUB_CLIENT_SECRET"),
+			BaseURL:      *baseURL,
+			AdminLogins:  splitCSV(os.Getenv("HYPHAE_ADMIN_LOGINS")),
+		})
+		// OAuth needs a base URL for its callback; disable it (the admin
+		// surface then runs ungated, local-only) if one wasn't provided.
+		if oauth != nil && *baseURL == "" {
+			fmt.Fprintln(os.Stderr, "hub: GitHub OAuth env set but --base-url missing; OAuth gate disabled (admin is ungated — bind 127.0.0.1 only)")
+			oauth = nil
+		}
+		if oauth != nil && oauth.AllowedCount() == 0 {
+			fmt.Fprintln(os.Stderr, "hub: warning: GitHub OAuth gate enabled but HYPHAE_ADMIN_LOGINS is empty — no one will be granted admin access")
+		}
+		oauthEnabled = oauth != nil
+		hubsync.NewAdmin(root, authConn, srv, oauth).Mount(srv.Mux())
+	}
+
 	// Graceful shutdown on SIGINT/SIGTERM.
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
@@ -646,6 +678,14 @@ func cmdHubServe(args []string) error {
 		fmt.Fprintf(os.Stderr, "hub: listening on %s  (%d space(s))\n", actual, registered)
 		if *requireAuth {
 			fmt.Fprintln(os.Stderr, "hub: auth required (Bearer token)")
+		}
+		if *admin {
+			fmt.Fprintf(os.Stderr, "hub: admin UI at %s/admin\n", strings.TrimRight(nonEmpty(*baseURL, "http://"+actual), "/"))
+			if oauthEnabled {
+				fmt.Fprintln(os.Stderr, "hub: admin gated by GitHub OAuth (allowlist)")
+			} else {
+				fmt.Fprintln(os.Stderr, "hub: admin UNGATED — keep this bound to 127.0.0.1 or front it with auth")
+			}
 		}
 		for _, sp := range spaces {
 			fmt.Fprintf(os.Stderr, "  hypha://%s → %s%s%s\n",
