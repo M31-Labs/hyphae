@@ -194,8 +194,8 @@ func TestDuplicateSubmit(t *testing.T) {
 	if err == nil {
 		t.Fatal("second Submit should have returned an error for duplicate spore")
 	}
-	if !strings.Contains(err.Error(), "spore already exists at") {
-		t.Errorf("unexpected error message: %v", err)
+	if !errors.Is(err, spore.ErrDuplicate) {
+		t.Errorf("expected ErrDuplicate, got: %v", err)
 	}
 }
 

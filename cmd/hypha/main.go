@@ -30,6 +30,7 @@ import (
 
 	"m31labs.dev/hyphae/internal/analyze"
 	"m31labs.dev/hyphae/internal/assess"
+	"m31labs.dev/hyphae/internal/atomicfs"
 	"m31labs.dev/hyphae/internal/capability"
 	"m31labs.dev/hyphae/internal/db"
 	"m31labs.dev/hyphae/internal/envelope"
@@ -76,6 +77,7 @@ Usage:
   hypha trace    list   [--active] [--agent <uri>] [--space <uri>] [--format text|json|compact]
   hypha trace    history [--similar <q>] [--task <id>] [--agent <uri>] [--include-open] [--limit N] [--space <uri>] [--format text|json|compact]
   hypha trace    tail   [--id <trace-id>] [--agent <uri>] [--interval 1s] [--timeout 5m] [--space <uri>]
+  hypha trace    reap   [--older-than 1h] [--space <uri>] [--format text|json|compact]
   hypha analyze  <kind> [target] [--space <uri>] [--source <path>] [--diff-ref <ref>] [--max-depth N] [--refresh]
                        kinds: impact, callgraph, refs, hotspot, dead, review
   hypha analyze  list   [--kind <k>] [--space <uri>] [--target-file <path>] [--format text|json|compact]
@@ -870,7 +872,7 @@ func cmdSporeReview(args []string, newStatus string) error {
 		return fmt.Errorf("spore review: status is %q (only unreviewed spores can be reviewed); for already-graphed spores use `hypha graft`", cur)
 	}
 	updated := writeFrontmatterField(data, "status", newStatus)
-	if err := os.WriteFile(sporePath, updated, 0o644); err != nil {
+	if err := atomicfs.WriteFile(sporePath, updated, 0o644); err != nil {
 		return fmt.Errorf("spore review: write %s: %w", sporePath, err)
 	}
 
@@ -1527,7 +1529,7 @@ func formatMdppFile(path string) (bool, error) {
 	if bytes.Equal(src, out) {
 		return false, nil
 	}
-	if err := os.WriteFile(path, out, 0o644); err != nil {
+	if err := atomicfs.WriteFile(path, out, 0o644); err != nil {
 		return false, err
 	}
 	return true, nil
@@ -1779,7 +1781,7 @@ func cmdSpaces(args []string) error {
 
 func cmdTrace(args []string) error {
 	if len(args) == 0 {
-		return errors.New("usage: hypha trace start|tick|done|list|history|tail [...]")
+		return errors.New("usage: hypha trace start|tick|done|list|history|tail|reap [...]")
 	}
 	switch args[0] {
 	case "start":
@@ -1794,8 +1796,10 @@ func cmdTrace(args []string) error {
 		return cmdTraceHistory(args[1:])
 	case "tail":
 		return cmdTraceTail(args[1:])
+	case "reap":
+		return cmdTraceReap(args[1:])
 	default:
-		return fmt.Errorf("unknown trace subcommand %q (try `start`, `tick`, `done`, `list`, `history`, `tail`)", args[0])
+		return fmt.Errorf("unknown trace subcommand %q (try `start`, `tick`, `done`, `list`, `history`, `tail`, `reap`)", args[0])
 	}
 }
 
@@ -2004,6 +2008,67 @@ func cmdTraceList(args []string) error {
 				r.LastTick.Format("2006-01-02 15:04"), r.Status, r.Ticks, r.ID, r.Agent, phase)
 		}
 		fmt.Fprintf(os.Stderr, "\n(%d traces)\n", len(rows))
+		return nil
+	})
+}
+
+func cmdTraceReap(args []string) error {
+	fs := flag.NewFlagSet("trace reap", flag.ContinueOnError)
+	olderStr := fs.String("older-than", "1h", "max time since last_tick before an open trace is considered stale")
+	spaceFlag := fs.String("space", "", "space URI (default: all installed spaces)")
+	format := formatFlag(fs)
+	if err := fs.Parse(reorderFlagsFirst(args)); err != nil {
+		return err
+	}
+	older, err := parseFlexDuration(*olderStr)
+	if err != nil {
+		return fmt.Errorf("--older-than %q: %w", *olderStr, err)
+	}
+
+	root, err := resolveRoot("")
+	if err != nil {
+		return err
+	}
+	spaces, err := listSpaces(root)
+	if err != nil {
+		return err
+	}
+
+	type spaceReap struct {
+		Space  string           `json:"space"`
+		Report trace.ReapReport `json:"report"`
+	}
+	var all []spaceReap
+	totalReaped := 0
+	for _, sp := range spaces {
+		if *spaceFlag != "" && !spaceMatches(sp, *spaceFlag) {
+			continue
+		}
+		rep, rerr := trace.Reap(sp.Path, older)
+		if rerr != nil {
+			fmt.Fprintf(os.Stderr, "warn: reap %s: %v\n", sp.URI, rerr)
+			continue
+		}
+		all = append(all, spaceReap{Space: "hypha://" + sp.URI, Report: rep})
+		totalReaped += len(rep.Reaped)
+	}
+
+	payload := map[string]any{
+		"older_than":   older.String(),
+		"spaces":       all,
+		"total_reaped": totalReaped,
+	}
+	return emit("trace reap", payload, *format, func(w io.Writer, _ any) error {
+		if totalReaped == 0 {
+			fmt.Fprintf(w, "no stale open traces (threshold %s)\n", older)
+			return nil
+		}
+		fmt.Fprintf(w, "reaped %d stale open trace(s) (threshold %s)\n", totalReaped, older)
+		for _, sr := range all {
+			for _, r := range sr.Report.Reaped {
+				fmt.Fprintf(w, "  %s  stale=%s  %s\n", r.ID, r.StaleFor, r.AgentID)
+			}
+		}
 		return nil
 	})
 }

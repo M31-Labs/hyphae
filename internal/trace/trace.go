@@ -19,6 +19,7 @@ import (
 	"strings"
 	"time"
 
+	"m31labs.dev/hyphae/internal/atomicfs"
 	"m31labs.dev/hyphae/internal/types"
 )
 
@@ -193,7 +194,7 @@ func appendWorkLogToSpore(sporePath string, tr types.Trace) error {
 		data = append(data, '\n')
 	}
 	data = append(data, []byte(b.String())...)
-	return os.WriteFile(sporePath, data, 0o644)
+	return atomicfs.WriteFile(sporePath, data, 0o644)
 }
 
 func bytesContains(haystack, needle []byte) bool {
@@ -326,10 +327,74 @@ func write(spaceRoot string, tr *types.Trace) error {
 	}
 	tr.FilePath = path
 	bytes := serialize(*tr)
-	if err := os.WriteFile(path, bytes, 0o644); err != nil {
+	if err := atomicfs.WriteFile(path, bytes, 0o644); err != nil {
 		return fmt.Errorf("trace: write: %w", err)
 	}
 	return nil
+}
+
+// ErrStale is returned by callers that want to distinguish a stale (reaped)
+// open trace from one that was deliberately closed. It is not produced
+// directly by trace.* — Reap stamps `status: killed` and a body note on
+// stale traces.
+var ErrStale = errors.New("trace: stale (last_tick older than threshold)")
+
+// ReapReport summarizes a Reap pass.
+type ReapReport struct {
+	Scanned int          `json:"scanned"`
+	Reaped  []ReapedItem `json:"reaped"`
+}
+
+// ReapedItem records one open trace that was force-closed because its
+// LastTick exceeded the staleness threshold.
+type ReapedItem struct {
+	ID           string    `json:"id"`
+	AgentID      string    `json:"agent"`
+	LastTick     time.Time `json:"last_tick"`
+	StaleFor     string    `json:"stale_for"` // human-readable duration since last tick
+	Path         string    `json:"path"`
+}
+
+// Reap walks spaceRoot/.trace and force-closes every open trace whose
+// LastTick is older than now-olderThan. Reaped traces get status=killed,
+// last_tick=now, and a "reaped: stale" body annotation. Non-open traces
+// are left alone.
+//
+// olderThan ≤ 0 is treated as "no threshold" — nothing is reaped.
+func Reap(spaceRoot string, olderThan time.Duration) (ReapReport, error) {
+	report := ReapReport{Reaped: []ReapedItem{}}
+	if olderThan <= 0 {
+		return report, nil
+	}
+	traces, err := List(spaceRoot, ListFilter{ActiveOnly: true})
+	if err != nil {
+		return report, err
+	}
+	cutoff := time.Now().UTC().Add(-olderThan)
+	for _, tr := range traces {
+		report.Scanned++
+		if !tr.LastTick.Before(cutoff) {
+			continue
+		}
+		stale := time.Since(tr.LastTick).Round(time.Second).String()
+		tr.Status = types.TraceStatusKilled
+		tr.LastTick = time.Now().UTC().Truncate(time.Second)
+		tr.Ticks = append(tr.Ticks, types.Tick{
+			At:      tr.LastTick,
+			Message: fmt.Sprintf("reaped: stale (no tick for %s, threshold %s)", stale, olderThan),
+		})
+		if werr := write(spaceRoot, &tr); werr != nil {
+			return report, fmt.Errorf("trace: reap %s: %w", tr.ID, werr)
+		}
+		report.Reaped = append(report.Reaped, ReapedItem{
+			ID:       tr.ID,
+			AgentID:  tr.AgentID,
+			LastTick: tr.LastTick,
+			StaleFor: stale,
+			Path:     tr.FilePath,
+		})
+	}
+	return report, nil
 }
 
 // serialize emits a Trace as a YAML-frontmatter + markdown-body file.

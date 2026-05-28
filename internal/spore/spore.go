@@ -9,6 +9,7 @@ import (
 	"bytes"
 	"crypto/sha256"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -18,9 +19,18 @@ import (
 	"time"
 	"unicode"
 
+	"m31labs.dev/hyphae/internal/atomicfs"
 	"m31labs.dev/hyphae/internal/types"
 	"m31labs.dev/mdpp"
 )
+
+// ErrDuplicate is returned by Submit when a spore with the same id is
+// already present in the inbox.
+var ErrDuplicate = errors.New("spore: duplicate (id already present in inbox)")
+
+// ErrInvalidStatusTransition is returned by review paths when a status
+// flip is not permitted (e.g., re-accepting an already-rejected spore).
+var ErrInvalidStatusTransition = errors.New("spore: invalid status transition")
 
 // ValidationError describes one required-field violation.
 type ValidationError struct {
@@ -289,14 +299,14 @@ func Submit(s types.Spore, spaceRoot string) (filePath string, r types.Receipt, 
 
 	// Guard against duplicates.
 	if _, statErr := os.Stat(filePath); statErr == nil {
-		return "", types.Receipt{}, fmt.Errorf("spore already exists at %s", filePath)
+		return "", types.Receipt{}, fmt.Errorf("%w: %s", ErrDuplicate, filePath)
 	}
 
 	// Reconstruct document bytes (frontmatter + body).
 	fileBytes := reconstructSource(s)
 
 	// Write file.
-	if writeErr := os.WriteFile(filePath, fileBytes, 0o644); writeErr != nil {
+	if writeErr := atomicfs.WriteFile(filePath, fileBytes, 0o644); writeErr != nil {
 		return "", types.Receipt{}, fmt.Errorf("failed to write spore file: %w", writeErr)
 	}
 
@@ -352,9 +362,9 @@ func SubmitBytes(source []byte, spaceRoot string) (filePath string, r types.Rece
 	}
 	filePath = filepath.Join(inboxDir, filename)
 	if _, statErr := os.Stat(filePath); statErr == nil {
-		return "", types.Receipt{}, fmt.Errorf("spore already exists at %s", filePath)
+		return "", types.Receipt{}, fmt.Errorf("%w: %s", ErrDuplicate, filePath)
 	}
-	if writeErr := os.WriteFile(filePath, source, 0o644); writeErr != nil {
+	if writeErr := atomicfs.WriteFile(filePath, source, 0o644); writeErr != nil {
 		return "", types.Receipt{}, fmt.Errorf("failed to write spore file: %w", writeErr)
 	}
 
