@@ -356,7 +356,7 @@ searchInput.addEventListener('keydown', async e => {
     const res = await fetch('/api/search?q=' + encodeURIComponent(q));
     const data = await res.json();
     searchResults.innerHTML = '';
-    (data.anchors || []).forEach(a => {
+    (data.hits || []).forEach(a => {
       const div = document.createElement('div');
       div.className = 'result-item';
       div.innerHTML = '<div>' + escHtml(a.title || a.uri) + '</div><div class="result-uri">' + escHtml(a.uri) + '</div>';
@@ -369,7 +369,7 @@ searchInput.addEventListener('keydown', async e => {
       });
       searchResults.appendChild(div);
     });
-    if (data.anchors && data.anchors.length > 0) {
+    if (data.hits && data.hits.length > 0) {
       searchResults.classList.add('open');
     } else {
       const div = document.createElement('div');

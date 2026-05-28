@@ -776,10 +776,14 @@ func cmdRecall(args []string) error {
 			return fmt.Errorf("recall: text renderer got %T", data)
 		}
 		fmt.Fprintln(w, r.Summary)
-		for _, a := range r.Anchors {
-			fmt.Fprintf(w, "  %s  %s\n", a.URI, a.Title)
+		for _, h := range r.Hits {
+			fmt.Fprintf(w, "\n  %s  %s\n", h.URI, h.Title)
+			for _, sn := range h.Snippets {
+				fmt.Fprintf(w, "      %s\n", sn.Text)
+				fmt.Fprintf(w, "        ↳ %s  (L%d-%d)\n", sn.Citation.Anchor, sn.Citation.Line, sn.Citation.EndLine)
+			}
 		}
-		fmt.Fprintf(os.Stderr, "(%d anchors, %d tokens used)\n", len(r.Anchors), r.TokensUsed)
+		fmt.Fprintf(os.Stderr, "\n(%d hits, %d tokens used)\n", len(r.Hits), r.TokensUsed)
 		return nil
 	})
 }

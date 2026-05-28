@@ -80,17 +80,17 @@ func TestRecall_HappyPath(t *testing.T) {
 	}
 
 	t.Run("single_match", func(t *testing.T) {
-		// "billing webhook" should surface obj-billing-001 as the top anchor.
+		// "billing webhook" should surface obj-billing-001 as the top hit.
 		resp, err := recall.Recall(conn, "billing webhook", 10, types.DefaultBudget())
 		if err != nil {
 			t.Fatalf("Recall: %v", err)
 		}
-		if len(resp.Anchors) == 0 {
-			t.Fatal("expected at least one anchor, got none")
+		if len(resp.Hits) == 0 {
+			t.Fatal("expected at least one hit, got none")
 		}
-		top := resp.Anchors[0]
+		top := resp.Hits[0]
 		if !strings.Contains(top.URI, "obj-billing-001") {
-			t.Errorf("expected top anchor to contain obj-billing-001, got URI=%q title=%q", top.URI, top.Title)
+			t.Errorf("expected top hit to contain obj-billing-001, got URI=%q title=%q", top.URI, top.Title)
 		}
 		t.Logf("query=%q top=%q score=%.4f tokensUsed=%d", resp.Query, top.Title, top.Score, resp.TokensUsed)
 	})
@@ -100,8 +100,8 @@ func TestRecall_HappyPath(t *testing.T) {
 		if err != nil {
 			t.Fatalf("Recall: %v", err)
 		}
-		if len(resp.Anchors) != 0 {
-			t.Errorf("expected no anchors, got %d", len(resp.Anchors))
+		if len(resp.Hits) != 0 {
+			t.Errorf("expected no hits, got %d", len(resp.Hits))
 		}
 		if !strings.Contains(resp.Summary, "No matches") {
 			t.Errorf("expected summary to contain 'No matches', got: %q", resp.Summary)
@@ -118,11 +118,11 @@ func TestRecall_HappyPath(t *testing.T) {
 		if resp.TokensUsed > 50 {
 			t.Errorf("TokensUsed=%d exceeds budget of 50", resp.TokensUsed)
 		}
-		// If there were matches, at least 1 anchor must survive.
-		if len(resp.Anchors) == 0 && strings.Contains(resp.Summary, "Found") {
-			t.Error("budget trim removed all anchors; must keep at least 1")
+		// If there were matches, at least 1 hit must survive.
+		if len(resp.Hits) == 0 && strings.Contains(resp.Summary, "Found") {
+			t.Error("budget trim removed all hits; must keep at least 1")
 		}
-		t.Logf("budget=50 tokensUsed=%d anchors=%d", resp.TokensUsed, len(resp.Anchors))
+		t.Logf("budget=50 tokensUsed=%d hits=%d", resp.TokensUsed, len(resp.Hits))
 	})
 }
 
@@ -147,8 +147,8 @@ func TestRecall_Index_Idempotent(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Recall after double-index: %v", err)
 	}
-	if len(resp.Anchors) != 1 {
-		t.Errorf("expected exactly 1 anchor after idempotent re-index, got %d", len(resp.Anchors))
+	if len(resp.Hits) != 1 {
+		t.Errorf("expected exactly 1 hit after idempotent re-index, got %d", len(resp.Hits))
 	}
 }
 
@@ -168,10 +168,10 @@ func TestRecall_ShapeHeadline(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Recall: %v", err)
 	}
-	if len(resp.Anchors) > 1 {
-		t.Errorf("headline shape: expected at most 1 anchor, got %d", len(resp.Anchors))
+	if len(resp.Hits) > 1 {
+		t.Errorf("headline shape: expected at most 1 hit, got %d", len(resp.Hits))
 	}
-	t.Logf("headline resp: summary=%q anchors=%d", resp.Summary, len(resp.Anchors))
+	t.Logf("headline resp: summary=%q hits=%d", resp.Summary, len(resp.Hits))
 }
 
 func TestRecall_ShapeFullDocuments_Unsupported(t *testing.T) {

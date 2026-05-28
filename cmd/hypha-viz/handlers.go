@@ -74,7 +74,7 @@ func handleSearch(conn *sql.DB) server.APIHandler {
 		if q == "" {
 			return map[string]any{
 				"summary": "",
-				"anchors": []any{},
+				"hits":    []any{},
 				"query":   "",
 			}, nil
 		}

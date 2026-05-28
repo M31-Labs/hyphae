@@ -107,12 +107,12 @@ func TestSearchEndpoint(t *testing.T) {
 		if err := json.Unmarshal(w.Body.Bytes(), &payload); err != nil {
 			t.Fatalf("GET /api/search: invalid JSON: %v — body: %s", err, w.Body.String())
 		}
-		// Response from recall.Recall always has summary and anchors.
+		// Response from recall.Recall always has summary and hits.
 		if _, ok := payload["summary"]; !ok {
 			t.Error("GET /api/search: missing 'summary' key in response")
 		}
-		if _, ok := payload["anchors"]; !ok {
-			t.Error("GET /api/search: missing 'anchors' key in response")
+		if _, ok := payload["hits"]; !ok {
+			t.Error("GET /api/search: missing 'hits' key in response")
 		}
 	}
 }

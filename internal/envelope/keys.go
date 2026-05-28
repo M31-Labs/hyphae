@@ -30,15 +30,24 @@ var fullToCompact = map[string]string{
 	// Recall response.
 	"query":       "q",
 	"summary":     "su",
-	"anchors":     "a",
+	"hits":        "hs",
+	"anchors":     "a", // legacy; kept until snippet-citation anchor key collision is resolved
 	"tokens_used": "tu",
 	"shape":       "sh",
 
-	// Recall anchor.
+	// Recall hit.
 	"uri":         "u",
 	"title":       "t",
 	"tokens_full": "tf",
 	"score":       "sc",
+	"snippets":    "sn",
+
+	// Recall snippet + citation.
+	"text":     "tx",
+	"citation": "ci",
+	"anchor":   "an",
+	"line":     "ln",
+	"end_line": "el",
 
 	// Pulse.
 	"space":             "sp",
