@@ -2,6 +2,8 @@
 
 A federated Markdown++ knowledge graph for agents (and the humans they work with).
 
+Current release: **v0.1.8** ([CHANGELOG](CHANGELOG.md)).
+
 Hyphae is built on **[Markdown++ (mdpp)](https://github.com/M31-Labs/mdpp)** —
 a structural Markdown parser, renderer, formatter, and LSP server. Every
 spore, decision, concept, lesson, spec, plan, skill, trace, and analysis
@@ -39,32 +41,47 @@ carries provenance.
 
 ## Status
 
-**v0.1.6** — full read + contribute + review + audit + observe + analyze loop.
-Ed25519 signing, graph queries, pulse aggregation, alignment scoring
-(`change:assess` / `task` / `pr`), spore submit/list/accept/reject,
-single-object fetch (`show`), in-flight trace lifecycle (`start | tick |
-done | list | history | tail`), canopy-backed code intelligence (`analyze
-impact | callgraph | refs | hotspot | dead | review`), mdpp.fmt post-graft,
-GoSX-based browser viz (mid-flight).
+**v0.1.8** — Hyphae meets the "everyday driver" bar. Source builds with
+`go install` are clean; CLI output is uniform across every command;
+recall returns body snippets with anchor citations; graft has a safe
+`--dry-run` + `--diff` preview path; trace and spore writes are atomic;
+stale traces can be reaped; and a Model Context Protocol stdio server
+(`hypha mcp serve`) exposes the whole agent-facing surface as 29 tools.
+
+Built on top of the existing v0.1.6 substrate: Ed25519 signing, graph
+queries, pulse aggregation, alignment scoring (`change:assess` /
+`task` / `pr`), spore submit/list/accept/reject, single-object fetch
+(`show`), in-flight trace lifecycle (`start | tick | done | list |
+history | tail | reap`), canopy-backed code intelligence (`analyze
+impact | callgraph | refs | hotspot | dead | review`), mdpp.fmt
+post-graft, GoSX-based browser viz (mid-flight).
 
 Today you can:
 
 - `hypha index rebuild` — walk an install root and populate a SQLite
   index (FTS5 + objects + anchors + edges) over every space.
 - `hypha recall <query>` — BM25-ranked, token-budgeted full-text search
-  returning a compact `summary + anchors` response.
+  returning a compact `summary + hits` response. Each hit carries up to
+  three body snippets with anchor-URI + line-range **citations**, so
+  agents can decide relevance without a follow-up `show`.
 - `hypha show <id>` — fetch one object by id (or `hypha://` URI). Default
   prints the full file; `--path` / `--json` / `--frontmatter` / `--body`
   select a slice. Closes the recall→read loop without URI→path translation.
 - `hypha spaces list` — enumerate installed spaces under `$HYPHAE_HOME/spaces`.
 - `hypha spore submit <file> [--sign --as <id>]` — validate, optionally
-  Ed25519-sign, write to inbox, emit + persist a content-hashed receipt.
+  Ed25519-sign, write to inbox **atomically**, emit + persist a
+  content-hashed receipt.
 - `hypha spore list [--space --status --since --limit]` — enumerate inbox
   spores across installed spaces, newest first, with filters.
-- `hypha graft <spore-id> --as <id> [--verify]` — apply a spore's
-  `proposed_writes` (`append_section`, `insert_after`, `replace_block`,
-  `create_file`, `add_tag`) via bounded mdpp edits, record `derived_from`
-  edges, update spore status in-place, persist the receipt.
+- `hypha spore accept|reject <spore-id> --as <id> [--reason "..."]` —
+  flip status + persist a review receipt.
+- `hypha graft <spore-id> --as <id> [--verify] [--dry-run] [--diff]
+  [--apply]` — apply a spore's `proposed_writes` (`append_section`,
+  `insert_after`, `replace_block`, `create_file`, `add_tag`) via
+  bounded mdpp edits, record `derived_from` edges, update spore status
+  in-place, persist the receipt. `--dry-run` previews without writing;
+  `--diff` renders unified diffs per touched file (implies dry-run
+  unless `--apply` is also passed).
 - `hypha identity init|list` — Ed25519 keypair generation, identity files
   (mode-0600 private key sidecar), listing.
 - `hypha cap issue` — scoped local capability token, persisted.
@@ -73,16 +90,19 @@ Today you can:
 - `hypha pulse [--window 30d]` — time-windowed signal aggregation: top
   initiatives, hot zones, recent pressure, edge-kind distribution,
   activity counts. Cached in `pulse_cache`.
-- `hypha assess change --task "<text>" [--files p1,p2] [--diff-summary "<text>"]`
-  — alignment scoring (`change:assess`). Matches the proposed change against
-  active initiatives in the space, composes pulse signals for recent
-  pressure, and infers a path-prefix hot zone. Returns the JSON shape from
-  `concepts/initiative-alignment.md`: alignment category, score,
+- `hypha assess change|task|pr` — alignment scoring. Matches the
+  proposed work against active initiatives, composes pulse signals for
+  recent pressure, infers a path-prefix hot zone. Returns the JSON shape
+  from `concepts/initiative-alignment.md`: alignment category, score,
   recommendation, matched initiatives, citations.
-- `hypha assess task --task "<text>"` — same scorer, task-only input. Use
-  to scope a task *before* any diff exists.
+- `hypha trace reap [--older-than 1h]` — force-close open traces whose
+  `last_tick` exceeded the staleness threshold (annotates body, flips
+  status to `killed`).
 - `hypha receipts list` — query the audit log by space, subject, action,
   time window.
+- `hypha mcp serve` — Model Context Protocol stdio server with 29 tools
+  (read + mutate), token-budgeted responses, compact short-key format
+  for agent callers. See *Output formats* and *MCP* below.
 
 For the browser visualization (separate binary, GoSX-based):
 
@@ -90,10 +110,48 @@ For the browser visualization (separate binary, GoSX-based):
   knowledge graph, search bar, click-to-expand neighbors, object detail
   panel. Earth-tone palette, plain Go + GoSX, no JS build step.
 
+### Output formats
+
+Every read/write command supports `--format text|json|compact|jsonline`:
+
+| Format | What | Use when |
+| --- | --- | --- |
+| `text` | Human-readable | Reading at a terminal (default on TTY) |
+| `json` | Indented full-key JSON envelope | Debugging, jq-friendly |
+| `jsonline` | Single-line full-key JSON | Pipe / agent / parse-friendly |
+| `compact` | Single-line short-key JSON envelope (`c`, `d`, `hs`, `sn`, `ci`, …) | Hot-path agent calls — ~7–40% smaller than json |
+
+The default auto-detects: `text` on a TTY, `compact` when stdout is
+piped. Override with `--format <name>` or the `HYPHAE_FORMAT` env var.
+Schema version (envelope-shape) starts at 1; every response carries
+`{ok, command, hyphae_version, schema, data, warnings, errors}` (or
+the short-key equivalent).
+
+### MCP
+
+```bash
+hypha mcp serve            # JSON-RPC 2.0 over stdio
+```
+
+The server exposes 29 tools — 16 read (`hypha_recall`, `hypha_show`,
+`hypha_pulse`, `hypha_assess_task|change|pr`, `hypha_graph_*`,
+`hypha_*_list`, `hypha_trace_history`, `hypha_analyze_list`) and 13
+mutate (`hypha_index_rebuild`, `hypha_spore_submit|accept|reject`,
+`hypha_graft` (dry-run by default; pass `apply=true` to persist,
+`diff=true` to include unified diffs), `hypha_trace_start|tick|done|reap`,
+`hypha_identity_init`, `hypha_cap_issue`, `hypha_analyze_run|refresh`).
+
+Every tool accepts the same token-discipline knobs: `format`
+(`jsonline`/`json`/`compact`), `max_tokens` (soft budget, list rows
+trimmed when over with a `TRUNCATED` warning attached), and `fields`
+(whitelist of top-level row fields for list tools). `hypha_graft`
+defaults to dry-run so an MCP client must consciously opt into
+persistence.
+
 Coming next: HTTP API for cloud-agent spore submission, peer federation
-(signed manifests + drift detection), `mdpp.fmt` after graft, `assess task`
-and `assess pr` shapes. Engine-backed graph rendering (Go-via-TinyGo for the
-canvas) is mid-flight; see `specs/gosx-engine-surface-completion.md`.
+(signed manifests + drift detection). Engine-backed graph rendering
+(Go-via-TinyGo for the canvas) is mid-flight; see
+`specs/gosx-engine-surface-completion.md`.
 
 The canonical Hyphae space (concepts, decisions, initiatives, protocols, skills)
 is installed under `~/.hyphae/spaces/m31labs-hyphae/`. The binary in this repo
@@ -185,13 +243,19 @@ federated independently of any one codebase.
 | `internal/db` | SQLite open + embedded schema migration |
 | `internal/parser` | Walk an mdpp space, extract Objects + Anchors + Edges |
 | `internal/spore` | Validate spore frontmatter, sign/verify (Ed25519), write to inbox, emit receipt |
-| `internal/recall` | FTS5 indexer + token-budgeted recall query |
-| `internal/graft` | Hyphae graft engine — bounded mdpp edits applying proposed_writes |
+| `internal/recall` | FTS5 indexer + token-budgeted recall query with snippet/citation extraction |
+| `internal/graft` | Hyphae graft engine — bounded mdpp edits, dry-run + diff renderer |
 | `internal/graph` | Backlinks / Related / Trace queries over the edges table |
 | `internal/pulse` | Time-windowed signal aggregation + cache |
 | `internal/identity` | Ed25519 keypair gen + identity files + private-key sidecar (0600) |
 | `internal/receipts` | Audit log persistence + queries |
 | `internal/capability` | Scoped local capability tokens |
+| `internal/trace` | In-flight trace lifecycle + Reap for stale traces |
+| `internal/envelope` | Uniform JSON envelope (`text` / `json` / `jsonline` / `compact`) + TTY auto-detect |
+| `internal/atomicfs` | Crash-safe temp+rename file writes for spore/trace/canonical edits |
+| `internal/mcp` | Model Context Protocol stdio server — 29 tools, token-budgeted |
+| `internal/analyze` | Canopy-cache for impact / callgraph / refs / hotspot / dead / review |
+| `internal/assess` | Alignment scorer (`change:assess` / `task` / `pr`) |
 | `internal/vizdata` | Shared graph-query helpers for the viz binary |
 
 Built on [Markdown++ (mdpp)](https://github.com/odvcencio/mdpp): a
