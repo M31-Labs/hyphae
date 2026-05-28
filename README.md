@@ -1,8 +1,72 @@
 # Hyphae
 
-A federated Markdown++ knowledge graph for agents (and the humans they work with).
+**Obsidian for engineering orgs** — a federated, agent-native knowledge graph
+built on plain Markdown files.
 
-Current release: **v0.1.8** ([CHANGELOG](CHANGELOG.md)).
+Current release: **v0.1.8** ([CHANGELOG](CHANGELOG.md)) ·
+[Docs](docs/README.md) · [Agent skills](skills/README.md) ·
+[Examples](examples/README.md)
+
+---
+
+## What it is
+
+Hyphae is a shared org memory layer. Concepts, decisions, initiatives, specs,
+plans, skills, and lessons live as plain `.md` files in a directory tree your
+team can clone, sync, or back up like any other repo. The `hypha` CLI gives
+agents a budgeted way to read it, contribute back, and prove what they did.
+
+| If you want… | Hyphae gives you… |
+| --- | --- |
+| A personal vault of linked Markdown notes (Obsidian, Logseq, Foam) | All of that, plus an agent-readable CLI, typed object graph, and FTS5 recall |
+| A wiki for your team's decisions and ADRs (Notion, Confluence) | Plain files in git instead of a vendor silo, with provenance on every edge |
+| Memory for your agents (vector stores, prompt-injected context) | Token-budgeted BM25 recall + multi-snippet citations, no embeddings required |
+| Safe writes from autonomous agents | The spore→graft protocol: agents propose, humans/trusted-agents approve, every change carries identity + receipt |
+| MCP integration for Claude Code / Cursor / custom clients | `hypha mcp serve` ships 29 read/mutate tools out of the box |
+
+The source of truth is `.md` files on disk; the graph is derived; every edge
+carries provenance.
+
+## Why
+
+| Problem | Hyphae's answer |
+| --- | --- |
+| Agents lose context between sessions | Persistent, queryable org memory in plain markdown |
+| Vector stores are opaque and lossy | BM25 over SQLite FTS5 — same files, no embeddings, predictable cost |
+| Agent writes corrupt your knowledge base | Spores are inbox-only until a human or trusted agent grafts them; atomic file writes; signed contributions |
+| Knowledge lives in a SaaS vendor | Plain files on disk; bring your own git, bring your own backups, federate across machines |
+| "What did the team decide about X?" requires asking a human | `hypha recall "X"` returns ranked hits with body snippets + anchor citations in <800 tokens |
+| Multi-repo orgs have no shared memory layer | One install root (`~/.hyphae/`) holds every space; agents query across all of them |
+
+## Drop-in setup (5 minutes)
+
+```bash
+# 1. Install the binary.
+go install m31labs.dev/hyphae/cmd/hypha@latest
+
+# 2. Bootstrap a space.
+mkdir -p ~/.hyphae/spaces/myorg-knowledge
+cp -r $(go env GOPATH)/pkg/mod/m31labs.dev/hyphae@*/examples/seed-space/. \
+      ~/.hyphae/spaces/myorg-knowledge/
+# (or copy by hand from this repo's `examples/seed-space/`)
+
+# 3. Index it.
+hypha index rebuild
+
+# 4. Read.
+hypha recall "your topic"
+
+# 5. (Optional) drop the agent skills into your runtime.
+cp skills/*.md ~/.claude/skills/   # or your runtime's skill path
+
+# 6. (Optional) wire MCP into your agent.
+# Claude Code, Cursor, custom — see docs/mcp.md.
+hypha mcp serve                     # JSON-RPC 2.0 over stdio, 29 tools
+```
+
+Full walkthrough: [docs/getting-started.md](docs/getting-started.md).
+
+## Substrate
 
 Hyphae is built on **[Markdown++ (mdpp)](https://github.com/M31-Labs/mdpp)** —
 a structural Markdown parser, renderer, formatter, and LSP server. Every
@@ -13,10 +77,7 @@ graft` applies a contribution, `m31labs.dev/mdpp/fmt` normalizes the
 touched file in-place so canonical state stays canonical. Hyphae is a
 load-bearing dogfood of mdpp.
 
-Hyphae is an efficient, OSS knowledge base — usable as a drop-in for the kinds
-of tools teams reach for when they want a personal or shared vault of plain
-`.md` notes, but built from the ground up to be read and written by agents as
-a first-class concern.
+## Pillars
 
 - **Markdown++ as the substrate** — typed frontmatter, container directives,
   admonitions, footnotes, math, diagrams, wikilinks, and a source-preserving
@@ -35,9 +96,22 @@ a first-class concern.
 - **Federated, local-first** — each space is a directory and (optionally) a
   git repo. Spaces subscribe to each other; the org gets a shared memory layer
   that survives any one machine or contributor.
+- **Agent-first ergonomics** — uniform JSON envelope, four output formats
+  (text / json / jsonline / compact), TTY auto-detect, `HYPHAE_FORMAT` env
+  override, atomic writes, typed errors, and an MCP stdio server with 29
+  token-budgeted tools.
 
-The source of truth is `.md` files on disk; the graph is derived; every edge
-carries provenance.
+## Documentation
+
+- [docs/getting-started.md](docs/getting-started.md) — install → first space → first recall → first spore → first graft → MCP wiring.
+- [docs/concepts.md](docs/concepts.md) — the mental model: space, object, anchor, spore, graft, trace, identity, capability, receipt.
+- [docs/cli-reference.md](docs/cli-reference.md) — every command, every flag, every output.
+- [docs/output-formats.md](docs/output-formats.md) — the envelope, the four formats, `HYPHAE_FORMAT`, exit codes.
+- [docs/mcp.md](docs/mcp.md) — wire Hyphae into Claude Code, Cursor, or any JSON-RPC client; tool reference.
+- [docs/architecture.md](docs/architecture.md) — package layout for contributors.
+- [skills/README.md](skills/README.md) — agent skills you can drop into any runtime (`~/.claude/skills/`, etc.).
+- [examples/seed-space/](examples/seed-space/) — copy-pasteable starter space with sample objects.
+- [CONTRIBUTING.md](CONTRIBUTING.md) — how to contribute (it's spores all the way down).
 
 ## Status
 
@@ -161,56 +235,20 @@ operates on whatever space tree you point it at via `HYPHAE_HOME` (default
 ## Install
 
 ```bash
-go install github.com/M31-Labs/hyphae/cmd/hypha@latest
+go install m31labs.dev/hyphae/cmd/hypha@latest
 ```
 
 Or from source:
 
 ```bash
-git clone git@github.com:M31-Labs/hyphae.git
+git clone https://github.com/M31-Labs/hyphae.git
 cd hyphae
 go install ./cmd/hypha
 ```
 
-## Quick start
-
-```bash
-# 1. Install the spec space (knowledge), if you don't already have one
-mkdir -p ~/.hyphae/spaces/m31labs-hyphae
-# … place mdpp files under it; see "Layout" below
-
-# 2. Index it
-hypha index rebuild
-
-# 3. Search
-hypha recall "spore submission" --format text
-hypha recall "context budget" --shape headline --format text
-
-# 4. Submit a spore
-cat > /tmp/my-report.md <<'EOF'
----
-mdpp: "0.1"
-id: spore.2026-05-25.local.example
-type: spore
-space: hypha://m31labs/hyphae
-status: unreviewed
-created: 2026-05-25T00:00:00Z
-agent:
-  id: agent://local/me
-  kind: human
-confidence: medium
-source_refs:
-  - hypha://m31labs/hyphae/concepts/spore
----
-
-# Example report
-
-## Summary
-Hello, Hyphae.
-EOF
-
-hypha spore submit /tmp/my-report.md
-```
+The full first-run walkthrough — bootstrapping a space, indexing,
+submitting your first spore, grafting it back, and wiring an agent —
+lives at [docs/getting-started.md](docs/getting-started.md).
 
 ## Layout
 
