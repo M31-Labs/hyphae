@@ -98,6 +98,15 @@ func run(args []string) error {
 	// Disable the default public-dir serving (no public/ dir in this binary).
 	app.SetPublicDir("")
 
+	// Point the runtime root at the dist/ tree so /gosx/runtime.wasm and
+	// /gosx/assets/runtime/* resolve to the shared client WASM the
+	// engine-surface bootstrap fetches at startup. Run `gosx build .`
+	// from the hyphae module root before launching hypha-viz to populate
+	// dist/. Without this, the bootstrap's fetch("/gosx/runtime.wasm")
+	// returns 404 and the canvas placeholder stays at
+	// "surface unavailable" forever (sycamore's PR #19 bootstrap chain).
+	app.SetRuntimeRoot("./dist")
+
 	// Page route: GET / — full graph viewer shell.
 	// Load the initial graph data server-side so the surface props include
 	// nodes and edges; the WASM module receives them at mount time without a
