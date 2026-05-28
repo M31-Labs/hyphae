@@ -32,6 +32,7 @@ import (
 	"m31labs.dev/hyphae/internal/assess"
 	"m31labs.dev/hyphae/internal/capability"
 	"m31labs.dev/hyphae/internal/db"
+	"m31labs.dev/hyphae/internal/envelope"
 	"m31labs.dev/hyphae/internal/graft"
 	"m31labs.dev/hyphae/internal/graph"
 	"m31labs.dev/hyphae/internal/identity"
@@ -45,52 +46,92 @@ import (
 	mdppfmt "m31labs.dev/mdpp/fmt"
 )
 
-const usage = `hypha — Hyphae v0.1.7 CLI
+const hyphaeVersion = "0.1.8"
+
+const usage = `hypha — Hyphae v0.1.8 CLI
 
 Usage:
   hypha index    rebuild [--root <path>]
-  hypha recall   <query> [--limit N] [--max-tokens N] [--shape headline|summary+anchors] [--format json|text]
+  hypha recall   <query> [--limit N] [--max-tokens N] [--shape headline|summary+anchors] [--format text|json|compact]
   hypha show     <id-or-hypha-uri> [--path] [--json] [--frontmatter] [--body]
-  hypha spaces   list [--format json|text]
-  hypha spore    submit <file> [--sign --as <identity-uri>]
-  hypha spore    list   [--space <uri>] [--status <state>] [--since 24h] [--limit N] [--format json|text]
-  hypha spore    accept <spore-id> --as <identity> [--reason "..."] [--space <uri>]
-  hypha spore    reject <spore-id> --as <identity> [--reason "..."] [--space <uri>]
-  hypha cap      issue --subject <uri> --space <uri> [--permissions p1,p2] [--expires 24h]
-  hypha identity init --name <name> --authority <auth> --space <uri> [--expires 1y]
-  hypha identity list
-  hypha graft    <spore-id> --as <identity-uri> [--space <hypha-uri>] [--verify] [--no-fmt]
-  hypha graph    backlinks <object-id> [--kind k1,k2] [--limit N]
-  hypha graph    related   <object-id> [--kind k1,k2] [--limit N]
-  hypha graph    trace     <object-id> [--kind derived_from,cites] [--max-depth 4]
-  hypha pulse    [--space <uri>] [--window 30d] [--ttl 5m] [--format json|text]
-  hypha assess   change --task <text> [--files p1,p2] [--diff-summary <text>] [--space <uri>] [--source <path>] [--format json|text]
-  hypha assess   task   --task <text> [--space <uri>] [--format json|text]
-  hypha assess   pr     --task <text> --base <ref> [--space <uri>] [--source <path>] [--format json|text]
-  hypha trace    start  --agent <uri> [--task <id>] [--phase <text>] [--space <uri>]
-  hypha trace    tick   <trace-id> "<checkpoint>" [--space <uri>]
-  hypha trace    done   <trace-id> [--status succeeded|failed|killed|superseded] [--link-spore <id>] [--space <uri>]
-  hypha trace    list   [--active] [--agent <uri>] [--space <uri>] [--format json|text]
-  hypha trace    history [--similar <q>] [--task <id>] [--agent <uri>] [--include-open] [--limit N] [--space <uri>]
+  hypha spaces   list [--format text|json|compact]
+  hypha spore    submit <file> [--sign --as <identity-uri>] [--format text|json|compact]
+  hypha spore    list   [--space <uri>] [--status <state>] [--since 24h] [--limit N] [--format text|json|compact]
+  hypha spore    accept <spore-id> --as <identity> [--reason "..."] [--space <uri>] [--format text|json|compact]
+  hypha spore    reject <spore-id> --as <identity> [--reason "..."] [--space <uri>] [--format text|json|compact]
+  hypha cap      issue --subject <uri> --space <uri> [--permissions p1,p2] [--expires 24h] [--format text|json|compact]
+  hypha identity init --name <name> --authority <auth> --space <uri> [--expires 1y] [--format text|json|compact]
+  hypha identity list [--format text|json|compact]
+  hypha graft    <spore-id> --as <identity-uri> [--space <hypha-uri>] [--verify] [--no-fmt] [--format text|json|compact]
+  hypha graph    backlinks <object-id> [--kind k1,k2] [--limit N] [--format text|json|compact]
+  hypha graph    related   <object-id> [--kind k1,k2] [--limit N] [--format text|json|compact]
+  hypha graph    trace     <object-id> [--kind derived_from,cites] [--max-depth 4] [--format text|json|compact]
+  hypha pulse    [--space <uri>] [--window 30d] [--ttl 5m] [--format text|json|compact]
+  hypha assess   change --task <text> [--files p1,p2] [--diff-summary <text>] [--space <uri>] [--source <path>] [--format text|json|compact]
+  hypha assess   task   --task <text> [--space <uri>] [--format text|json|compact]
+  hypha assess   pr     --task <text> --base <ref> [--space <uri>] [--source <path>] [--format text|json|compact]
+  hypha trace    start  --agent <uri> [--task <id>] [--phase <text>] [--space <uri>] [--format text|json|compact]
+  hypha trace    tick   <trace-id> "<checkpoint>" [--space <uri>] [--format text|json|compact]
+  hypha trace    done   <trace-id> [--status succeeded|failed|killed|superseded] [--link-spore <id>] [--space <uri>] [--format text|json|compact]
+  hypha trace    list   [--active] [--agent <uri>] [--space <uri>] [--format text|json|compact]
+  hypha trace    history [--similar <q>] [--task <id>] [--agent <uri>] [--include-open] [--limit N] [--space <uri>] [--format text|json|compact]
   hypha trace    tail   [--id <trace-id>] [--agent <uri>] [--interval 1s] [--timeout 5m] [--space <uri>]
   hypha analyze  <kind> [target] [--space <uri>] [--source <path>] [--diff-ref <ref>] [--max-depth N] [--refresh]
                        kinds: impact, callgraph, refs, hotspot, dead, review
-  hypha analyze  list   [--kind <k>] [--space <uri>] [--target-file <path>] [--format json|text]
+  hypha analyze  list   [--kind <k>] [--space <uri>] [--target-file <path>] [--format text|json|compact]
   hypha analyze  refresh <id> [--space <uri>] [--source <path>]
-  hypha receipts list   [--space <uri>] [--subject <uri>] [--action <name>] [--since 24h] [--limit N]
+  hypha receipts list   [--space <uri>] [--subject <uri>] [--action <name>] [--since 24h] [--limit N] [--format text|json|compact]
 
 Separate binary for the browser visualization (GoSX-based):
   hypha-viz       [--addr 127.0.0.1:7777] [--root <hyphae-home>]
 
+Output formats:
+  --format text       human-readable. Default when stdout is a terminal.
+  --format json       full-key indented JSON envelope (Envelope schema v1).
+  --format compact    same data, single-line + documented short-key map.
+                      Default when stdout is piped or redirected.
+  HYPHAE_FORMAT       env override for the auto-detected default.
+
 Environment:
   HYPHAE_HOME    install root (default: $HOME/.hyphae)
+  HYPHAE_FORMAT  default output format when --format is not given
 `
 
 func main() {
+	envelope.SetHyphaeVersion(hyphaeVersion)
 	if err := run(os.Args[1:]); err != nil {
 		fmt.Fprintln(os.Stderr, "hypha:", err)
 		os.Exit(1)
 	}
+}
+
+// formatFlag declares the standard --format flag on fs. Pass the result to
+// envelope.ParseFormat after fs.Parse to resolve text|json|compact (and
+// auto-detect when blank).
+func formatFlag(fs *flag.FlagSet) *string {
+	return fs.String("format", "", "text | json | compact (default: text on TTY, compact on pipe)")
+}
+
+// emit is a tiny convenience wrapper around envelope.Emit. The text
+// renderer can be nil for commands that do not yet have a human view.
+func emit(command string, data any, formatStr string, text envelope.TextRenderer) error {
+	f, err := envelope.ParseFormat(formatStr)
+	if err != nil {
+		return err
+	}
+	return envelope.Emit(os.Stdout, envelope.New(command, data), f, text)
+}
+
+// emitErr writes a typed error envelope for command and returns the error
+// the caller should propagate (so the binary still exits non-zero).
+func emitErr(command string, formatStr string, code, message, hint string) error {
+	f, ferr := envelope.ParseFormat(formatStr)
+	if ferr != nil {
+		f = envelope.AutoDetect()
+	}
+	env := envelope.NewError(command, envelope.Note{Code: code, Message: message, Hint: hint})
+	_ = envelope.Emit(os.Stdout, env, f, nil)
+	return errors.New(message)
 }
 
 func run(args []string) error {
@@ -143,7 +184,7 @@ func cmdPulse(args []string) error {
 	spaceURI := fs.String("space", "", "filter by space URI (default: all spaces)")
 	windowStr := fs.String("window", "30d", "Go duration window (e.g. 7d, 30d, q2 → 90d)")
 	ttlStr := fs.String("ttl", "5m", "cache TTL; pass 0 to force recompute")
-	format := fs.String("format", "json", "json | text")
+	format := formatFlag(fs)
 	if err := fs.Parse(reorderFlagsFirst(args)); err != nil {
 		return err
 	}
@@ -177,17 +218,14 @@ func cmdPulse(args []string) error {
 		return err
 	}
 
-	switch *format {
-	case "json":
-		enc := json.NewEncoder(os.Stdout)
-		enc.SetIndent("", "  ")
-		return enc.Encode(p)
-	case "text":
-		printPulseText(os.Stdout, p)
+	return emit("pulse", p, *format, func(w io.Writer, data any) error {
+		pp, ok := data.(pulse.Pulse)
+		if !ok {
+			return fmt.Errorf("pulse: text renderer got %T", data)
+		}
+		printPulseText(w, pp)
 		return nil
-	default:
-		return fmt.Errorf("unknown --format %q", *format)
-	}
+	})
 }
 
 // parseFlexDuration accepts Go durations plus a few human-friendly shorthands:
@@ -267,7 +305,7 @@ func cmdAssessPR(args []string) error {
 	spaceURI := fs.String("space", "", "space URI (default: all spaces)")
 	windowStr := fs.String("window", "30d", "Go duration window for recent-pressure aggregation")
 	budgetTokens := fs.Int("budget-tokens", 1500, "soft response token budget")
-	format := fs.String("format", "json", "json | text")
+	format := formatFlag(fs)
 	if err := fs.Parse(reorderFlagsFirst(args)); err != nil {
 		return err
 	}
@@ -334,27 +372,23 @@ func cmdAssessPR(args []string) error {
 		return err
 	}
 
-	if *format == "json" {
-		enc := json.NewEncoder(os.Stdout)
-		enc.SetIndent("", "  ")
-		// Include the derived inputs in the JSON for traceability.
-		envelope := map[string]any{
-			"task":          *task,
-			"base_ref":      *base,
-			"changed_files": files,
-			"diff_summary":  diffSummary,
-			"result":        res,
+	payload := map[string]any{
+		"task":          *task,
+		"base_ref":      *base,
+		"changed_files": files,
+		"diff_summary":  diffSummary,
+		"result":        res,
+	}
+	return emit("assess pr", payload, *format, func(w io.Writer, _ any) error {
+		fmt.Fprintf(w, "Base ref:      %s\n", *base)
+		fmt.Fprintf(w, "Changed files: %d\n", len(files))
+		if diffSummary != "" {
+			fmt.Fprintf(w, "Diff summary:  %s\n", diffSummary)
 		}
-		return enc.Encode(envelope)
-	}
-	fmt.Printf("Base ref:      %s\n", *base)
-	fmt.Printf("Changed files: %d\n", len(files))
-	if diffSummary != "" {
-		fmt.Printf("Diff summary:  %s\n", diffSummary)
-	}
-	fmt.Println()
-	printAssessText(os.Stdout, res)
-	return nil
+		fmt.Fprintln(w)
+		printAssessText(w, res)
+		return nil
+	})
 }
 
 // gitChangedFiles returns the file paths changed between base...HEAD.
@@ -401,7 +435,7 @@ func cmdAssessTask(args []string) error {
 	spaceURI := fs.String("space", "", "filter scoring to one space URI (default: all spaces)")
 	windowStr := fs.String("window", "30d", "Go duration window for recent-pressure aggregation")
 	budgetTokens := fs.Int("budget-tokens", 1200, "soft response token budget (advisory)")
-	format := fs.String("format", "json", "json | text")
+	format := formatFlag(fs)
 	if err := fs.Parse(reorderFlagsFirst(args)); err != nil {
 		return err
 	}
@@ -434,17 +468,14 @@ func cmdAssessTask(args []string) error {
 		return err
 	}
 
-	switch *format {
-	case "json":
-		enc := json.NewEncoder(os.Stdout)
-		enc.SetIndent("", "  ")
-		return enc.Encode(res)
-	case "text":
-		printAssessText(os.Stdout, res)
+	return emit("assess task", res, *format, func(w io.Writer, data any) error {
+		r, ok := data.(assess.Result)
+		if !ok {
+			return fmt.Errorf("assess task: text renderer got %T", data)
+		}
+		printAssessText(w, r)
 		return nil
-	default:
-		return fmt.Errorf("unknown --format %q", *format)
-	}
+	})
 }
 
 func cmdAssessChange(args []string) error {
@@ -456,7 +487,7 @@ func cmdAssessChange(args []string) error {
 	source := fs.String("source", "", "source repo path (enables canopy-cache enrichment; defaults via space convention)")
 	windowStr := fs.String("window", "30d", "Go duration window for recent-pressure aggregation")
 	budgetTokens := fs.Int("budget-tokens", 1200, "soft response token budget (advisory)")
-	format := fs.String("format", "json", "json | text")
+	format := formatFlag(fs)
 	if err := fs.Parse(reorderFlagsFirst(args)); err != nil {
 		return err
 	}
@@ -509,17 +540,14 @@ func cmdAssessChange(args []string) error {
 		return err
 	}
 
-	switch *format {
-	case "json":
-		enc := json.NewEncoder(os.Stdout)
-		enc.SetIndent("", "  ")
-		return enc.Encode(res)
-	case "text":
-		printAssessText(os.Stdout, res)
+	return emit("assess change", res, *format, func(w io.Writer, data any) error {
+		r, ok := data.(assess.Result)
+		if !ok {
+			return fmt.Errorf("assess change: text renderer got %T", data)
+		}
+		printAssessText(w, r)
 		return nil
-	default:
-		return fmt.Errorf("unknown --format %q", *format)
-	}
+	})
 }
 
 func printAssessText(w io.Writer, r assess.Result) {
@@ -568,6 +596,7 @@ func cmdIndex(args []string) error {
 	}
 	fs := flag.NewFlagSet("index rebuild", flag.ContinueOnError)
 	rootFlag := fs.String("root", "", "install root override (default: HYPHAE_HOME or ~/.hyphae)")
+	format := formatFlag(fs)
 	if err := fs.Parse(args[1:]); err != nil {
 		return err
 	}
@@ -609,10 +638,19 @@ func cmdIndex(args []string) error {
 		totalEdg += len(edges)
 	}
 
-	fmt.Fprintf(os.Stderr, "indexed %d objects, %d anchors, %d edges across %d space(s)\n",
-		totalObj, totalAnc, totalEdg, len(spaces))
-	fmt.Fprintf(os.Stderr, "db: %s\n", dbPath)
-	return nil
+	payload := map[string]any{
+		"db":              dbPath,
+		"spaces_indexed":  len(spaces),
+		"objects_indexed": totalObj,
+		"anchors_indexed": totalAnc,
+		"edges_indexed":   totalEdg,
+	}
+	return emit("index rebuild", payload, *format, func(w io.Writer, _ any) error {
+		fmt.Fprintf(w, "Indexed %d objects, %d anchors, %d edges across %d space(s)\n",
+			totalObj, totalAnc, totalEdg, len(spaces))
+		fmt.Fprintf(w, "  db: %s\n", dbPath)
+		return nil
+	})
 }
 
 // persistObjectsAnchorsEdges writes parser output to objects/anchors/edges
@@ -705,7 +743,7 @@ func cmdRecall(args []string) error {
 	limit := fs.Int("limit", 12, "max anchor candidates before budgeting")
 	maxTokens := fs.Int("max-tokens", 800, "response token cap")
 	shape := fs.String("shape", "summary+anchors", "headline | summary+anchors | count_only")
-	format := fs.String("format", "json", "json | text")
+	format := formatFlag(fs)
 	if err := fs.Parse(reorderFlagsFirst(args)); err != nil {
 		return err
 	}
@@ -732,21 +770,18 @@ func cmdRecall(args []string) error {
 		return err
 	}
 
-	switch *format {
-	case "json":
-		enc := json.NewEncoder(os.Stdout)
-		enc.SetIndent("", "  ")
-		return enc.Encode(resp)
-	case "text":
-		fmt.Println(resp.Summary)
-		for _, a := range resp.Anchors {
-			fmt.Printf("  %s  %s\n", a.URI, a.Title)
+	return emit("recall", resp, *format, func(w io.Writer, data any) error {
+		r, ok := data.(recall.Response)
+		if !ok {
+			return fmt.Errorf("recall: text renderer got %T", data)
 		}
-		fmt.Fprintf(os.Stderr, "(%d anchors, %d tokens used)\n", len(resp.Anchors), resp.TokensUsed)
+		fmt.Fprintln(w, r.Summary)
+		for _, a := range r.Anchors {
+			fmt.Fprintf(w, "  %s  %s\n", a.URI, a.Title)
+		}
+		fmt.Fprintf(os.Stderr, "(%d anchors, %d tokens used)\n", len(r.Anchors), r.TokensUsed)
 		return nil
-	default:
-		return fmt.Errorf("unknown --format %q (expected json|text)", *format)
-	}
+	})
 }
 
 // --- spore submit -----------------------------------------------------------
@@ -778,7 +813,7 @@ func cmdSporeReview(args []string, newStatus string) error {
 	spaceFlag := fs.String("space", "", "space URI containing the spore")
 	asURI := fs.String("as", "", "reviewer identity URI (recorded in the receipt)")
 	reason := fs.String("reason", "", "optional human-readable reason (recorded in metadata)")
-	format := fs.String("format", "json", "json | text")
+	format := formatFlag(fs)
 	if err := fs.Parse(reorderFlagsFirst(args)); err != nil {
 		return err
 	}
@@ -874,16 +909,13 @@ func cmdSporeReview(args []string, newStatus string) error {
 		"receipt_id":   receipt.ID,
 		"content_hash": receipt.ContentHash,
 	}
-	if *format == "json" {
-		enc := json.NewEncoder(os.Stdout)
-		enc.SetIndent("", "  ")
-		return enc.Encode(out)
-	}
-	fmt.Printf("Spore %s: %s → %s\n", sporeID, cur, newStatus)
-	fmt.Printf("  Reviewer: %s\n", *asURI)
-	fmt.Printf("  Receipt:  %s\n", receipt.ID)
-	fmt.Printf("  Path:     %s\n", sporePath)
-	return nil
+	return emit("spore "+newStatus, out, *format, func(w io.Writer, _ any) error {
+		fmt.Fprintf(w, "Spore %s: %s → %s\n", sporeID, cur, newStatus)
+		fmt.Fprintf(w, "  Reviewer: %s\n", *asURI)
+		fmt.Fprintf(w, "  Receipt:  %s\n", receipt.ID)
+		fmt.Fprintf(w, "  Path:     %s\n", sporePath)
+		return nil
+	})
 }
 
 // readFrontmatterField extracts the value of a top-level `key: value` field
@@ -972,6 +1004,7 @@ func cmdSporeSubmit(rest []string) error {
 	fs := flag.NewFlagSet("spore submit", flag.ContinueOnError)
 	sign := fs.Bool("sign", false, "Ed25519-sign the spore before submission")
 	signer := fs.String("as", "", "signer identity URI (required with --sign)")
+	format := formatFlag(fs)
 	if err := fs.Parse(reorderFlagsFirst(rest)); err != nil {
 		return err
 	}
@@ -1044,17 +1077,17 @@ func cmdSporeSubmit(rest []string) error {
 		fmt.Fprintf(os.Stderr, "warn: receipt not persisted (index unavailable: %v)\n", dbErr)
 	}
 
-	enc := json.NewEncoder(os.Stdout)
-	enc.SetIndent("", "  ")
-	if err := enc.Encode(map[string]any{
-		"receipt":  receipt,
-		"filePath": filePath,
-		"signed":   *sign,
-	}); err != nil {
-		return err
+	payload := map[string]any{
+		"receipt":   receipt,
+		"file_path": filePath,
+		"signed":    *sign,
 	}
-	fmt.Fprintf(os.Stderr, "\nReported back to Hyphae: %s\n", filePath)
-	return nil
+	return emit("spore submit", payload, *format, func(w io.Writer, _ any) error {
+		fmt.Fprintf(w, "Submitted: %s\n", filePath)
+		fmt.Fprintf(w, "  Signed:   %t\n", *sign)
+		fmt.Fprintf(w, "  Receipt:  %s\n", receipt.ID)
+		return nil
+	})
 }
 
 // identityNameFromURI extracts the bare name from "identity://<authority>/<name>".
@@ -1092,7 +1125,7 @@ func cmdSporeList(args []string) error {
 	statusFilter := fs.String("status", "", "filter by status (unreviewed, accepted, partial, rejected, ...)")
 	sinceStr := fs.String("since", "", "only spores submitted within this duration (e.g. 24h, 7d)")
 	limit := fs.Int("limit", 50, "max results")
-	format := fs.String("format", "text", "json | text")
+	format := formatFlag(fs)
 	if err := fs.Parse(reorderFlagsFirst(args)); err != nil {
 		return err
 	}
@@ -1167,29 +1200,26 @@ func cmdSporeList(args []string) error {
 		out = out[:*limit]
 	}
 
-	switch *format {
-	case "json":
-		enc := json.NewEncoder(os.Stdout)
-		enc.SetIndent("", "  ")
-		return enc.Encode(out)
-	case "text":
-		if len(out) == 0 {
-			fmt.Println("(no spores)")
+	return emit("spore list", out, *format, func(w io.Writer, data any) error {
+		rows, ok := data.([]sporeRow)
+		if !ok {
+			return fmt.Errorf("spore list: text renderer got %T", data)
+		}
+		if len(rows) == 0 {
+			fmt.Fprintln(w, "(no spores)")
 			return nil
 		}
-		for _, r := range out {
-			fmt.Printf("%s  %-12s  %s\n      %s\n",
+		for _, r := range rows {
+			fmt.Fprintf(w, "%s  %-12s  %s\n      %s\n",
 				r.SubmittedAt.Format("2006-01-02 15:04"),
 				nonEmpty(r.Status, "?"),
 				r.ID,
 				r.Path,
 			)
 		}
-		fmt.Fprintf(os.Stderr, "\n(%d spores)\n", len(out))
+		fmt.Fprintf(os.Stderr, "\n(%d spores)\n", len(rows))
 		return nil
-	default:
-		return fmt.Errorf("unknown --format %q", *format)
-	}
+	})
 }
 
 // spaceMatches reports whether the filter (a hypha:// URI or bare authority/name)
@@ -1215,6 +1245,7 @@ func cmdCap(args []string) error {
 	maxResponseTokens := fs.Int("max-response-tokens", 800, "limits.max_response_tokens")
 	maxSpores := fs.Int("max-spores", 3, "limits.max_spores")
 	maxBytes := fs.Int("max-bytes", 200000, "limits.max_bytes")
+	format := formatFlag(fs)
 	if err := fs.Parse(args[1:]); err != nil {
 		return err
 	}
@@ -1268,11 +1299,16 @@ func cmdCap(args []string) error {
 		fmt.Fprintf(os.Stderr, "warn: failed to persist cap:issue receipt: %v\n", wErr)
 	}
 
-	enc := json.NewEncoder(os.Stdout)
-	enc.SetIndent("", "  ")
-	return enc.Encode(map[string]any{
+	payload := map[string]any{
 		"token":      cap.ID,
 		"capability": cap,
+	}
+	return emit("cap issue", payload, *format, func(w io.Writer, _ any) error {
+		fmt.Fprintf(w, "Capability: %s\n", cap.ID)
+		fmt.Fprintf(w, "  Subject:   %s\n", cap.Subject)
+		fmt.Fprintf(w, "  Space:     %s\n", cap.SpaceID)
+		fmt.Fprintf(w, "  Expires:   %s\n", cap.ExpiresAt.Format(time.RFC3339))
+		return nil
 	})
 }
 
@@ -1297,6 +1333,7 @@ func cmdIdentityInit(args []string) error {
 	name := fs.String("name", "", "bare username (e.g. odvcencio)")
 	authority := fs.String("authority", "", "URI authority (e.g. m31labs)")
 	space := fs.String("space", "", "owning space URI (e.g. hypha://m31labs/hyphae)")
+	format := formatFlag(fs)
 	if err := fs.Parse(reorderFlagsFirst(args)); err != nil {
 		return err
 	}
@@ -1322,17 +1359,25 @@ func cmdIdentityInit(args []string) error {
 		return fmt.Errorf("save: %w", err)
 	}
 
-	enc := json.NewEncoder(os.Stdout)
-	enc.SetIndent("", "  ")
-	return enc.Encode(map[string]any{
-		"identity":     id,
-		"identityFile": mdPath,
-		"privateKey":   keyPath + " (mode 0600)",
+	payload := map[string]any{
+		"identity":      id,
+		"identity_file": mdPath,
+		"private_key":   keyPath + " (mode 0600)",
+	}
+	return emit("identity init", payload, *format, func(w io.Writer, _ any) error {
+		fmt.Fprintf(w, "Identity: %s\n", id.ID)
+		fmt.Fprintf(w, "  File: %s\n", mdPath)
+		fmt.Fprintf(w, "  Key:  %s (mode 0600)\n", keyPath)
+		return nil
 	})
 }
 
 func cmdIdentityList(args []string) error {
-	_ = args
+	fs := flag.NewFlagSet("identity list", flag.ContinueOnError)
+	format := formatFlag(fs)
+	if err := fs.Parse(reorderFlagsFirst(args)); err != nil {
+		return err
+	}
 	root, err := resolveRoot("")
 	if err != nil {
 		return err
@@ -1343,13 +1388,20 @@ func cmdIdentityList(args []string) error {
 	if err != nil {
 		return err
 	}
-	if len(list) == 0 {
-		fmt.Fprintf(os.Stderr, "no identities found at %s\n", dir)
+	return emit("identity list", list, *format, func(w io.Writer, data any) error {
+		ids, ok := data.([]identity.Identity)
+		if !ok {
+			return fmt.Errorf("identity list: text renderer got %T", data)
+		}
+		if len(ids) == 0 {
+			fmt.Fprintf(os.Stderr, "no identities found at %s\n", dir)
+			return nil
+		}
+		for _, i := range ids {
+			fmt.Fprintf(w, "  %s\n", i.ID)
+		}
 		return nil
-	}
-	enc := json.NewEncoder(os.Stdout)
-	enc.SetIndent("", "  ")
-	return enc.Encode(list)
+	})
 }
 
 // --- graft -----------------------------------------------------------------
@@ -1363,6 +1415,7 @@ func cmdGraft(args []string) error {
 	spaceURI := fs.String("space", "", "space URI override (auto-detected from inbox if omitted)")
 	verify := fs.Bool("verify", false, "verify Ed25519 signature on the spore before applying")
 	noFmt := fs.Bool("no-fmt", false, "skip the mdpp.fmt pass on touched canonical files (formatting on by default)")
+	format := formatFlag(fs)
 	if err := fs.Parse(reorderFlagsFirst(args)); err != nil {
 		return err
 	}
@@ -1437,14 +1490,22 @@ func cmdGraft(args []string) error {
 		fmt.Fprintf(os.Stderr, "warn: failed to persist graft receipt: %v\n", wErr)
 	}
 
-	enc := json.NewEncoder(os.Stdout)
-	enc.SetIndent("", "  ")
-	if err := enc.Encode(result); err != nil {
-		return err
-	}
-	fmt.Fprintf(os.Stderr, "\nGrafted %s → status: %s (applied %d, skipped %d)\n",
-		result.SporeID, result.NewSporeStatus, len(result.AppliedWrites), len(result.SkippedWrites))
-	return nil
+	return emit("graft", result, *format, func(w io.Writer, data any) error {
+		r, ok := data.(graft.Result)
+		if !ok {
+			return fmt.Errorf("graft: text renderer got %T", data)
+		}
+		fmt.Fprintf(w, "Grafted %s → status: %s (applied %d, skipped %d)\n",
+			r.SporeID, r.NewSporeStatus, len(r.AppliedWrites), len(r.SkippedWrites))
+		fmt.Fprintf(w, "  Receipt: %s\n", r.Receipt.ID)
+		if len(r.TouchedFiles) > 0 {
+			fmt.Fprintln(w, "  Touched:")
+			for _, p := range r.TouchedFiles {
+				fmt.Fprintf(w, "    - %s\n", p)
+			}
+		}
+		return nil
+	})
 }
 
 // formatMdppFile runs mdpp.fmt on a single file and rewrites it if the
@@ -1595,9 +1656,9 @@ func cmdShow(args []string) error {
 			"summary":    summary,
 			"updated_at": updatedAt,
 		}
-		enc := json.NewEncoder(os.Stdout)
-		enc.SetIndent("", "  ")
-		return enc.Encode(out)
+		// --json selects the metadata slice. The envelope wraps it so the
+		// shape matches the rest of the agent surface.
+		return emit("show", out, "", nil)
 	}
 
 	content, err := os.ReadFile(absPath)
@@ -1678,10 +1739,10 @@ func splitFrontmatter(content []byte) (frontmatter, body []byte) {
 
 func cmdSpaces(args []string) error {
 	if len(args) == 0 || args[0] != "list" {
-		return errors.New("usage: hypha spaces list [--format json|text]")
+		return errors.New("usage: hypha spaces list [--format text|json|compact]")
 	}
 	fs := flag.NewFlagSet("spaces list", flag.ContinueOnError)
-	format := fs.String("format", "text", "json | text")
+	format := formatFlag(fs)
 	if err := fs.Parse(reorderFlagsFirst(args[1:])); err != nil {
 		return err
 	}
@@ -1693,24 +1754,21 @@ func cmdSpaces(args []string) error {
 	if err != nil {
 		return err
 	}
-	switch *format {
-	case "json":
-		enc := json.NewEncoder(os.Stdout)
-		enc.SetIndent("", "  ")
-		return enc.Encode(spaces)
-	case "text":
-		if len(spaces) == 0 {
-			fmt.Println("(no spaces installed)")
+	return emit("spaces list", spaces, *format, func(w io.Writer, data any) error {
+		sps, ok := data.([]spaceEntry)
+		if !ok {
+			return fmt.Errorf("spaces list: text renderer got %T", data)
+		}
+		if len(sps) == 0 {
+			fmt.Fprintln(w, "(no spaces installed)")
 			return nil
 		}
-		for _, sp := range spaces {
-			fmt.Printf("  hypha://%s\n      %s\n", sp.URI, sp.Path)
+		for _, sp := range sps {
+			fmt.Fprintf(w, "  hypha://%s\n      %s\n", sp.URI, sp.Path)
 		}
-		fmt.Fprintf(os.Stderr, "\n(%d space(s))\n", len(spaces))
+		fmt.Fprintf(os.Stderr, "\n(%d space(s))\n", len(sps))
 		return nil
-	default:
-		return fmt.Errorf("unknown --format %q", *format)
-	}
+	})
 }
 
 // --- trace -----------------------------------------------------------------
@@ -1772,7 +1830,7 @@ func cmdTraceStart(args []string) error {
 	session := fs.String("session", "", "session identifier, if applicable")
 	taskRef := fs.String("task", "", "task identifier this trace covers")
 	phase := fs.String("phase", "", "short phase label")
-	format := fs.String("format", "text", "json | text")
+	format := formatFlag(fs)
 	if err := fs.Parse(reorderFlagsFirst(args)); err != nil {
 		return err
 	}
@@ -1802,15 +1860,16 @@ func cmdTraceStart(args []string) error {
 		return err
 	}
 
-	if *format == "json" {
-		enc := json.NewEncoder(os.Stdout)
-		enc.SetIndent("", "  ")
-		return enc.Encode(tr)
-	}
-	fmt.Println(tr.ID)
-	fmt.Fprintf(os.Stderr, "  status:   %s\n  agent:    %s\n  started:  %s\n  file:     %s\n",
-		tr.Status, tr.AgentID, tr.Started.Format(time.RFC3339), tr.FilePath)
-	return nil
+	return emit("trace start", tr, *format, func(w io.Writer, data any) error {
+		t, ok := data.(types.Trace)
+		if !ok {
+			return fmt.Errorf("trace start: text renderer got %T", data)
+		}
+		fmt.Fprintln(w, t.ID)
+		fmt.Fprintf(os.Stderr, "  status:   %s\n  agent:    %s\n  started:  %s\n  file:     %s\n",
+			t.Status, t.AgentID, t.Started.Format(time.RFC3339), t.FilePath)
+		return nil
+	})
 }
 
 func cmdTraceTick(args []string) error {
@@ -1845,7 +1904,7 @@ func cmdTraceDone(args []string) error {
 	status := fs.String("status", "succeeded", "succeeded | failed | killed | superseded")
 	linked := fs.String("link-spore", "", "spore id to attribute the work log to (optional)")
 	spaceFlag := fs.String("space", "", "space URI (default: only installed space)")
-	format := fs.String("format", "text", "json | text")
+	format := formatFlag(fs)
 	if err := fs.Parse(reorderFlagsFirst(args)); err != nil {
 		return err
 	}
@@ -1867,14 +1926,15 @@ func cmdTraceDone(args []string) error {
 		return err
 	}
 
-	if *format == "json" {
-		enc := json.NewEncoder(os.Stdout)
-		enc.SetIndent("", "  ")
-		return enc.Encode(tr)
-	}
-	fmt.Fprintf(os.Stderr, "trace: %s\n  status:        %s\n  ticks:         %d\n  linked_spore:  %s\n  file:          %s\n",
-		tr.ID, tr.Status, len(tr.Ticks), nonEmpty(tr.LinkedSpore, "(none)"), tr.FilePath)
-	return nil
+	return emit("trace done", tr, *format, func(w io.Writer, data any) error {
+		t, ok := data.(types.Trace)
+		if !ok {
+			return fmt.Errorf("trace done: text renderer got %T", data)
+		}
+		fmt.Fprintf(os.Stderr, "trace: %s\n  status:        %s\n  ticks:         %d\n  linked_spore:  %s\n  file:          %s\n",
+			t.ID, t.Status, len(t.Ticks), nonEmpty(t.LinkedSpore, "(none)"), t.FilePath)
+		return nil
+	})
 }
 
 func cmdTraceList(args []string) error {
@@ -1882,7 +1942,7 @@ func cmdTraceList(args []string) error {
 	activeOnly := fs.Bool("active", false, "only currently-open traces")
 	agent := fs.String("agent", "", "exact agent URI match")
 	spaceFlag := fs.String("space", "", "space URI (default: all installed spaces)")
-	format := fs.String("format", "text", "json | text")
+	format := formatFlag(fs)
 	if err := fs.Parse(reorderFlagsFirst(args)); err != nil {
 		return err
 	}
@@ -1896,18 +1956,7 @@ func cmdTraceList(args []string) error {
 		return err
 	}
 
-	type row struct {
-		ID        string    `json:"id"`
-		Space     string    `json:"space"`
-		Agent     string    `json:"agent"`
-		Status    string    `json:"status"`
-		Started   time.Time `json:"started"`
-		LastTick  time.Time `json:"last_tick"`
-		Ticks     int       `json:"ticks"`
-		Phase     string    `json:"phase,omitempty"`
-		Path      string    `json:"path"`
-	}
-	var out []row
+	var out []traceListRow
 
 	for _, sp := range spaces {
 		if *spaceFlag != "" && !spaceMatches(sp, *spaceFlag) {
@@ -1919,7 +1968,7 @@ func cmdTraceList(args []string) error {
 			continue
 		}
 		for _, t := range traces {
-			out = append(out, row{
+			out = append(out, traceListRow{
 				ID:       t.ID,
 				Space:    t.SpaceID,
 				Agent:    t.AgentID,
@@ -1933,27 +1982,38 @@ func cmdTraceList(args []string) error {
 		}
 	}
 
-	if *format == "json" {
-		enc := json.NewEncoder(os.Stdout)
-		enc.SetIndent("", "  ")
-		return enc.Encode(out)
-	}
-	if len(out) == 0 {
-		fmt.Println("(no traces)")
+	return emit("trace list", out, *format, func(w io.Writer, data any) error {
+		rows, ok := data.([]traceListRow)
+		if !ok {
+			return fmt.Errorf("trace list: text renderer got %T", data)
+		}
+		if len(rows) == 0 {
+			fmt.Fprintln(w, "(no traces)")
+			return nil
+		}
+		for _, r := range rows {
+			phase := ""
+			if r.Phase != "" {
+				phase = "  phase=" + r.Phase
+			}
+			fmt.Fprintf(w, "%s  %-10s  ticks=%-2d  %s\n      agent=%s%s\n",
+				r.LastTick.Format("2006-01-02 15:04"), r.Status, r.Ticks, r.ID, r.Agent, phase)
+		}
+		fmt.Fprintf(os.Stderr, "\n(%d traces)\n", len(rows))
 		return nil
-	}
-	for _, r := range out {
-		fmt.Printf("%s  %-10s  ticks=%-2d  %s\n      agent=%s%s\n",
-			r.LastTick.Format("2006-01-02 15:04"), r.Status, r.Ticks, r.ID, r.Agent,
-			func() string {
-				if r.Phase != "" {
-					return "  phase=" + r.Phase
-				}
-				return ""
-			}())
-	}
-	fmt.Fprintf(os.Stderr, "\n(%d traces)\n", len(out))
-	return nil
+	})
+}
+
+type traceListRow struct {
+	ID       string    `json:"id"`
+	Space    string    `json:"space"`
+	Agent    string    `json:"agent"`
+	Status   string    `json:"status"`
+	Started  time.Time `json:"started"`
+	LastTick time.Time `json:"last_tick"`
+	Ticks    int       `json:"ticks"`
+	Phase    string    `json:"phase,omitempty"`
+	Path     string    `json:"path"`
 }
 
 // cmdTraceHistory queries the FTS5 index for closed traces matching --similar
@@ -1967,7 +2027,7 @@ func cmdTraceHistory(args []string) error {
 	includeOpen := fs.Bool("include-open", false, "include currently-open traces (default: closed only)")
 	limit := fs.Int("limit", 10, "max results")
 	spaceFlag := fs.String("space", "", "scope FTS to one space URI")
-	format := fs.String("format", "text", "json | text")
+	format := formatFlag(fs)
 	if err := fs.Parse(reorderFlagsFirst(args)); err != nil {
 		return err
 	}
@@ -1984,21 +2044,7 @@ func cmdTraceHistory(args []string) error {
 		return err
 	}
 
-	// If --similar is set, do a typed FTS5 query first; otherwise scan all
-	// trace files via the trace package.
-	type row struct {
-		ID       string    `json:"id"`
-		Space    string    `json:"space"`
-		Agent    string    `json:"agent"`
-		Status   string    `json:"status"`
-		TaskRef  string    `json:"task_ref,omitempty"`
-		Phase    string    `json:"phase,omitempty"`
-		Ticks    int       `json:"ticks"`
-		LastTick time.Time `json:"last_tick"`
-		Path     string    `json:"path"`
-		Snippet  string    `json:"snippet,omitempty"`
-	}
-	var out []row
+	var out []traceHistoryRow
 
 	var fts5Matches map[string]float64 // id → BM25 rank (lower is better)
 	if *similar != "" {
@@ -2054,7 +2100,7 @@ LIMIT ?`
 					continue
 				}
 			}
-			out = append(out, row{
+			out = append(out, traceHistoryRow{
 				ID:       t.ID,
 				Space:    t.SpaceID,
 				Agent:    t.AgentID,
@@ -2080,33 +2126,43 @@ LIMIT ?`
 		out = out[:*limit]
 	}
 
-	if *format == "json" {
-		enc := json.NewEncoder(os.Stdout)
-		enc.SetIndent("", "  ")
-		return enc.Encode(out)
-	}
-	if len(out) == 0 {
-		fmt.Println("(no matching traces)")
+	return emit("trace history", out, *format, func(w io.Writer, data any) error {
+		rows, ok := data.([]traceHistoryRow)
+		if !ok {
+			return fmt.Errorf("trace history: text renderer got %T", data)
+		}
+		if len(rows) == 0 {
+			fmt.Fprintln(w, "(no matching traces)")
+			return nil
+		}
+		for _, r := range rows {
+			task := ""
+			if r.TaskRef != "" {
+				task = "  task=" + r.TaskRef
+			}
+			phase := ""
+			if r.Phase != "" {
+				phase = "  phase=" + r.Phase
+			}
+			fmt.Fprintf(w, "%s  %-10s  ticks=%-2d  %s\n      agent=%s%s%s\n",
+				r.LastTick.Format("2006-01-02 15:04"), r.Status, r.Ticks, r.ID, r.Agent, task, phase)
+		}
+		fmt.Fprintf(os.Stderr, "\n(%d traces)\n", len(rows))
 		return nil
-	}
-	for _, r := range out {
-		fmt.Printf("%s  %-10s  ticks=%-2d  %s\n      agent=%s%s%s\n",
-			r.LastTick.Format("2006-01-02 15:04"), r.Status, r.Ticks, r.ID, r.Agent,
-			func() string {
-				if r.TaskRef != "" {
-					return "  task=" + r.TaskRef
-				}
-				return ""
-			}(),
-			func() string {
-				if r.Phase != "" {
-					return "  phase=" + r.Phase
-				}
-				return ""
-			}())
-	}
-	fmt.Fprintf(os.Stderr, "\n(%d traces)\n", len(out))
-	return nil
+	})
+}
+
+type traceHistoryRow struct {
+	ID       string    `json:"id"`
+	Space    string    `json:"space"`
+	Agent    string    `json:"agent"`
+	Status   string    `json:"status"`
+	TaskRef  string    `json:"task_ref,omitempty"`
+	Phase    string    `json:"phase,omitempty"`
+	Ticks    int       `json:"ticks"`
+	LastTick time.Time `json:"last_tick"`
+	Path     string    `json:"path"`
+	Snippet  string    `json:"snippet,omitempty"`
 }
 
 // sanitizeTraceQuery mirrors recall's strip-to-alphanum approach so FTS5 won't
@@ -2269,7 +2325,7 @@ func cmdAnalyzeRun(kind string, args []string) error {
 	diffRef := fs.String("diff-ref", "", "git ref for kinds that diff (impact, review)")
 	maxDepth := fs.Int("max-depth", 0, "max reverse-call depth (impact, callgraph)")
 	refresh := fs.Bool("refresh", false, "ignore cached analysis and re-run canopy")
-	format := fs.String("format", "text", "json | text")
+	format := formatFlag(fs)
 	if err := fs.Parse(reorderFlagsFirst(args)); err != nil {
 		return err
 	}
@@ -2328,7 +2384,7 @@ func cmdAnalyzeList(args []string) error {
 	kindFilter := fs.String("kind", "", "filter by kind (impact|callgraph|refs|hotspot|dead|review)")
 	targetFile := fs.String("target-file", "", "match analyses whose target_files include this path")
 	spaceFlag := fs.String("space", "", "space URI (default: all installed spaces)")
-	format := fs.String("format", "text", "json | text")
+	format := formatFlag(fs)
 	if err := fs.Parse(reorderFlagsFirst(args)); err != nil {
 		return err
 	}
@@ -2342,17 +2398,7 @@ func cmdAnalyzeList(args []string) error {
 		return err
 	}
 
-	type row struct {
-		ID            string    `json:"id"`
-		Kind          string    `json:"kind"`
-		Target        string    `json:"target"`
-		Commit        string    `json:"commit"`
-		ComputedAt    time.Time `json:"computed_at"`
-		Stale         bool      `json:"stale"`
-		TotalAffected int       `json:"total_affected,omitempty"`
-		Path          string    `json:"path"`
-	}
-	var out []row
+	var out []analyzeListRow
 	for _, sp := range spaces {
 		if *spaceFlag != "" && !spaceMatches(sp, *spaceFlag) {
 			continue
@@ -2365,7 +2411,7 @@ func cmdAnalyzeList(args []string) error {
 		sourcePath, _ := resolveSourceForSpace("hypha://"+sp.URI, "")
 		for _, a := range list {
 			checkAndAnnotateFreshness(&a, sourcePath)
-			out = append(out, row{
+			out = append(out, analyzeListRow{
 				ID:            a.ID,
 				Kind:          a.Kind,
 				Target:        a.Target,
@@ -2378,32 +2424,44 @@ func cmdAnalyzeList(args []string) error {
 		}
 	}
 
-	if *format == "json" {
-		enc := json.NewEncoder(os.Stdout)
-		enc.SetIndent("", "  ")
-		return enc.Encode(out)
-	}
-	if len(out) == 0 {
-		fmt.Println("(no analyses)")
-		return nil
-	}
-	for _, r := range out {
-		staleTag := ""
-		if r.Stale {
-			staleTag = "  STALE"
+	return emit("analyze list", out, *format, func(w io.Writer, data any) error {
+		rows, ok := data.([]analyzeListRow)
+		if !ok {
+			return fmt.Errorf("analyze list: text renderer got %T", data)
 		}
-		fmt.Printf("%s  %-10s  %s  @%s%s\n      %s\n",
-			r.ComputedAt.Format("2006-01-02 15:04"), r.Kind, r.Target, r.Commit, staleTag, r.ID)
-	}
-	fmt.Fprintf(os.Stderr, "\n(%d analyses)\n", len(out))
-	return nil
+		if len(rows) == 0 {
+			fmt.Fprintln(w, "(no analyses)")
+			return nil
+		}
+		for _, r := range rows {
+			staleTag := ""
+			if r.Stale {
+				staleTag = "  STALE"
+			}
+			fmt.Fprintf(w, "%s  %-10s  %s  @%s%s\n      %s\n",
+				r.ComputedAt.Format("2006-01-02 15:04"), r.Kind, r.Target, r.Commit, staleTag, r.ID)
+		}
+		fmt.Fprintf(os.Stderr, "\n(%d analyses)\n", len(rows))
+		return nil
+	})
+}
+
+type analyzeListRow struct {
+	ID            string    `json:"id"`
+	Kind          string    `json:"kind"`
+	Target        string    `json:"target"`
+	Commit        string    `json:"commit"`
+	ComputedAt    time.Time `json:"computed_at"`
+	Stale         bool      `json:"stale"`
+	TotalAffected int       `json:"total_affected,omitempty"`
+	Path          string    `json:"path"`
 }
 
 func cmdAnalyzeRefresh(args []string) error {
 	fs := flag.NewFlagSet("analyze refresh", flag.ContinueOnError)
 	spaceFlag := fs.String("space", "", "space URI (default: only installed space)")
 	source := fs.String("source", "", "source repo path (default: ~/work/<space-basename>)")
-	format := fs.String("format", "text", "json | text")
+	format := formatFlag(fs)
 	if err := fs.Parse(reorderFlagsFirst(args)); err != nil {
 		return err
 	}
@@ -2485,39 +2543,40 @@ func checkAndAnnotateFreshness(a *types.Analysis, sourcePath string) {
 }
 
 func emitAnalysis(a types.Analysis, format string) error {
-	if format == "json" {
-		enc := json.NewEncoder(os.Stdout)
-		enc.SetIndent("", "  ")
-		return enc.Encode(a)
-	}
-	staleTag := ""
-	if a.Stale {
-		staleTag = "  [STALE — re-run with `hypha analyze refresh " + a.ID + "`]"
-	}
-	fmt.Printf("Analysis:    %s%s\n", a.ID, staleTag)
-	fmt.Printf("Kind:        %s\n", a.Kind)
-	fmt.Printf("Target:      %s\n", a.Target)
-	if a.Commit != "" {
-		fmt.Printf("Commit:      %s\n", a.Commit)
-	}
-	fmt.Printf("Computed at: %s\n", a.ComputedAt.Format(time.RFC3339))
-	if a.TotalAffected > 0 {
-		fmt.Printf("Affected:    %d symbols across %d files\n", a.TotalAffected, len(a.TopFiles))
-	}
-	if len(a.TopFiles) > 0 {
-		fmt.Println("\nTop files:")
-		for _, f := range a.TopFiles {
-			fmt.Printf("  - %s\n", f)
+	return emit("analyze", a, format, func(w io.Writer, data any) error {
+		an, ok := data.(types.Analysis)
+		if !ok {
+			return fmt.Errorf("analyze: text renderer got %T", data)
 		}
-	}
-	if len(a.TopSymbols) > 0 {
-		fmt.Println("\nTop symbols:")
-		for _, s := range a.TopSymbols {
-			fmt.Printf("  - %s\n", s)
+		staleTag := ""
+		if an.Stale {
+			staleTag = "  [STALE — re-run with `hypha analyze refresh " + an.ID + "`]"
 		}
-	}
-	fmt.Printf("\nFile: %s\n", a.FilePath)
-	return nil
+		fmt.Fprintf(w, "Analysis:    %s%s\n", an.ID, staleTag)
+		fmt.Fprintf(w, "Kind:        %s\n", an.Kind)
+		fmt.Fprintf(w, "Target:      %s\n", an.Target)
+		if an.Commit != "" {
+			fmt.Fprintf(w, "Commit:      %s\n", an.Commit)
+		}
+		fmt.Fprintf(w, "Computed at: %s\n", an.ComputedAt.Format(time.RFC3339))
+		if an.TotalAffected > 0 {
+			fmt.Fprintf(w, "Affected:    %d symbols across %d files\n", an.TotalAffected, len(an.TopFiles))
+		}
+		if len(an.TopFiles) > 0 {
+			fmt.Fprintln(w, "\nTop files:")
+			for _, f := range an.TopFiles {
+				fmt.Fprintf(w, "  - %s\n", f)
+			}
+		}
+		if len(an.TopSymbols) > 0 {
+			fmt.Fprintln(w, "\nTop symbols:")
+			for _, s := range an.TopSymbols {
+				fmt.Fprintf(w, "  - %s\n", s)
+			}
+		}
+		fmt.Fprintf(w, "\nFile: %s\n", an.FilePath)
+		return nil
+	})
 }
 
 // --- graph -----------------------------------------------------------------
@@ -2544,6 +2603,7 @@ func cmdGraphLinks(args []string, fn linksFunc) error {
 	fs := flag.NewFlagSet("graph links", flag.ContinueOnError)
 	kindStr := fs.String("kind", "", "comma-separated edge kinds to filter (default: all)")
 	limit := fs.Int("limit", 50, "max results")
+	format := formatFlag(fs)
 	if err := fs.Parse(reorderFlagsFirst(args)); err != nil {
 		return err
 	}
@@ -2566,15 +2626,28 @@ func cmdGraphLinks(args []string, fn linksFunc) error {
 	if err != nil {
 		return err
 	}
-	enc := json.NewEncoder(os.Stdout)
-	enc.SetIndent("", "  ")
-	return enc.Encode(out)
+	return emit("graph links", out, *format, func(w io.Writer, data any) error {
+		neighbors, ok := data.([]graph.Neighbor)
+		if !ok {
+			return fmt.Errorf("graph links: text renderer got %T", data)
+		}
+		if len(neighbors) == 0 {
+			fmt.Fprintln(w, "(no neighbors)")
+			return nil
+		}
+		for _, n := range neighbors {
+			fmt.Fprintf(w, "  %-16s  %s\n", n.Edge.Kind, n.Endpoint)
+		}
+		fmt.Fprintf(os.Stderr, "\n(%d neighbors)\n", len(neighbors))
+		return nil
+	})
 }
 
 func cmdGraphTrace(args []string) error {
 	fs := flag.NewFlagSet("graph trace", flag.ContinueOnError)
 	kindStr := fs.String("kind", "derived_from,cites,source_ref", "comma-separated edge kinds to follow")
 	maxDepth := fs.Int("max-depth", 4, "max BFS depth")
+	format := formatFlag(fs)
 	if err := fs.Parse(reorderFlagsFirst(args)); err != nil {
 		return err
 	}
@@ -2597,9 +2670,21 @@ func cmdGraphTrace(args []string) error {
 	if err != nil {
 		return err
 	}
-	enc := json.NewEncoder(os.Stdout)
-	enc.SetIndent("", "  ")
-	return enc.Encode(steps)
+	return emit("graph trace", steps, *format, func(w io.Writer, data any) error {
+		ss, ok := data.([]graph.TraceStep)
+		if !ok {
+			return fmt.Errorf("graph trace: text renderer got %T", data)
+		}
+		if len(ss) == 0 {
+			fmt.Fprintln(w, "(no path)")
+			return nil
+		}
+		for _, s := range ss {
+			fmt.Fprintf(w, "  depth=%d  %-16s  %s → %s\n", s.HopDepth, s.Edge.Kind, s.From, s.To)
+		}
+		fmt.Fprintf(os.Stderr, "\n(%d steps)\n", len(ss))
+		return nil
+	})
 }
 
 func parseEdgeKinds(s string) []types.EdgeKind {
@@ -2626,6 +2711,7 @@ func cmdReceipts(args []string) error {
 	action := fs.String("action", "", "filter by action (e.g. spore:create, graft, cap:issue)")
 	since := fs.String("since", "", "Go duration; receipts created within the last N units")
 	limit := fs.Int("limit", 50, "max results")
+	format := formatFlag(fs)
 	if err := fs.Parse(reorderFlagsFirst(args[1:])); err != nil {
 		return err
 	}
@@ -2660,9 +2746,22 @@ func cmdReceipts(args []string) error {
 		return err
 	}
 
-	enc := json.NewEncoder(os.Stdout)
-	enc.SetIndent("", "  ")
-	return enc.Encode(out)
+	return emit("receipts list", out, *format, func(w io.Writer, data any) error {
+		rs, ok := data.([]types.Receipt)
+		if !ok {
+			return fmt.Errorf("receipts list: text renderer got %T", data)
+		}
+		if len(rs) == 0 {
+			fmt.Fprintln(w, "(no receipts)")
+			return nil
+		}
+		for _, r := range rs {
+			fmt.Fprintf(w, "%s  %-16s  %s\n      %s\n",
+				r.CreatedAt.Format("2006-01-02 15:04"), r.Action, r.SubjectID, r.ID)
+		}
+		fmt.Fprintf(os.Stderr, "\n(%d receipts)\n", len(rs))
+		return nil
+	})
 }
 
 // openIndex opens the SQLite index at the default path under root.
