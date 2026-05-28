@@ -40,10 +40,12 @@ import (
 	"m31labs.dev/hyphae/internal/identity"
 	"m31labs.dev/hyphae/internal/mcp"
 	"m31labs.dev/hyphae/internal/parser"
+	"m31labs.dev/hyphae/internal/peers"
 	"m31labs.dev/hyphae/internal/pulse"
 	"m31labs.dev/hyphae/internal/recall"
 	"m31labs.dev/hyphae/internal/receipts"
 	"m31labs.dev/hyphae/internal/spore"
+	"m31labs.dev/hyphae/internal/syncbundle"
 	"m31labs.dev/hyphae/internal/trace"
 	"m31labs.dev/hyphae/internal/types"
 	mdppfmt "m31labs.dev/mdpp/fmt"
@@ -86,6 +88,11 @@ Usage:
   hypha analyze  refresh <id> [--space <uri>] [--source <path>]
   hypha db       history  --space <uri> [--limit N] [--format text|json|compact]
   hypha db       compact  --space <uri> [--format text|json|compact]
+  hypha sync     export   --space <uri> [--out <file>] [--format text|json|compact]
+  hypha sync     import   [--space <uri>] [--in <file>] [--format text|json|compact]
+  hypha peer     add      <uri> [--name <name>] [--format text|json|compact]
+  hypha peer     list     [--format text|json|compact]
+  hypha peer     remove   <name-or-uri> [--format text|json|compact]
   hypha receipts list   [--space <uri>] [--subject <uri>] [--action <name>] [--since 24h] [--limit N] [--format text|json|compact]
   hypha mcp      serve                              MCP stdio server (JSON-RPC 2.0; read-only tools)
 
@@ -181,6 +188,10 @@ func run(args []string) error {
 		return cmdAnalyze(rest)
 	case "db":
 		return cmdDB(rest)
+	case "sync":
+		return cmdSync(rest)
+	case "peer":
+		return cmdPeer(rest)
 	case "mcp":
 		return cmdMCP(rest)
 	default:
@@ -298,6 +309,246 @@ func mustResolveSpace(installRoot, spaceURI string) string {
 		return filepath.Join(installRoot, "spaces", "unknown")
 	}
 	return p
+}
+
+// --- sync ------------------------------------------------------------------
+
+func cmdSync(args []string) error {
+	if len(args) == 0 {
+		return errors.New("usage: hypha sync export|import [...]")
+	}
+	switch args[0] {
+	case "export":
+		return cmdSyncExport(args[1:])
+	case "import":
+		return cmdSyncImport(args[1:])
+	default:
+		return fmt.Errorf("unknown sync subcommand %q (try `export`, `import`)", args[0])
+	}
+}
+
+func cmdSyncExport(args []string) error {
+	fs := flag.NewFlagSet("sync export", flag.ContinueOnError)
+	spaceFlag := fs.String("space", "", "space URI (required)")
+	out := fs.String("out", "", "output file path; `-` for stdout (default: <space>.bundle in cwd)")
+	format := formatFlag(fs)
+	if err := fs.Parse(reorderFlagsFirst(args)); err != nil {
+		return err
+	}
+	if *spaceFlag == "" {
+		return errors.New("--space <uri> is required")
+	}
+	root, err := resolveRoot("")
+	if err != nil {
+		return err
+	}
+	sh, err := crdtshadow.Default.Get(mustResolveSpace(root, *spaceFlag), *spaceFlag)
+	if err != nil {
+		return err
+	}
+	bundle, err := syncbundle.Export(sh.Doc(), *spaceFlag)
+	if err != nil {
+		return err
+	}
+	data, err := bundle.Marshal()
+	if err != nil {
+		return err
+	}
+	target := *out
+	if target == "" {
+		target = bundleDefaultName(*spaceFlag)
+	}
+	if target == "-" {
+		if _, err := os.Stdout.Write(data); err != nil {
+			return err
+		}
+		fmt.Fprintln(os.Stderr, "exported bundle to stdout")
+	} else {
+		if err := atomicfs.WriteFile(target, data, 0o644); err != nil {
+			return err
+		}
+	}
+	payload := map[string]any{
+		"space":       *spaceFlag,
+		"out":         target,
+		"from_actor":  bundle.FromActor,
+		"from_heads":  bundle.FromHeads,
+		"bundle_size": len(data),
+	}
+	return emit("sync export", payload, *format, func(w io.Writer, _ any) error {
+		fmt.Fprintf(w, "Exported %s\n", *spaceFlag)
+		fmt.Fprintf(w, "  out:   %s\n", target)
+		fmt.Fprintf(w, "  bytes: %d\n", len(data))
+		fmt.Fprintf(w, "  heads: %s\n", strings.Join(bundle.FromHeads, ", "))
+		return nil
+	})
+}
+
+func cmdSyncImport(args []string) error {
+	fs := flag.NewFlagSet("sync import", flag.ContinueOnError)
+	spaceFlag := fs.String("space", "", "space URI (default: take from bundle)")
+	in := fs.String("in", "-", "input file path; `-` for stdin")
+	format := formatFlag(fs)
+	if err := fs.Parse(reorderFlagsFirst(args)); err != nil {
+		return err
+	}
+	root, err := resolveRoot("")
+	if err != nil {
+		return err
+	}
+	var raw []byte
+	if *in == "-" {
+		raw, err = io.ReadAll(os.Stdin)
+	} else {
+		raw, err = os.ReadFile(*in)
+	}
+	if err != nil {
+		return fmt.Errorf("sync import: read: %w", err)
+	}
+	bundle, err := syncbundle.Unmarshal(raw)
+	if err != nil {
+		return err
+	}
+	targetSpace := *spaceFlag
+	if targetSpace == "" {
+		targetSpace = bundle.Space
+	}
+	if targetSpace == "" {
+		return errors.New("sync import: bundle missing space and no --space override")
+	}
+	if *spaceFlag != "" && bundle.Space != "" && *spaceFlag != bundle.Space {
+		fmt.Fprintf(os.Stderr, "warn: --space %q overrides bundle space %q\n", *spaceFlag, bundle.Space)
+	}
+	sh, err := crdtshadow.Default.Get(mustResolveSpace(root, targetSpace), targetSpace)
+	if err != nil {
+		return err
+	}
+	delta, err := syncbundle.Import(sh.Doc(), bundle)
+	if err != nil {
+		return err
+	}
+	if _, err := sh.Store().AppendChangesFromDoc(sh.Doc()); err != nil {
+		return fmt.Errorf("sync import: persist: %w", err)
+	}
+	payload := map[string]any{
+		"space":            targetSpace,
+		"in":               *in,
+		"changes_absorbed": delta,
+		"from_actor":       bundle.FromActor,
+		"from_heads":       bundle.FromHeads,
+	}
+	return emit("sync import", payload, *format, func(w io.Writer, _ any) error {
+		fmt.Fprintf(w, "Imported %s\n", targetSpace)
+		fmt.Fprintf(w, "  from:   %s (actor %s)\n", *in, bundle.FromActor)
+		fmt.Fprintf(w, "  absorbed: %d new change(s)\n", delta)
+		return nil
+	})
+}
+
+func bundleDefaultName(spaceURI string) string {
+	rest := strings.TrimPrefix(spaceURI, "hypha://")
+	rest = strings.ReplaceAll(rest, "/", "-")
+	if rest == "" {
+		rest = "space"
+	}
+	return rest + ".bundle"
+}
+
+// --- peer ------------------------------------------------------------------
+
+func cmdPeer(args []string) error {
+	if len(args) == 0 {
+		return errors.New("usage: hypha peer add|list|remove [...]")
+	}
+	switch args[0] {
+	case "add":
+		return cmdPeerAdd(args[1:])
+	case "list":
+		return cmdPeerList(args[1:])
+	case "remove", "rm":
+		return cmdPeerRemove(args[1:])
+	default:
+		return fmt.Errorf("unknown peer subcommand %q (try `add`, `list`, `remove`)", args[0])
+	}
+}
+
+func cmdPeerAdd(args []string) error {
+	fs := flag.NewFlagSet("peer add", flag.ContinueOnError)
+	name := fs.String("name", "", "peer name (default: derived from URI)")
+	format := formatFlag(fs)
+	if err := fs.Parse(reorderFlagsFirst(args)); err != nil {
+		return err
+	}
+	if fs.NArg() == 0 {
+		return errors.New("usage: hypha peer add <uri> [--name <name>]")
+	}
+	uri := fs.Arg(0)
+	root, err := resolveRoot("")
+	if err != nil {
+		return err
+	}
+	added, err := peers.Add(root, *name, uri)
+	if err != nil {
+		return err
+	}
+	return emit("peer add", added, *format, func(w io.Writer, _ any) error {
+		fmt.Fprintf(w, "Added peer %s → %s\n", added.Name, added.URI)
+		return nil
+	})
+}
+
+func cmdPeerList(args []string) error {
+	fs := flag.NewFlagSet("peer list", flag.ContinueOnError)
+	format := formatFlag(fs)
+	if err := fs.Parse(reorderFlagsFirst(args)); err != nil {
+		return err
+	}
+	root, err := resolveRoot("")
+	if err != nil {
+		return err
+	}
+	list, err := peers.List(root)
+	if err != nil {
+		return err
+	}
+	return emit("peer list", list, *format, func(w io.Writer, data any) error {
+		ps, ok := data.([]peers.Peer)
+		if !ok {
+			return fmt.Errorf("peer list: text renderer got %T", data)
+		}
+		if len(ps) == 0 {
+			fmt.Fprintln(w, "(no peers)")
+			return nil
+		}
+		for _, p := range ps {
+			fmt.Fprintf(w, "  %-20s  %s   added %s\n", p.Name, p.URI, p.AddedAt.Format(time.RFC3339))
+		}
+		return nil
+	})
+}
+
+func cmdPeerRemove(args []string) error {
+	fs := flag.NewFlagSet("peer remove", flag.ContinueOnError)
+	format := formatFlag(fs)
+	if err := fs.Parse(reorderFlagsFirst(args)); err != nil {
+		return err
+	}
+	if fs.NArg() == 0 {
+		return errors.New("usage: hypha peer remove <name-or-uri>")
+	}
+	needle := fs.Arg(0)
+	root, err := resolveRoot("")
+	if err != nil {
+		return err
+	}
+	removed, err := peers.Remove(root, needle)
+	if err != nil {
+		return err
+	}
+	return emit("peer remove", removed, *format, func(w io.Writer, _ any) error {
+		fmt.Fprintf(w, "Removed peer %s → %s\n", removed.Name, removed.URI)
+		return nil
+	})
 }
 
 // --- mcp -------------------------------------------------------------------
