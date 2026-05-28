@@ -514,6 +514,31 @@ func TestTamperedBody(t *testing.T) {
 	}
 }
 
+// TestWorkLogAppendPreservesSignature proves that the `trace done --link-spore`
+// work-log append — a "## Work log (trace.…)" section added to the body AFTER
+// signing — does not invalidate the signature. The signed region is the
+// authored content, which ends where the tool-appended work log begins.
+func TestWorkLogAppendPreservesSignature(t *testing.T) {
+	id, priv := makeTestIdentity(t)
+	resolver := resolverFor(id)
+
+	signed, err := spore.Sign(validSporeDoc, priv, id.ID)
+	if err != nil {
+		t.Fatalf("Sign returned error: %v", err)
+	}
+
+	// Exactly the shape internal/trace.appendWorkLogToSpore writes.
+	workLog := "\n## Work log (trace.2026-05-28.testbot.abcd)\n\n" +
+		"_Compacted from trace `trace.2026-05-28.testbot.abcd` (succeeded, ticks=1, " +
+		"started=2026-05-28T18:00:00Z, last_tick=2026-05-28T18:05:00Z)._\n\n" +
+		"- 2026-05-28T18:01:00Z  did the thing\n"
+	withLog := append(append([]byte{}, signed...), []byte(workLog)...)
+
+	if err := spore.Verify(withLog, resolver); err != nil {
+		t.Fatalf("Verify should pass after work-log append, got: %v", err)
+	}
+}
+
 // TestUnknownSigner verifies that Verify returns an error when the resolver
 // does not recognise the signing key URI.
 func TestUnknownSigner(t *testing.T) {

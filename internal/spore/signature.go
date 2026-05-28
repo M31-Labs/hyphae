@@ -1,6 +1,7 @@
 package spore
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"encoding/base64"
 	"errors"
@@ -66,8 +67,8 @@ func Sign(source []byte, priv identity.PrivateKey, signedKey string) ([]byte, er
 		return nil, fmt.Errorf("spore: sign: created field missing or invalid type %T", fm["created"])
 	}
 
-	// Extract body bytes.
-	body := extractBodyBytes(doc)
+	// Extract body bytes (excluding any tool-appended work-log section).
+	body := signableBody(extractBodyBytes(doc))
 
 	// Compute body hash.
 	bodyHash := sha256.Sum256(body)
@@ -129,8 +130,8 @@ func Verify(source []byte, resolve IdentityResolver) error {
 		return fmt.Errorf("spore: unknown signer %q: %w", sig.Key, err)
 	}
 
-	// Extract body bytes.
-	body := extractBodyBytes(doc)
+	// Extract body bytes (excluding any tool-appended work-log section).
+	body := signableBody(extractBodyBytes(doc))
 
 	// Verify content hash.
 	bodyHash := sha256.Sum256(body)
@@ -204,6 +205,26 @@ func buildCanonicalPayload(agentID, sporeID string, createdAt time.Time, bodyHas
 
 // extractBodyBytes returns the raw body bytes (everything after the closing
 // `---` of the frontmatter block).
+// workLogMarker is the heading `hypha trace done --link-spore` appends to a
+// spore body (see internal/trace.appendWorkLogToSpore). The leading newline is
+// part of the appended block, so matching it lets signableBody recover the
+// original authored body byte-for-byte.
+var workLogMarker = []byte("\n## Work log (trace.")
+
+// signableBody returns the portion of the body the signature covers: the
+// authored content, excluding any work-log section appended by trace-done
+// after signing. A body with no work log is returned unchanged, so signing
+// and verification agree and pre-existing signatures stay valid. Tampering
+// anywhere in the authored region (or via any other appended text) still
+// changes the hash and fails verification — only the specific tool-generated
+// work-log section is exempt.
+func signableBody(body []byte) []byte {
+	if i := bytes.Index(body, workLogMarker); i >= 0 {
+		return body[:i]
+	}
+	return body
+}
+
 func extractBodyBytes(doc *mdpp.Document) []byte {
 	if doc == nil || doc.Root == nil {
 		return nil
