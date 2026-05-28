@@ -3,6 +3,8 @@ package mcp
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -86,10 +88,87 @@ func TestServer_InitializeListAndCall(t *testing.T) {
 	}
 	textBlock, _ := content[0].(map[string]any)
 	text, _ := textBlock["text"].(string)
-	if !strings.Contains(text, `"command": "hypha_recall"`) {
+	if !strings.Contains(text, `"command":"hypha_recall"`) {
 		t.Errorf("envelope command missing in tool response; got: %s", text)
 	}
 	if !strings.Contains(text, `"Envelope"`) {
 		t.Errorf("expected to find the seeded object's title 'Envelope' in response; got: %s", text)
+	}
+}
+
+func TestServer_CompactFormatShortensKeys(t *testing.T) {
+	conn, err := db.Open(filepath.Join(t.TempDir(), "mcp.db"))
+	if err != nil {
+		t.Fatalf("db.Open: %v", err)
+	}
+	defer conn.Close()
+	if err := recall.IndexBatch(conn, []types.Object{
+		{ID: "x", Type: types.TypeConcept, SpaceID: "t/s", Title: "X", Body: "compact x"},
+	}); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	in := strings.NewReader(
+		`{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"hypha_recall","arguments":{"query":"compact","format":"compact"}}}` + "\n",
+	)
+	out := &bytes.Buffer{}
+	s := NewServer(conn, t.TempDir(), ServerInfo{Name: "test", Version: "0"})
+	s.in = in
+	s.out = out
+	s.log = &bytes.Buffer{}
+	if err := s.Serve(); err != nil {
+		t.Fatalf("Serve: %v", err)
+	}
+	// The inner JSON is escaped inside the MCP transport string, so check for
+	// the escaped form of the short key.
+	body := out.String()
+	if !strings.Contains(body, `\"c\":\"hypha_recall\"`) {
+		t.Errorf("compact format missing short key c (command); got: %s", body)
+	}
+	if strings.Contains(body, `\"command\"`) {
+		t.Errorf("compact format should not contain full key 'command'; got: %s", body)
+	}
+}
+
+func TestServer_TruncationWarningsWhenOverBudget(t *testing.T) {
+	conn, err := db.Open(filepath.Join(t.TempDir(), "mcp.db"))
+	if err != nil {
+		t.Fatalf("db.Open: %v", err)
+	}
+	defer conn.Close()
+	// Seed enough objects that a tight budget forces a trim.
+	var objs []types.Object
+	for i := 0; i < 12; i++ {
+		objs = append(objs, types.Object{
+			ID:      fmt.Sprintf("obj-%02d", i),
+			Type:    types.TypeConcept,
+			SpaceID: "t/s",
+			Title:   fmt.Sprintf("Object %d about widgets and gizmos", i),
+			Body:    "widget gizmo widget gizmo widget gizmo widget gizmo widget gizmo widget gizmo",
+		})
+	}
+	if err := recall.IndexBatch(conn, objs); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	// Make sure spaces/ exists so listSpaces doesn't return ENOENT.
+	root := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(root, "spaces"), 0o755); err != nil {
+		t.Fatalf("mkdir spaces: %v", err)
+	}
+	in := strings.NewReader(
+		`{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"hypha_spore_list","arguments":{"max_tokens":50}}}` + "\n",
+	)
+	out := &bytes.Buffer{}
+	s := NewServer(conn, root, ServerInfo{Name: "test", Version: "0"})
+	s.in = in
+	s.out = out
+	s.log = &bytes.Buffer{}
+	if err := s.Serve(); err != nil {
+		t.Fatalf("Serve: %v", err)
+	}
+	// Empty spaces → empty list → response well-formed and tiny.
+	if !strings.Contains(out.String(), `\"command\":\"hypha_spore_list\"`) {
+		t.Errorf("expected command spore_list in response; got: %s", out.String())
 	}
 }

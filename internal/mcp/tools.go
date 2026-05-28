@@ -10,6 +10,7 @@ import (
 	"m31labs.dev/hyphae/internal/analyze"
 	"m31labs.dev/hyphae/internal/assess"
 	"m31labs.dev/hyphae/internal/graph"
+	"m31labs.dev/hyphae/internal/identity"
 	"m31labs.dev/hyphae/internal/pulse"
 	"m31labs.dev/hyphae/internal/recall"
 	"m31labs.dev/hyphae/internal/receipts"
@@ -20,130 +21,186 @@ import (
 // toolSpec defines one MCP tool: its surface name, its description, the
 // JSON Schema for its arguments, and the handler that turns those
 // arguments into a serializable result.
+//
+// DefaultMaxTokens is the soft response-size cap when the caller doesn't
+// pass `max_tokens`. List-shaped responses honor it by dropping trailing
+// rows and emitting a TRUNCATED warning.
 type toolSpec struct {
-	Name        string
-	Description string
-	InputSchema map[string]any
-	Handler     func(args map[string]any) (any, error)
+	Name             string
+	Description      string
+	InputSchema      map[string]any
+	DefaultMaxTokens int
+	Handler          func(args map[string]any) (any, error)
 }
 
 func buildTools(s *Server) []toolSpec {
+	var tools []toolSpec
+	tools = append(tools, readTools(s)...)
+	tools = append(tools, writeTools(s)...)
+	return tools
+}
+
+func readTools(s *Server) []toolSpec {
+	// budgetProps is the common token-discipline arg set: format selects
+	// the wire shape; max_tokens caps response size with truncation; fields
+	// projects each list row down to a whitelist.
+	budgetProps := map[string]any{
+		"format":     enumProp([]string{"jsonline", "json", "compact"}, "wire shape (default jsonline)"),
+		"max_tokens": numberProp("soft response budget; list rows are trimmed when over"),
+		"fields":     arrayOfStrings("whitelist of top-level fields per list row"),
+	}
+
 	return []toolSpec{
 		{
-			Name: "hypha_recall",
-			Description: "Full-text search across all installed Hyphae spaces. " +
-				"Returns ranked hits with short body snippets and per-snippet citations (anchor URI + line range). " +
-				"Token-budgeted; designed for direct LLM consumption.",
-			InputSchema: schema(map[string]any{
+			Name:             "hypha_recall",
+			Description:      "FTS5 search across spaces; ranked hits + body snippets + per-snippet citations.",
+			DefaultMaxTokens: 800,
+			InputSchema: schema(merge(map[string]any{
 				"query":      stringProp("query terms"),
 				"limit":      numberProp("max hits to consider (default 12)"),
-				"max_tokens": numberProp("token budget for the response (default 800)"),
-				"shape":      enumProp([]string{"headline", "summary+anchors", "count_only"}, "response shape"),
-			}, []string{"query"}),
+				"shape":      enumProp([]string{"headline", "summary+anchors", "count_only"}, "recall response shape"),
+			}, budgetProps), []string{"query"}),
 			Handler: func(args map[string]any) (any, error) {
-				query, _ := args["query"].(string)
-				if strings.TrimSpace(query) == "" {
-					return nil, errors.New("recall: query is required")
+				q, _ := args["query"].(string)
+				if strings.TrimSpace(q) == "" {
+					return nil, errors.New("recall: query required")
 				}
-				limit := intArg(args, "limit", 12)
-				maxTokens := intArg(args, "max_tokens", 800)
 				shape, _ := args["shape"].(string)
 				if shape == "" {
 					shape = "summary+anchors"
 				}
-				return recall.Recall(s.conn, query, limit, types.Budget{
-					MaxResponseTokens: maxTokens,
+				return recall.Recall(s.conn, q, intArg(args, "limit", 12), types.Budget{
+					MaxResponseTokens: intArg(args, "max_tokens", 800),
 					Shape:             types.ResponseShape(shape),
 				})
 			},
 		},
 		{
-			Name: "hypha_pulse",
-			Description: "Time-windowed signal aggregation: top initiatives, hot zones, recent pressure, " +
-				"edge-kind distribution, activity counts.",
-			InputSchema: schema(map[string]any{
-				"space":  stringProp("filter to a single space URI (default: all spaces)"),
-				"window": stringProp("Go duration; supports Nd (e.g. 7d, 30d). Default 30d."),
-			}, nil),
+			Name:             "hypha_show",
+			Description:      "Fetch one object's metadata or body by id/URI; slice picks how much to return.",
+			DefaultMaxTokens: 1200,
+			InputSchema: schema(merge(map[string]any{
+				"id":    stringProp("hypha:// URI or bare object id"),
+				"slice": enumProp([]string{"metadata", "frontmatter", "body", "full", "path"}, "what to return (default metadata)"),
+			}, budgetProps), []string{"id"}),
 			Handler: func(args map[string]any) (any, error) {
-				space, _ := args["space"].(string)
+				id, _ := args["id"].(string)
+				if id == "" {
+					return nil, errors.New("show: id required")
+				}
+				slice, _ := args["slice"].(string)
+				if slice == "" {
+					slice = "metadata"
+				}
+				return showObject(s.conn, s.installRoot, id, slice)
+			},
+		},
+		{
+			Name:             "hypha_pulse",
+			Description:      "Time-windowed signal: top initiatives, hot zones, recent pressure, activity.",
+			DefaultMaxTokens: 800,
+			InputSchema: schema(merge(map[string]any{
+				"space":  stringProp("filter to a single space URI"),
+				"window": stringProp("Go duration; supports Nd (e.g. 7d, 30d). Default 30d."),
+			}, budgetProps), nil),
+			Handler: func(args map[string]any) (any, error) {
 				windowStr, _ := args["window"].(string)
 				if windowStr == "" {
 					windowStr = "30d"
 				}
-				window, err := parseFlexDuration(windowStr)
+				w, err := parseFlexDuration(windowStr)
 				if err != nil {
 					return nil, fmt.Errorf("window %q: %w", windowStr, err)
 				}
-				return pulse.Compute(s.conn, space, window)
+				return pulse.Compute(s.conn, stringArg(args, "space"), w)
 			},
 		},
 		{
-			Name: "hypha_assess_task",
-			Description: "Alignment scoring for a proposed task against active initiatives in a space. " +
-				"Returns alignment category, matched initiatives, recommendation.",
-			InputSchema: schema(map[string]any{
-				"task":  stringProp("natural-language description of the task"),
+			Name:             "hypha_assess_task",
+			Description:      "Alignment scoring for a task vs active initiatives.",
+			DefaultMaxTokens: 600,
+			InputSchema: schema(merge(map[string]any{
+				"task":  stringProp("task description"),
 				"space": stringProp("filter scoring to one space URI"),
-			}, []string{"task"}),
+			}, budgetProps), []string{"task"}),
 			Handler: func(args map[string]any) (any, error) {
 				task, _ := args["task"].(string)
 				if strings.TrimSpace(task) == "" {
-					return nil, errors.New("assess_task: task is required")
+					return nil, errors.New("assess_task: task required")
 				}
-				space, _ := args["space"].(string)
 				return assess.Change(s.conn, assess.ChangeRequest{
 					Task:   task,
-					Space:  space,
+					Space:  stringArg(args, "space"),
 					Window: 30 * 24 * time.Hour,
-					Budget: types.Budget{MaxResponseTokens: 1200, Shape: types.ShapeCitedSpans},
+					Budget: types.Budget{MaxResponseTokens: intArg(args, "max_tokens", 600), Shape: types.ShapeCitedSpans},
 				})
 			},
 		},
 		{
-			Name: "hypha_assess_change",
-			Description: "Alignment scoring for a change (task + changed files + diff summary). " +
-				"Same scorer as assess_task with richer input.",
-			InputSchema: schema(map[string]any{
-				"task":         stringProp("natural-language description of the change"),
+			Name:             "hypha_assess_change",
+			Description:      "Alignment scoring with task + changed files + diff summary.",
+			DefaultMaxTokens: 800,
+			InputSchema: schema(merge(map[string]any{
+				"task":         stringProp("change description"),
 				"files":        arrayOfStrings("changed file paths"),
 				"diff_summary": stringProp("one-line diff summary"),
 				"space":        stringProp("filter scoring to one space URI"),
-			}, []string{"task"}),
+			}, budgetProps), []string{"task"}),
 			Handler: func(args map[string]any) (any, error) {
 				task, _ := args["task"].(string)
 				if strings.TrimSpace(task) == "" {
-					return nil, errors.New("assess_change: task is required")
+					return nil, errors.New("assess_change: task required")
 				}
-				files := stringSliceArg(args, "files")
-				diff, _ := args["diff_summary"].(string)
-				space, _ := args["space"].(string)
 				return assess.Change(s.conn, assess.ChangeRequest{
 					Task:         task,
-					ChangedFiles: files,
-					DiffSummary:  diff,
-					Space:        space,
+					ChangedFiles: stringSliceArg(args, "files"),
+					DiffSummary:  stringArg(args, "diff_summary"),
+					Space:        stringArg(args, "space"),
 					Window:       30 * 24 * time.Hour,
-					Budget:       types.Budget{MaxResponseTokens: 1200, Shape: types.ShapeCitedSpans},
+					Budget:       types.Budget{MaxResponseTokens: intArg(args, "max_tokens", 800), Shape: types.ShapeCitedSpans},
 				})
 			},
 		},
 		{
-			Name:        "hypha_spaces_list",
-			Description: "List installed spaces under $HYPHAE_HOME/spaces.",
-			InputSchema: schema(map[string]any{}, nil),
+			Name:             "hypha_assess_pr",
+			Description:      "Alignment scoring for a PR: derives files + diff-summary from git base...HEAD.",
+			DefaultMaxTokens: 800,
+			InputSchema: schema(merge(map[string]any{
+				"task":   stringProp("PR description"),
+				"base":   stringProp("git base ref (default origin/main)"),
+				"source": stringProp("source repo path (default cwd)"),
+				"space":  stringProp("filter scoring to one space URI"),
+			}, budgetProps), []string{"task"}),
+			Handler: func(args map[string]any) (any, error) {
+				task, _ := args["task"].(string)
+				if strings.TrimSpace(task) == "" {
+					return nil, errors.New("assess_pr: task required")
+				}
+				base := stringArg(args, "base")
+				if base == "" {
+					base = "origin/main"
+				}
+				return assessPR(s.conn, s.installRoot, task, base, stringArg(args, "source"), stringArg(args, "space"), intArg(args, "max_tokens", 800))
+			},
+		},
+		{
+			Name:             "hypha_spaces_list",
+			Description:      "List installed spaces under $HYPHAE_HOME/spaces.",
+			DefaultMaxTokens: 600,
+			InputSchema:      schema(budgetProps, nil),
 			Handler: func(_ map[string]any) (any, error) {
 				return listSpaces(s.installRoot)
 			},
 		},
 		{
-			Name: "hypha_graph_backlinks",
-			Description: "Edges pointing AT this object. Walks the typed graph table.",
-			InputSchema: schema(map[string]any{
-				"object_id": stringProp("hypha:// URI or bare object id"),
-				"kind":      stringProp("comma-separated edge kinds to filter"),
+			Name:             "hypha_graph_backlinks",
+			Description:      "Edges pointing AT object_id.",
+			DefaultMaxTokens: 800,
+			InputSchema: schema(merge(map[string]any{
+				"object_id": stringProp("hypha:// URI or bare id"),
+				"kind":      stringProp("CSV of edge kinds"),
 				"limit":     numberProp("max results (default 50)"),
-			}, []string{"object_id"}),
+			}, budgetProps), []string{"object_id"}),
 			Handler: func(args map[string]any) (any, error) {
 				id, _ := args["object_id"].(string)
 				if id == "" {
@@ -153,13 +210,14 @@ func buildTools(s *Server) []toolSpec {
 			},
 		},
 		{
-			Name: "hypha_graph_related",
-			Description: "Edges incident on this object (in or out).",
-			InputSchema: schema(map[string]any{
-				"object_id": stringProp("hypha:// URI or bare object id"),
-				"kind":      stringProp("comma-separated edge kinds to filter"),
+			Name:             "hypha_graph_related",
+			Description:      "Edges incident on object_id (in or out).",
+			DefaultMaxTokens: 800,
+			InputSchema: schema(merge(map[string]any{
+				"object_id": stringProp("hypha:// URI or bare id"),
+				"kind":      stringProp("CSV of edge kinds"),
 				"limit":     numberProp("max results (default 50)"),
-			}, []string{"object_id"}),
+			}, budgetProps), []string{"object_id"}),
 			Handler: func(args map[string]any) (any, error) {
 				id, _ := args["object_id"].(string)
 				if id == "" {
@@ -169,62 +227,97 @@ func buildTools(s *Server) []toolSpec {
 			},
 		},
 		{
-			Name: "hypha_graph_trace",
-			Description: "BFS the derivation/citation chain from an object.",
-			InputSchema: schema(map[string]any{
-				"object_id": stringProp("hypha:// URI or bare object id"),
-				"kind":      stringProp("comma-separated edge kinds to follow (default derived_from,cites,source_ref)"),
+			Name:             "hypha_graph_trace",
+			Description:      "BFS the derivation/citation chain from object_id.",
+			DefaultMaxTokens: 800,
+			InputSchema: schema(merge(map[string]any{
+				"object_id": stringProp("hypha:// URI or bare id"),
+				"kind":      stringProp("CSV of edge kinds (default derived_from,cites,source_ref)"),
 				"max_depth": numberProp("max BFS depth (default 4)"),
-			}, []string{"object_id"}),
+			}, budgetProps), []string{"object_id"}),
 			Handler: func(args map[string]any) (any, error) {
 				id, _ := args["object_id"].(string)
 				if id == "" {
 					return nil, errors.New("graph_trace: object_id required")
 				}
-				kind := stringArg(args, "kind")
-				if kind == "" {
-					kind = "derived_from,cites,source_ref"
+				k := stringArg(args, "kind")
+				if k == "" {
+					k = "derived_from,cites,source_ref"
 				}
-				return graph.Trace(s.conn, id, parseEdgeKinds(kind), intArg(args, "max_depth", 4))
+				return graph.Trace(s.conn, id, parseEdgeKinds(k), intArg(args, "max_depth", 4))
 			},
 		},
 		{
-			Name: "hypha_spore_list",
-			Description: "List inbox spores across installed spaces.",
-			InputSchema: schema(map[string]any{
+			Name:             "hypha_identity_list",
+			Description:      "List local identities under $HYPHAE_HOME/.catalog/identities.",
+			DefaultMaxTokens: 400,
+			InputSchema:      schema(budgetProps, nil),
+			Handler: func(_ map[string]any) (any, error) {
+				return identity.List(filepath.Join(s.installRoot, ".catalog", "identities"))
+			},
+		},
+		{
+			Name:             "hypha_spore_list",
+			Description:      "List inbox spores across spaces.",
+			DefaultMaxTokens: 800,
+			InputSchema: schema(merge(map[string]any{
 				"space":  stringProp("filter by space URI"),
-				"status": stringProp("filter by status (unreviewed, accepted, rejected, …)"),
+				"status": stringProp("filter by status"),
 				"limit":  numberProp("max results (default 50)"),
-			}, nil),
+			}, budgetProps), nil),
 			Handler: func(args map[string]any) (any, error) {
 				return sporeList(s.installRoot, stringArg(args, "space"), stringArg(args, "status"), intArg(args, "limit", 50))
 			},
 		},
 		{
-			Name: "hypha_trace_list",
-			Description: "List in-flight or recently-closed traces.",
-			InputSchema: schema(map[string]any{
+			Name:             "hypha_trace_list",
+			Description:      "List traces; active=true narrows to open.",
+			DefaultMaxTokens: 800,
+			InputSchema: schema(merge(map[string]any{
 				"space":  stringProp("filter by space URI"),
 				"agent":  stringProp("exact agent URI match"),
-				"active": boolProp("only currently-open traces"),
-			}, nil),
+				"active": boolProp("only open traces"),
+			}, budgetProps), nil),
 			Handler: func(args map[string]any) (any, error) {
-				space := stringArg(args, "space")
-				agent := stringArg(args, "agent")
 				active, _ := args["active"].(bool)
-				return traceList(s.installRoot, space, agent, active)
+				return traceList(s.installRoot, stringArg(args, "space"), stringArg(args, "agent"), active)
 			},
 		},
 		{
-			Name: "hypha_receipts_list",
-			Description: "Query the local audit log.",
-			InputSchema: schema(map[string]any{
+			Name:             "hypha_trace_history",
+			Description:      "FTS5 search of closed traces (methodology recall).",
+			DefaultMaxTokens: 800,
+			InputSchema: schema(merge(map[string]any{
+				"similar":      stringProp("free-text query against trace bodies"),
+				"task":         stringProp("filter to traces with this task_ref"),
+				"agent":        stringProp("filter to this agent URI"),
+				"include_open": boolProp("include currently-open traces"),
+				"limit":        numberProp("max results (default 10)"),
+				"space":        stringProp("filter by space URI"),
+			}, budgetProps), nil),
+			Handler: func(args map[string]any) (any, error) {
+				includeOpen, _ := args["include_open"].(bool)
+				return traceHistory(s.conn, s.installRoot, traceHistoryArgs{
+					Similar:     stringArg(args, "similar"),
+					Task:        stringArg(args, "task"),
+					Agent:       stringArg(args, "agent"),
+					Space:       stringArg(args, "space"),
+					IncludeOpen: includeOpen,
+					Limit:       intArg(args, "limit", 10),
+				})
+			},
+		},
+		{
+			Name:             "hypha_receipts_list",
+			Description:      "Local audit log query.",
+			DefaultMaxTokens: 800,
+			InputSchema: schema(merge(map[string]any{
 				"space":   stringProp("filter by space URI"),
 				"subject": stringProp("filter by subject id"),
-				"action":  stringProp("filter by action (e.g. spore:create, graft, cap:issue)"),
-				"since":   stringProp("Go duration; receipts within the last N units"),
+				"action":  stringProp("filter by action"),
+				"since":   stringProp("Go duration; receipts within last N units"),
 				"limit":   numberProp("max results (default 50)"),
-			}, nil),
+			}, budgetProps), nil),
 			Handler: func(args map[string]any) (any, error) {
 				var sinceT time.Time
 				if since := stringArg(args, "since"); since != "" {
@@ -244,13 +337,14 @@ func buildTools(s *Server) []toolSpec {
 			},
 		},
 		{
-			Name: "hypha_analyze_list",
-			Description: "List cached canopy code-intelligence analyses across spaces.",
-			InputSchema: schema(map[string]any{
+			Name:             "hypha_analyze_list",
+			Description:      "List cached canopy analyses across spaces.",
+			DefaultMaxTokens: 800,
+			InputSchema: schema(merge(map[string]any{
 				"kind":        stringProp("filter by kind (impact|callgraph|refs|hotspot|dead|review)"),
 				"target_file": stringProp("filter analyses whose target_files include this path"),
 				"space":       stringProp("filter by space URI"),
-			}, nil),
+			}, budgetProps), nil),
 			Handler: func(args map[string]any) (any, error) {
 				return analyzeList(s.installRoot, stringArg(args, "kind"), stringArg(args, "target_file"), stringArg(args, "space"))
 			},
@@ -267,6 +361,17 @@ func schema(props map[string]any, required []string) map[string]any {
 	}
 	if len(required) > 0 {
 		out["required"] = required
+	}
+	return out
+}
+
+func merge(a, b map[string]any) map[string]any {
+	out := make(map[string]any, len(a)+len(b))
+	for k, v := range a {
+		out[k] = v
+	}
+	for k, v := range b {
+		out[k] = v
 	}
 	return out
 }

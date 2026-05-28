@@ -20,10 +20,15 @@ const (
 	// FormatCompact renders the full Envelope as single-line JSON using
 	// the documented short-key map. Same data as FormatJSON.
 	FormatCompact
+	// FormatJSONLine is single-line full-key JSON — no indentation,
+	// but every key spelled out. The sweet spot for callers that need
+	// machine-readable output without paying the indentation tax or
+	// learning the compact key map. Used by the MCP server.
+	FormatJSONLine
 )
 
 // String returns the user-facing name of the format ("text", "json",
-// "compact").
+// "compact", "jsonline").
 func (f Format) String() string {
 	switch f {
 	case FormatText:
@@ -32,14 +37,15 @@ func (f Format) String() string {
 		return "json"
 	case FormatCompact:
 		return "compact"
+	case FormatJSONLine:
+		return "jsonline"
 	default:
 		return fmt.Sprintf("format(%d)", int(f))
 	}
 }
 
 // ParseFormat resolves a user-supplied format name. Empty string returns
-// the auto-detected default. Legacy aliases "json" stays json; an explicit
-// "compact" selects compact.
+// the auto-detected default.
 func ParseFormat(s string) (Format, error) {
 	switch strings.ToLower(strings.TrimSpace(s)) {
 	case "":
@@ -50,8 +56,10 @@ func ParseFormat(s string) (Format, error) {
 		return FormatJSON, nil
 	case "compact":
 		return FormatCompact, nil
+	case "jsonline", "json-line", "line":
+		return FormatJSONLine, nil
 	default:
-		return FormatText, fmt.Errorf("unknown --format %q (expected text|json|compact)", s)
+		return FormatText, fmt.Errorf("unknown --format %q (expected text|json|compact|jsonline)", s)
 	}
 }
 

@@ -16,8 +16,6 @@ import (
 	"fmt"
 	"io"
 	"os"
-
-	"m31labs.dev/hyphae/internal/envelope"
 )
 
 // ProtocolVersion is the MCP version this server advertises.
@@ -182,14 +180,15 @@ func (s *Server) handleToolCall(req rpcRequest) {
 		return
 	}
 
-	// Tool responses are always wrapped in the hyphae envelope (compact-
-	// shape data with full keys) so the client gets the same machine-
-	// readable contract as the CLI's --format json.
-	env := envelope.New(p.Name, data)
-	raw, _ := json.MarshalIndent(env, "", "  ")
+	// Token-conscious response: single-line full-key JSON envelope by
+	// default; callers can opt into compact (short-key) via the per-tool
+	// `format` arg. Lists get budget-aware row trimming with a TRUNCATED
+	// warning when the cap kicks in.
+	opts := optsFromArgs(p.Arguments, spec.DefaultMaxTokens)
+	text := render(p.Name, data, opts)
 	s.reply(req.ID, map[string]any{
 		"content": []any{
-			map[string]any{"type": "text", "text": string(raw)},
+			map[string]any{"type": "text", "text": text},
 		},
 	})
 }
