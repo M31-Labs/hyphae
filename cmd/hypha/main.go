@@ -84,6 +84,8 @@ Usage:
                        kinds: impact, callgraph, refs, hotspot, dead, review
   hypha analyze  list   [--kind <k>] [--space <uri>] [--target-file <path>] [--format text|json|compact]
   hypha analyze  refresh <id> [--space <uri>] [--source <path>]
+  hypha db       history  --space <uri> [--limit N] [--format text|json|compact]
+  hypha db       compact  --space <uri> [--format text|json|compact]
   hypha receipts list   [--space <uri>] [--subject <uri>] [--action <name>] [--since 24h] [--limit N] [--format text|json|compact]
   hypha mcp      serve                              MCP stdio server (JSON-RPC 2.0; read-only tools)
 
@@ -177,11 +179,125 @@ func run(args []string) error {
 		return cmdTrace(rest)
 	case "analyze":
 		return cmdAnalyze(rest)
+	case "db":
+		return cmdDB(rest)
 	case "mcp":
 		return cmdMCP(rest)
 	default:
 		return fmt.Errorf("unknown command %q (try `hypha help`)", group)
 	}
+}
+
+// --- db --------------------------------------------------------------------
+
+func cmdDB(args []string) error {
+	if len(args) == 0 {
+		return errors.New("usage: hypha db history|compact [...]")
+	}
+	switch args[0] {
+	case "history":
+		return cmdDBHistory(args[1:])
+	case "compact":
+		return cmdDBCompact(args[1:])
+	default:
+		return fmt.Errorf("unknown db subcommand %q (try `history`, `compact`)", args[0])
+	}
+}
+
+func cmdDBHistory(args []string) error {
+	fs := flag.NewFlagSet("db history", flag.ContinueOnError)
+	spaceFlag := fs.String("space", "", "space URI (required)")
+	limit := fs.Int("limit", 50, "max rows (0 = all)")
+	format := formatFlag(fs)
+	if err := fs.Parse(reorderFlagsFirst(args)); err != nil {
+		return err
+	}
+	if *spaceFlag == "" {
+		return errors.New("--space <uri> is required")
+	}
+	root, err := resolveRoot("")
+	if err != nil {
+		return err
+	}
+	sh, err := crdtshadow.Default.Get(mustResolveSpace(root, *spaceFlag), *spaceFlag)
+	if err != nil {
+		return err
+	}
+	rows, err := sh.Store().History(*limit)
+	if err != nil {
+		return err
+	}
+	heads, _ := sh.Store().Heads()
+	count, _ := sh.Store().CountChanges()
+	payload := map[string]any{
+		"space":         *spaceFlag,
+		"db":            sh.DBPath(),
+		"total_changes": count,
+		"heads":         heads,
+		"rows":          rows,
+	}
+	return emit("db history", payload, *format, func(w io.Writer, _ any) error {
+		fmt.Fprintf(w, "Space: %s  (%d change(s) total)\n", *spaceFlag, count)
+		fmt.Fprintf(w, "  db:    %s\n", sh.DBPath())
+		fmt.Fprintf(w, "  heads: %s\n", strings.Join(heads, ", "))
+		if len(rows) == 0 {
+			fmt.Fprintln(w, "  (no changes)")
+			return nil
+		}
+		fmt.Fprintln(w)
+		for _, r := range rows {
+			short := r.Hash
+			if len(short) > 12 {
+				short = short[:12]
+			}
+			fmt.Fprintf(w, "  %s  %s  %s  seq=%d  %s\n",
+				r.Time.Format(time.RFC3339), short, r.ActorID[:min(8, len(r.ActorID))], r.Seq, r.Message)
+		}
+		return nil
+	})
+}
+
+func cmdDBCompact(args []string) error {
+	fs := flag.NewFlagSet("db compact", flag.ContinueOnError)
+	spaceFlag := fs.String("space", "", "space URI (required)")
+	format := formatFlag(fs)
+	if err := fs.Parse(reorderFlagsFirst(args)); err != nil {
+		return err
+	}
+	if *spaceFlag == "" {
+		return errors.New("--space <uri> is required")
+	}
+	root, err := resolveRoot("")
+	if err != nil {
+		return err
+	}
+	sh, err := crdtshadow.Default.Get(mustResolveSpace(root, *spaceFlag), *spaceFlag)
+	if err != nil {
+		return err
+	}
+	if err := sh.Store().Compact(sh.Doc()); err != nil {
+		return err
+	}
+	snapshots, _ := sh.Store().CountSnapshots()
+	payload := map[string]any{
+		"space":     *spaceFlag,
+		"db":        sh.DBPath(),
+		"snapshots": snapshots,
+	}
+	return emit("db compact", payload, *format, func(w io.Writer, _ any) error {
+		fmt.Fprintf(w, "Compacted %s\n", *spaceFlag)
+		fmt.Fprintf(w, "  db:        %s\n", sh.DBPath())
+		fmt.Fprintf(w, "  snapshots: %d\n", snapshots)
+		return nil
+	})
+}
+
+func mustResolveSpace(installRoot, spaceURI string) string {
+	p, err := crdtshadow.SpaceURIToPath(installRoot, spaceURI)
+	if err != nil {
+		return filepath.Join(installRoot, "spaces", "unknown")
+	}
+	return p
 }
 
 // --- mcp -------------------------------------------------------------------

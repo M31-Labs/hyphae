@@ -25,11 +25,12 @@ package crdtshadow
 import (
 	"encoding/json"
 	"fmt"
+	"os"
 	"path/filepath"
 	"sync"
 
 	"m31labs.dev/gosx/crdt"
-	"m31labs.dev/hyphae/internal/atomicfs"
+	"m31labs.dev/hyphae/internal/crdtdb"
 	"m31labs.dev/hyphae/internal/types"
 )
 
@@ -42,10 +43,16 @@ const (
 	keyCanonical = "canonical"
 )
 
-// SnapshotFilename is the per-space file under <space-root> where the
-// Doc snapshot lives in Phase 1. Phase 2 replaces this with a SQLite
-// change log at <space-root>/.crdt.db.
-const SnapshotFilename = ".crdt.dat"
+// LegacySnapshotFilename is the Phase 1 per-space snapshot file. Kept
+// for one-time migration into the Phase 2 SQLite change log.
+const LegacySnapshotFilename = ".crdt.dat"
+
+// SnapshotFilename is the historical name still exported for tests
+// that introspect on-disk shape. New code should prefer DBFilename.
+const SnapshotFilename = LegacySnapshotFilename
+
+// DBFilename is the per-space append-only SQLite change log (Phase 2).
+const DBFilename = ".crdt.db"
 
 // Shadow owns one gosx Doc for one Hyphae space. Concurrent-safe.
 type Shadow struct {
@@ -53,7 +60,10 @@ type Shadow struct {
 	spaceRoot string
 	spaceID   string
 	doc       *crdt.Doc
-	snapPath  string
+	store     *crdtdb.Store
+	snapPath  string // legacy .crdt.dat path; retained for the migration
+	dbPath    string
+	closed    bool
 
 	// Cached ObjIDs for the top-level submaps. Populated by bootstrap().
 	receiptsObj  crdt.ObjID
@@ -67,26 +77,58 @@ type Shadow struct {
 // absolute directory of the space; spaceID is the canonical
 // hypha://authority/name URI.
 //
-// If <spaceRoot>/.crdt.dat exists, the snapshot is loaded; otherwise a
-// fresh Doc is created with a generated actor id.
+// Phase 2 persistence: the per-space change log lives at
+// <spaceRoot>/.crdt.db. A legacy <spaceRoot>/.crdt.dat snapshot from
+// Phase 1 is auto-migrated on first open and the .dat file removed.
 func Open(spaceRoot, spaceID string) (*Shadow, error) {
 	if spaceRoot == "" {
 		return nil, fmt.Errorf("crdtshadow: spaceRoot is required")
 	}
-	snap := filepath.Join(spaceRoot, SnapshotFilename)
 
-	doc, err := loadOrFresh(snap)
+	dbPath := filepath.Join(spaceRoot, DBFilename)
+	legacy := filepath.Join(spaceRoot, LegacySnapshotFilename)
+
+	store, err := crdtdb.Open(dbPath)
 	if err != nil {
 		return nil, err
+	}
+
+	doc := crdt.NewDoc()
+	if _, err := store.LoadAllInto(doc); err != nil {
+		_ = store.Close()
+		return nil, fmt.Errorf("crdtshadow: replay log: %w", err)
+	}
+
+	// One-time migration: if the legacy .dat exists, load it as a Doc,
+	// merge into the current Doc, append the merged changes into the
+	// store, then remove the .dat so the migration is idempotent.
+	if data, rerr := readIfExists(legacy); rerr == nil && data != nil {
+		legacyDoc, lerr := crdt.Load(data)
+		if lerr != nil {
+			_ = store.Close()
+			return nil, fmt.Errorf("crdtshadow: load legacy .dat: %w", lerr)
+		}
+		if err := doc.Merge(legacyDoc); err != nil {
+			_ = store.Close()
+			return nil, fmt.Errorf("crdtshadow: merge legacy: %w", err)
+		}
+		if _, err := store.AppendChangesFromDoc(doc); err != nil {
+			_ = store.Close()
+			return nil, fmt.Errorf("crdtshadow: persist legacy: %w", err)
+		}
+		_ = os.Remove(legacy) // best-effort; idempotent on next open
 	}
 
 	s := &Shadow{
 		spaceRoot: spaceRoot,
 		spaceID:   spaceID,
 		doc:       doc,
-		snapPath:  snap,
+		store:     store,
+		snapPath:  legacy,
+		dbPath:    dbPath,
 	}
 	if err := s.bootstrap(); err != nil {
+		_ = store.Close()
 		return nil, fmt.Errorf("crdtshadow: bootstrap: %w", err)
 	}
 	return s, nil
@@ -106,12 +148,32 @@ func (s *Shadow) SpaceID() string { return s.spaceID }
 // SpaceRoot returns the on-disk root this shadow tracks.
 func (s *Shadow) SpaceRoot() string { return s.spaceRoot }
 
-// SnapshotPath returns the absolute path of the persisted snapshot.
+// SnapshotPath returns the legacy .crdt.dat path. Kept for tests that
+// inspect on-disk shape; new code should prefer DBPath.
 func (s *Shadow) SnapshotPath() string { return s.snapPath }
 
-// Close flushes any pending commit and persists the snapshot.
+// DBPath returns the SQLite change-log path (<spaceRoot>/.crdt.db).
+func (s *Shadow) DBPath() string { return s.dbPath }
+
+// Store returns the underlying append-only change log for inspection
+// (history, heads, compaction). Read-only operations are safe; mutating
+// the store outside Shadow.Record* is not.
+func (s *Shadow) Store() *crdtdb.Store { return s.store }
+
+// Close persists pending state and closes the underlying DB handle.
+// Safe to call multiple times.
 func (s *Shadow) Close() error {
-	return s.persistLocked(true)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closed {
+		return nil
+	}
+	s.closed = true
+	if err := s.persistLocked(true); err != nil {
+		_ = s.store.Close()
+		return err
+	}
+	return s.store.Close()
 }
 
 // RecordReceipt mirrors a Receipt into the CRDT.
@@ -286,16 +348,15 @@ func (s *Shadow) readBlobLocked(parent crdt.ObjID, key string) ([]byte, bool) {
 	return append([]byte{}, val.Bytes...), true
 }
 
-// persistLocked saves the Doc snapshot to disk. Caller must hold s.mu.
-// In Phase 1 this is a full Save() on every record; Phase 2 swaps this
-// for the append-only SQLite change log.
+// persistLocked flushes any uncommitted ops to disk via the change log.
+// Caller must hold s.mu. Idempotent — appending an already-stored
+// change is a no-op (sync.State suppresses it).
 func (s *Shadow) persistLocked(_ bool) error {
-	data, err := s.doc.Save()
-	if err != nil {
-		return fmt.Errorf("crdtshadow: doc.Save: %w", err)
+	if s.store == nil {
+		return nil
 	}
-	if err := atomicfs.WriteFile(s.snapPath, data, 0o644); err != nil {
-		return fmt.Errorf("crdtshadow: write snapshot %s: %w", s.snapPath, err)
+	if _, err := s.store.AppendChangesFromDoc(s.doc); err != nil {
+		return fmt.Errorf("crdtshadow: append changes: %w", err)
 	}
 	return nil
 }
@@ -317,17 +378,3 @@ func getOrMakeMap(doc *crdt.Doc, parent crdt.ObjID, prop string) (crdt.ObjID, er
 	return newID, nil
 }
 
-func loadOrFresh(snapPath string) (*crdt.Doc, error) {
-	data, err := readIfExists(snapPath)
-	if err != nil {
-		return nil, fmt.Errorf("crdtshadow: read %s: %w", snapPath, err)
-	}
-	if data == nil {
-		return crdt.NewDoc(), nil
-	}
-	doc, err := crdt.Load(data)
-	if err != nil {
-		return nil, fmt.Errorf("crdtshadow: load snapshot %s: %w", snapPath, err)
-	}
-	return doc, nil
-}

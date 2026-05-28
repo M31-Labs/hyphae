@@ -93,7 +93,7 @@ func TestShadowRoundTripsAllRecorders(t *testing.T) {
 	}
 }
 
-func TestShadowSnapshotLandsOnDisk(t *testing.T) {
+func TestShadowChangeLogLandsOnDisk(t *testing.T) {
 	root := t.TempDir()
 	s, err := crdtshadow.Open(root, "hypha://test/space")
 	if err != nil {
@@ -103,12 +103,64 @@ func TestShadowSnapshotLandsOnDisk(t *testing.T) {
 		t.Fatalf("RecordReceipt: %v", err)
 	}
 
-	snap := s.SnapshotPath()
-	if !strings.HasSuffix(snap, crdtshadow.SnapshotFilename) {
-		t.Errorf("SnapshotPath = %q, want suffix %q", snap, crdtshadow.SnapshotFilename)
+	dbPath := s.DBPath()
+	if !strings.HasSuffix(dbPath, crdtshadow.DBFilename) {
+		t.Errorf("DBPath = %q, want suffix %q", dbPath, crdtshadow.DBFilename)
 	}
-	if data, err := readFile(snap); err != nil || len(data) == 0 {
-		t.Errorf("snapshot not written or empty (len=%d, err=%v)", len(data), err)
+	if data, err := readFile(dbPath); err != nil || len(data) == 0 {
+		t.Errorf("change log not written or empty (len=%d, err=%v)", len(data), err)
+	}
+	n, err := s.Store().CountChanges()
+	if err != nil {
+		t.Fatalf("CountChanges: %v", err)
+	}
+	if n < 1 {
+		t.Errorf("expected ≥1 change row after RecordReceipt, got %d", n)
+	}
+}
+
+func TestShadowMigratesLegacyDat(t *testing.T) {
+	root := t.TempDir()
+	// Build a Phase-1-style snapshot at .crdt.dat with one Map entry.
+	{
+		s, err := crdtshadow.Open(root, "hypha://test/legacy")
+		if err != nil {
+			t.Fatalf("seed Open: %v", err)
+		}
+		if err := s.RecordReceipt(types.Receipt{ID: "legacy-receipt", Action: "test"}); err != nil {
+			t.Fatalf("seed RecordReceipt: %v", err)
+		}
+		_ = s.Close()
+		// Now write a fake legacy .dat the migration must absorb. Use the
+		// store's current Doc state via the public Save() path.
+		// (For this test we'll simulate by reopening, exporting via Doc,
+		// and saving as .dat — exercises the migrate-on-open path.)
+	}
+	// At this point .crdt.db exists. Drop a .crdt.dat next to it to
+	// trigger migration on the next Open by saving the current Doc.
+	{
+		s2, err := crdtshadow.Open(root, "hypha://test/legacy")
+		if err != nil {
+			t.Fatalf("reopen for legacy snapshot creation: %v", err)
+		}
+		data, err := s2.Doc().Save()
+		if err != nil {
+			t.Fatalf("doc.Save: %v", err)
+		}
+		legacy := filepath.Join(root, crdtshadow.LegacySnapshotFilename)
+		if err := writeFile(legacy, data); err != nil {
+			t.Fatalf("write legacy: %v", err)
+		}
+		_ = s2.Close()
+	}
+	// Reopen — the migration should consume the .dat and remove it.
+	s3, err := crdtshadow.Open(root, "hypha://test/legacy")
+	if err != nil {
+		t.Fatalf("Open after legacy seed: %v", err)
+	}
+	defer s3.Close()
+	if _, err := readFile(filepath.Join(root, crdtshadow.LegacySnapshotFilename)); err == nil {
+		t.Errorf("legacy .crdt.dat was not removed after migration")
 	}
 }
 

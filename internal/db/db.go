@@ -44,17 +44,28 @@ func Root() (string, error) {
 // Open opens the SQLite DB at path (creating parent dirs as needed) and
 // runs the embedded schema migration. Safe to call repeatedly.
 func Open(path string) (*sql.DB, error) {
+	conn, err := OpenRaw(path)
+	if err != nil {
+		return nil, err
+	}
+	if err := Migrate(conn); err != nil {
+		_ = conn.Close()
+		return nil, err
+	}
+	return conn, nil
+}
+
+// OpenRaw opens the SQLite DB at path (creating parent dirs as needed)
+// without applying the canonical Hyphae index schema. Used by packages
+// (e.g. crdtdb) that own their own schema and just want a connection.
+func OpenRaw(path string) (*sql.DB, error) {
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
-		return nil, fmt.Errorf("hyphae/db: mkdir index dir: %w", err)
+		return nil, fmt.Errorf("hyphae/db: mkdir dir: %w", err)
 	}
 	dsn := fmt.Sprintf("file:%s?_pragma=foreign_keys(1)&_pragma=journal_mode(WAL)", path)
 	conn, err := sql.Open("sqlite", dsn)
 	if err != nil {
 		return nil, fmt.Errorf("hyphae/db: open sqlite: %w", err)
-	}
-	if err := Migrate(conn); err != nil {
-		_ = conn.Close()
-		return nil, err
 	}
 	return conn, nil
 }
