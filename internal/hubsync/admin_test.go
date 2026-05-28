@@ -146,7 +146,7 @@ func gatedAdmin(t *testing.T, logins ...string) (*http.ServeMux, *OAuth) {
 		t.Fatalf("db open: %v", err)
 	}
 	t.Cleanup(func() { conn.Close() })
-	o := NewOAuth(OAuthConfig{ClientID: "x", ClientSecret: "y", BaseURL: "https://hub.example", AdminLogins: logins})
+	o := NewOAuth(OAuthConfig{ClientID: "x", ClientSecret: "y", BaseURL: "https://hub.example", AdminLogins: logins, Store: conn})
 	srv := NewServer(root, crdtshadow.NewRegistry(), conn, false)
 	mux := http.NewServeMux()
 	NewAdmin(root, conn, srv, o).Mount(mux)
@@ -225,4 +225,61 @@ func reqWithCookie(path string, c *http.Cookie) *http.Request {
 	r := httptest.NewRequest(http.MethodGet, path, nil)
 	r.AddCookie(c)
 	return r
+}
+
+func TestOAuthAdmitsAnyone(t *testing.T) {
+	none := NewOAuth(OAuthConfig{ClientID: "x", ClientSecret: "y"})
+	if none.AdmitsAnyone() {
+		t.Error("no logins and no org should admit no one")
+	}
+	byLogin := NewOAuth(OAuthConfig{ClientID: "x", ClientSecret: "y", AdminLogins: []string{"alice"}})
+	if !byLogin.AdmitsAnyone() {
+		t.Error("an allowlist should admit someone")
+	}
+	byOrg := NewOAuth(OAuthConfig{ClientID: "x", ClientSecret: "y", AdminOrg: "m31labs"})
+	if !byOrg.AdmitsAnyone() {
+		t.Error("an org should admit someone")
+	}
+}
+
+// TestSessionSurvivesRestart proves DB-backed sessions persist across a
+// hub restart: a session minted by one OAuth instance is still valid when
+// looked up by a fresh instance sharing the same store.
+func TestSessionSurvivesRestart(t *testing.T) {
+	root := t.TempDir()
+	conn, err := db.Open(filepath.Join(root, "test.db"))
+	if err != nil {
+		t.Fatalf("db open: %v", err)
+	}
+	defer conn.Close()
+
+	before := NewOAuth(OAuthConfig{ClientID: "x", ClientSecret: "y", AdminLogins: []string{"alice"}, Store: conn})
+	rec := httptest.NewRecorder()
+	if !before.grantSession(rec, "alice") {
+		t.Fatal("grantSession failed")
+	}
+	cookie := rec.Result().Cookies()[0]
+
+	// Simulate a restart: brand-new OAuth over the same DB.
+	after := NewOAuth(OAuthConfig{ClientID: "x", ClientSecret: "y", AdminLogins: []string{"alice"}, Store: conn})
+	login, ok := after.sessionLogin(reqWithCookie("/admin", cookie))
+	if !ok || login != "alice" {
+		t.Fatalf("session lost across restart: login=%q ok=%v", login, ok)
+	}
+}
+
+func TestOrgScopeRequestedOnlyWhenConfigured(t *testing.T) {
+	withOrg := NewOAuth(OAuthConfig{ClientID: "x", ClientSecret: "y", AdminOrg: "m31labs"})
+	rec := httptest.NewRecorder()
+	withOrg.handleStart(rec, httptest.NewRequest(http.MethodGet, "/admin/oauth/github/start", nil))
+	if loc := rec.Header().Get("Location"); !strings.Contains(loc, "read%3Aorg") && !strings.Contains(loc, "read:org") {
+		t.Errorf("org-configured start should request read:org scope; Location=%q", loc)
+	}
+
+	noOrg := NewOAuth(OAuthConfig{ClientID: "x", ClientSecret: "y", AdminLogins: []string{"alice"}})
+	rec2 := httptest.NewRecorder()
+	noOrg.handleStart(rec2, httptest.NewRequest(http.MethodGet, "/admin/oauth/github/start", nil))
+	if loc := rec2.Header().Get("Location"); strings.Contains(loc, "read%3Aorg") || strings.Contains(loc, "read:org") {
+		t.Errorf("allowlist-only start should not request read:org; Location=%q", loc)
+	}
 }

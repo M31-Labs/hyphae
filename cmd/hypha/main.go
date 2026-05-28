@@ -70,7 +70,9 @@ Usage:
   hypha spore    list   [--space <uri>] [--status <state>] [--since 24h] [--limit N] [--format text|json|compact]
   hypha spore    accept <spore-id> --as <identity> [--reason "..."] [--space <uri>] [--format text|json|compact]
   hypha spore    reject <spore-id> --as <identity> [--reason "..."] [--space <uri>] [--format text|json|compact]
-  hypha cap      issue --subject <uri> --space <uri> [--permissions p1,p2] [--expires 24h] [--format text|json|compact]
+  hypha cap      issue  --subject <uri> --space <uri> [--permissions p1,p2] [--expires 24h] [--format text|json|compact]
+  hypha cap      revoke <token-id> [--format text|json|compact]
+  hypha cap      list   [--space <uri>] [--include-revoked] [--format text|json|compact]
   hypha identity init --name <name> --authority <auth> --space <uri> [--expires 1y] [--format text|json|compact]
   hypha identity list [--format text|json|compact]
   hypha graft    <spore-id> --as <identity-uri> [--space <hypha-uri>] [--verify] [--no-fmt] [--dry-run] [--diff] [--apply] [--format text|json|compact]
@@ -125,7 +127,10 @@ Environment:
                                admin UI behind GitHub login.
   HYPHAE_GITHUB_CLIENT_SECRET  GitHub OAuth app client secret
   HYPHAE_ADMIN_LOGINS          comma-separated GitHub logins allowed admin
-                               access (empty = no one); required for the gate
+                               access; combine with HYPHAE_ADMIN_ORG
+  HYPHAE_ADMIN_ORG             GitHub org whose members get admin access
+                               (requested with read:org). Set logins and/or
+                               org; with neither, the gate admits no one
 `
 
 func main() {
@@ -651,6 +656,8 @@ func cmdHubServe(args []string) error {
 			ClientSecret: os.Getenv("HYPHAE_GITHUB_CLIENT_SECRET"),
 			BaseURL:      *baseURL,
 			AdminLogins:  splitCSV(os.Getenv("HYPHAE_ADMIN_LOGINS")),
+			AdminOrg:     strings.TrimSpace(os.Getenv("HYPHAE_ADMIN_ORG")),
+			Store:        authConn, // persist sessions across hub restarts
 		})
 		// OAuth needs a base URL for its callback; disable it (the admin
 		// surface then runs ungated, local-only) if one wasn't provided.
@@ -658,8 +665,8 @@ func cmdHubServe(args []string) error {
 			fmt.Fprintln(os.Stderr, "hub: GitHub OAuth env set but --base-url missing; OAuth gate disabled (admin is ungated — bind 127.0.0.1 only)")
 			oauth = nil
 		}
-		if oauth != nil && oauth.AllowedCount() == 0 {
-			fmt.Fprintln(os.Stderr, "hub: warning: GitHub OAuth gate enabled but HYPHAE_ADMIN_LOGINS is empty — no one will be granted admin access")
+		if oauth != nil && !oauth.AdmitsAnyone() {
+			fmt.Fprintln(os.Stderr, "hub: warning: GitHub OAuth gate enabled but neither HYPHAE_ADMIN_LOGINS nor HYPHAE_ADMIN_ORG is set — no one will be granted admin access")
 		}
 		oauthEnabled = oauth != nil
 		hubsync.NewAdmin(root, authConn, srv, oauth).Mount(srv.Mux())
@@ -2034,12 +2041,25 @@ func spaceMatches(sp spaceEntry, filter string) bool {
 	return sp.URI == f || sp.URI == filter
 }
 
-// --- cap issue --------------------------------------------------------------
+// --- cap issue|revoke|list --------------------------------------------------
 
 func cmdCap(args []string) error {
-	if len(args) == 0 || args[0] != "issue" {
-		return errors.New("usage: hypha cap issue --subject <uri> --space <uri> [--permissions p1,p2] [--expires 24h]")
+	if len(args) == 0 {
+		return errors.New("usage: hypha cap issue|revoke|list ...")
 	}
+	switch args[0] {
+	case "issue":
+		return cmdCapIssue(args[1:])
+	case "revoke":
+		return cmdCapRevoke(args[1:])
+	case "list":
+		return cmdCapList(args[1:])
+	default:
+		return fmt.Errorf("unknown cap subcommand %q (want issue|revoke|list)", args[0])
+	}
+}
+
+func cmdCapIssue(args []string) error {
 	fs := flag.NewFlagSet("cap issue", flag.ContinueOnError)
 	subject := fs.String("subject", "", "identity URI for the token subject")
 	space := fs.String("space", "", "hypha:// URI of the target space")
@@ -2050,13 +2070,13 @@ func cmdCap(args []string) error {
 	maxSpores := fs.Int("max-spores", 3, "limits.max_spores")
 	maxBytes := fs.Int("max-bytes", 200000, "limits.max_bytes")
 	format := formatFlag(fs)
-	if err := fs.Parse(args[1:]); err != nil {
+	if err := fs.Parse(args); err != nil {
 		return err
 	}
 	if *subject == "" || *space == "" {
 		return errors.New("--subject and --space are required")
 	}
-	expires, err := time.ParseDuration(*expiresFlag)
+	expires, err := parseFlexDuration(*expiresFlag)
 	if err != nil {
 		return fmt.Errorf("--expires %q: %w", *expiresFlag, err)
 	}
@@ -2115,6 +2135,105 @@ func cmdCap(args []string) error {
 		fmt.Fprintf(w, "  Expires:   %s\n", cap.ExpiresAt.Format(time.RFC3339))
 		return nil
 	})
+}
+
+func cmdCapRevoke(args []string) error {
+	fs := flag.NewFlagSet("cap revoke", flag.ContinueOnError)
+	format := formatFlag(fs)
+	if err := fs.Parse(reorderFlagsFirst(args)); err != nil {
+		return err
+	}
+	rest := fs.Args()
+	if len(rest) != 1 || strings.TrimSpace(rest[0]) == "" {
+		return errors.New("usage: hypha cap revoke <token-id>")
+	}
+	token := strings.TrimSpace(rest[0])
+
+	root, err := resolveRoot("")
+	if err != nil {
+		return err
+	}
+	conn, err := db.Open(filepath.Join(root, ".index", "hyphae.db"))
+	if err != nil {
+		return err
+	}
+	defer conn.Close()
+
+	// Capture the subject/space for the receipt before revoking.
+	subject, spaceID := "", ""
+	if c, vErr := capability.Verify(conn, token); vErr == nil {
+		subject, spaceID = c.Subject, c.SpaceID
+	}
+	if err := capability.Revoke(conn, token); err != nil {
+		return err
+	}
+
+	rcpt := types.Receipt{
+		ID:              "hypha-receipt:" + time.Now().UTC().Format("2006-01-02") + ":caprevoke-" + token,
+		SpaceID:         spaceID,
+		SubjectID:       subject,
+		SubjectKind:     "agent",
+		Action:          "cap:revoke",
+		Status:          "revoked",
+		CreatedAt:       time.Now().UTC(),
+		PermissionsUsed: []string{"permission:grant"},
+		NextState:       "revoked",
+	}
+	if wErr := receipts.Write(conn, rcpt); wErr != nil && !errors.Is(wErr, receipts.ErrAlreadyExists) {
+		fmt.Fprintf(os.Stderr, "warn: failed to persist cap:revoke receipt: %v\n", wErr)
+	}
+	crdtshadow.MirrorReceipt(root, rcpt)
+
+	return emit("cap revoke", map[string]any{"token": token, "revoked": true}, *format,
+		func(w io.Writer, _ any) error {
+			fmt.Fprintf(w, "Revoked: %s\n", token)
+			return nil
+		})
+}
+
+func cmdCapList(args []string) error {
+	fs := flag.NewFlagSet("cap list", flag.ContinueOnError)
+	space := fs.String("space", "", "filter to a single space URI")
+	includeRevoked := fs.Bool("include-revoked", false, "include revoked tokens")
+	format := formatFlag(fs)
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+
+	root, err := resolveRoot("")
+	if err != nil {
+		return err
+	}
+	conn, err := db.Open(filepath.Join(root, ".index", "hyphae.db"))
+	if err != nil {
+		return err
+	}
+	defer conn.Close()
+
+	caps, err := capability.List(conn, *space, *includeRevoked)
+	if err != nil {
+		return err
+	}
+
+	return emit("cap list", map[string]any{"capabilities": caps, "count": len(caps)}, *format,
+		func(w io.Writer, _ any) error {
+			if len(caps) == 0 {
+				fmt.Fprintln(w, "No capabilities.")
+				return nil
+			}
+			for _, c := range caps {
+				status := "active"
+				switch {
+				case c.RevokedAt != nil:
+					status = "revoked"
+				case time.Now().After(c.ExpiresAt):
+					status = "expired"
+				}
+				fmt.Fprintf(w, "%s  %-28s  %s  [%s]  %s\n",
+					c.ID, c.Subject, c.SpaceID, strings.Join(c.Permissions, ","), status)
+			}
+			return nil
+		})
 }
 
 // --- identity --------------------------------------------------------------

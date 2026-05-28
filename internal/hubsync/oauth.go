@@ -2,6 +2,7 @@ package hubsync
 
 import (
 	"crypto/rand"
+	"database/sql"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -35,11 +36,13 @@ type OAuth struct {
 	clientSecret string
 	baseURL      string          // public base URL of this hub, e.g. https://hub.example
 	allow        map[string]bool // lowercased GitHub logins permitted admin access
+	org          string          // optional GitHub org; members get admin access
 	secureCookie bool            // set the Secure cookie flag (true when baseURL is https)
 
-	mu       sync.Mutex
-	states   map[string]time.Time // CSRF state → expiry
-	sessions map[string]session   // session token → login + expiry
+	sessions sessionStore // persists admin sessions across restarts when DB-backed
+
+	mu     sync.Mutex
+	states map[string]time.Time // CSRF state → expiry (in-memory; fine to lose on restart)
 
 	httpClient *http.Client
 }
@@ -57,12 +60,17 @@ const (
 
 // OAuthConfig configures the GitHub gate. ClientID and ClientSecret are
 // required (NewOAuth returns nil without them). AdminLogins is the set of
-// GitHub usernames allowed admin access; an empty list denies everyone.
+// GitHub usernames allowed admin access; AdminOrg, when set, additionally
+// grants access to any member of that GitHub org. With neither, no one is
+// granted access. Store, when non-nil, persists sessions across restarts
+// (otherwise sessions are in-memory).
 type OAuthConfig struct {
 	ClientID     string
 	ClientSecret string
 	BaseURL      string
 	AdminLogins  []string
+	AdminOrg     string
+	Store        *sql.DB
 }
 
 // NewOAuth builds the gate. Returns nil when ClientID or ClientSecret
@@ -77,15 +85,22 @@ func NewOAuth(cfg OAuthConfig) *OAuth {
 			allow[l] = true
 		}
 	}
+	var store sessionStore
+	if cfg.Store != nil {
+		store = dbSessionStore{conn: cfg.Store}
+	} else {
+		store = newMemSessionStore()
+	}
 	baseURL := strings.TrimRight(cfg.BaseURL, "/")
 	return &OAuth{
 		clientID:     cfg.ClientID,
 		clientSecret: cfg.ClientSecret,
 		baseURL:      baseURL,
 		allow:        allow,
+		org:          strings.TrimSpace(cfg.AdminOrg),
 		secureCookie: strings.HasPrefix(baseURL, "https://"),
+		sessions:     store,
 		states:       make(map[string]time.Time),
-		sessions:     make(map[string]session),
 		httpClient:   &http.Client{Timeout: 15 * time.Second},
 	}
 }
@@ -93,6 +108,11 @@ func NewOAuth(cfg OAuthConfig) *OAuth {
 // AllowedCount reports how many logins are on the admin allowlist. Zero
 // means no one can be granted access (a likely misconfiguration).
 func (o *OAuth) AllowedCount() int { return len(o.allow) }
+
+// AdmitsAnyone reports whether the gate can grant access to at least one
+// principal — i.e. the allowlist is non-empty or an org is configured.
+// When false, the gate is a locked door with no key (a misconfiguration).
+func (o *OAuth) AdmitsAnyone() bool { return len(o.allow) > 0 || o.org != "" }
 
 // Mount registers the OAuth routes (these are never gated, or login
 // would redirect-loop).
@@ -116,10 +136,16 @@ func (o *OAuth) Guard(next http.HandlerFunc) http.HandlerFunc {
 
 func (o *OAuth) handleStart(w http.ResponseWriter, r *http.Request) {
 	state := o.newState()
+	// read:org is only requested when org-based access is configured, so
+	// allowlist-only deployments keep the minimal read:user consent screen.
+	scope := "read:user"
+	if o.org != "" {
+		scope = "read:user read:org"
+	}
 	q := url.Values{}
 	q.Set("client_id", o.clientID)
 	q.Set("redirect_uri", o.baseURL+"/admin/oauth/github/callback")
-	q.Set("scope", "read:user")
+	q.Set("scope", scope)
 	q.Set("state", state)
 	http.Redirect(w, r, "https://github.com/login/oauth/authorize?"+q.Encode(), http.StatusSeeOther)
 }
@@ -141,22 +167,43 @@ func (o *OAuth) handleCallback(w http.ResponseWriter, r *http.Request) {
 		pageStatus(w, http.StatusBadGateway, "GitHub login", `<p class="err">fetch user failed: `+html.EscapeString(err.Error())+`</p>`)
 		return
 	}
-	if !o.allow[strings.ToLower(login)] {
+	if !o.authorized(token, login) {
 		pageStatus(w, http.StatusForbidden, "Access denied", fmt.Sprintf(
-			`<p class="err">GitHub user <code>%s</code> is not on the admin allowlist.</p>`+
-				`<p class="muted">Ask an operator to add you to <code>HYPHAE_ADMIN_LOGINS</code>.</p>`,
-			html.EscapeString(login)))
+			`<p class="err">GitHub user <code>%s</code> is not permitted admin access.</p>`+
+				`<p class="muted">Ask an operator to add you to <code>HYPHAE_ADMIN_LOGINS</code>`+
+				`%s.</p>`,
+			html.EscapeString(login), o.orgHint()))
 		return
 	}
-	o.grantSession(w, login)
+	if !o.grantSession(w, login) {
+		return // grantSession already wrote an error response
+	}
 	http.Redirect(w, r, "/admin", http.StatusSeeOther)
+}
+
+// authorized reports whether a successfully-authenticated GitHub login may
+// access the admin surface: it is on the allowlist, or (when an org is
+// configured) it is an active member of that org.
+func (o *OAuth) authorized(token, login string) bool {
+	if o.allow[strings.ToLower(login)] {
+		return true
+	}
+	if o.org != "" {
+		return o.isOrgMember(token)
+	}
+	return false
+}
+
+func (o *OAuth) orgHint() string {
+	if o.org == "" {
+		return ""
+	}
+	return ` or to the <code>` + html.EscapeString(o.org) + `</code> GitHub org`
 }
 
 func (o *OAuth) handleLogout(w http.ResponseWriter, r *http.Request) {
 	if c, err := r.Cookie(sessionCookie); err == nil {
-		o.mu.Lock()
-		delete(o.sessions, c.Value)
-		o.mu.Unlock()
+		o.sessions.drop(c.Value)
 	}
 	http.SetCookie(w, &http.Cookie{
 		Name: sessionCookie, Value: "", Path: "/admin",
@@ -167,17 +214,21 @@ func (o *OAuth) handleLogout(w http.ResponseWriter, r *http.Request) {
 
 // ─── sessions ─────────────────────────────────────────────────────────────
 
-func (o *OAuth) grantSession(w http.ResponseWriter, login string) {
+// grantSession mints a session, persists it, and sets the cookie. Returns
+// false (after writing an error response) if the session could not be
+// persisted, so the caller must not also write to w.
+func (o *OAuth) grantSession(w http.ResponseWriter, login string) bool {
 	tok := randToken()
-	o.mu.Lock()
-	o.sessions[tok] = session{login: login, exp: time.Now().Add(sessionTTL)}
-	o.gcSessionsLocked()
-	o.mu.Unlock()
+	if err := o.sessions.create(tok, login, time.Now().Add(sessionTTL)); err != nil {
+		http.Error(w, "could not establish session", http.StatusInternalServerError)
+		return false
+	}
 	http.SetCookie(w, &http.Cookie{
 		Name: sessionCookie, Value: tok, Path: "/admin",
 		HttpOnly: true, Secure: o.secureCookie, SameSite: http.SameSiteLaxMode,
 		MaxAge: int(sessionTTL.Seconds()),
 	})
+	return true
 }
 
 // sessionLogin returns the authenticated GitHub login for the request, if
@@ -187,23 +238,7 @@ func (o *OAuth) sessionLogin(r *http.Request) (string, bool) {
 	if err != nil || c.Value == "" {
 		return "", false
 	}
-	o.mu.Lock()
-	defer o.mu.Unlock()
-	s, ok := o.sessions[c.Value]
-	if !ok || time.Now().After(s.exp) {
-		delete(o.sessions, c.Value)
-		return "", false
-	}
-	return s.login, true
-}
-
-func (o *OAuth) gcSessionsLocked() {
-	now := time.Now()
-	for k, s := range o.sessions {
-		if now.After(s.exp) {
-			delete(o.sessions, k)
-		}
-	}
+	return o.sessions.lookup(c.Value)
 }
 
 // ─── GitHub API ─────────────────────────────────────────────────────────────
@@ -262,6 +297,33 @@ func (o *OAuth) fetchLogin(token string) (string, error) {
 		return "", fmt.Errorf("github: empty login")
 	}
 	return out.Login, nil
+}
+
+// isOrgMember reports whether the authenticated user (identified by their
+// own access token) is an active member of o.org. Uses the membership
+// endpoint, which the user-to-server token can read for itself with the
+// read:org scope. Any non-active state or API error is treated as "no".
+func (o *OAuth) isOrgMember(token string) bool {
+	req, _ := http.NewRequest(http.MethodGet,
+		"https://api.github.com/user/memberships/orgs/"+url.PathEscape(o.org), nil)
+	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("Accept", "application/vnd.github+json")
+	resp, err := o.httpClient.Do(req)
+	if err != nil {
+		return false
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return false
+	}
+	body, _ := io.ReadAll(resp.Body)
+	var out struct {
+		State string `json:"state"`
+	}
+	if err := json.Unmarshal(body, &out); err != nil {
+		return false
+	}
+	return out.State == "active"
 }
 
 // ─── state management ───────────────────────────────────────────────────────

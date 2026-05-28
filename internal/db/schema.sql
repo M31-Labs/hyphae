@@ -38,6 +38,18 @@ CREATE TABLE IF NOT EXISTS capabilities (
 CREATE INDEX IF NOT EXISTS idx_capabilities_subject ON capabilities(subject_identity_id);
 CREATE INDEX IF NOT EXISTS idx_capabilities_space   ON capabilities(space_id);
 
+-- Admin UI sessions for the hub's GitHub-OAuth-gated /admin surface.
+-- token_hash is the SHA-256 (hex) of the session cookie value, so a DB
+-- leak does not yield usable session cookies. Survives hub restarts.
+CREATE TABLE IF NOT EXISTS admin_sessions (
+  token_hash TEXT PRIMARY KEY,
+  login      TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  expires_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_admin_sessions_expiry ON admin_sessions(expires_at);
+
 CREATE TABLE IF NOT EXISTS files (
   id               TEXT PRIMARY KEY,
   space_id         TEXT NOT NULL,
