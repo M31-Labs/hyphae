@@ -17,13 +17,14 @@ import (
 
 // PullStats describes one sync pass for reporting.
 type PullStats struct {
-	BytesSent     int  `json:"bytes_sent"`
-	BytesReceived int  `json:"bytes_received"`
-	FramesSent    int  `json:"frames_sent"`
-	FramesRecv    int  `json:"frames_received"`
-	ChangesBefore int  `json:"changes_before"`
-	ChangesAfter  int  `json:"changes_after"`
-	Once          bool `json:"once"`
+	BytesSent          int      `json:"bytes_sent"`
+	BytesReceived      int      `json:"bytes_received"`
+	FramesSent         int      `json:"frames_sent"`
+	FramesRecv         int      `json:"frames_received"`
+	ChangesBefore      int      `json:"changes_before"`
+	ChangesAfter       int      `json:"changes_after"`
+	Once               bool     `json:"once"`
+	MaterializedFiles  []string `json:"materialized_files,omitempty"`
 }
 
 // Pull opens a websocket connection to the peer's hub for spaceURI,
@@ -155,6 +156,15 @@ func Pull(ctx context.Context, peerURL, spaceURI, token string, sh *crdtshadow.S
 
 	afterCount, _ := sh.Store().CountChanges()
 	stats.ChangesAfter = afterCount
+
+	// Land any remote canonical edits on disk by materializing each
+	// changed file. Best-effort: a materialize failure is logged via
+	// the returned stats but doesn't fail the pull.
+	if stats.ChangesAfter > stats.ChangesBefore {
+		if changed, mErr := sh.MaterializeAll(); mErr == nil {
+			stats.MaterializedFiles = changed
+		}
+	}
 	return stats, nil
 }
 

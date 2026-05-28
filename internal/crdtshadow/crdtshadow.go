@@ -27,6 +27,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 
 	"m31labs.dev/gosx/crdt"
@@ -34,13 +35,19 @@ import (
 	"m31labs.dev/hyphae/internal/types"
 )
 
-// Top-level Doc keys. Stable; change requires a migration.
+// Top-level Doc key prefixes. Every record is a flat Put on Root
+// under "<prefix>\x00<key>" because gosx's MakeMap is LWW-compared
+// across actors — two peers independently MakeMap'ing the same slot
+// would orphan one side's children. Flattening sidesteps the
+// problem: each Put competes only with the same key from another
+// peer, and same-key edits become explicit per-key conflicts (which
+// is what we want — Phase 6 surfaces these).
 const (
-	keyReceipts  = "receipts"
-	keyEdges     = "edges"
-	keySpores    = "spores"
-	keyTraces    = "traces"
-	keyCanonical = "canonical"
+	prefixReceipts  = "receipts"
+	prefixEdges     = "edges"
+	prefixSpores    = "spores"
+	prefixTraces    = "traces"
+	prefixCanonical = "canonical"
 )
 
 // LegacySnapshotFilename is the Phase 1 per-space snapshot file. Kept
@@ -64,13 +71,19 @@ type Shadow struct {
 	snapPath  string // legacy .crdt.dat path; retained for the migration
 	dbPath    string
 	closed    bool
+}
 
-	// Cached ObjIDs for the top-level submaps. Populated by bootstrap().
-	receiptsObj  crdt.ObjID
-	edgesObj     crdt.ObjID
-	sporesObj    crdt.ObjID
-	tracesObj    crdt.ObjID
-	canonicalObj crdt.ObjID
+// flatKey builds the canonical Root-level key for a prefix + payload key.
+func flatKey(prefix, key string) string { return prefix + "\x00" + key }
+
+// parseFlatKey splits a flat Root key back into (prefix, key). Returns
+// ok=false when the key does not match the flat-key shape.
+func parseFlatKey(k string) (prefix, key string, ok bool) {
+	idx := strings.IndexByte(k, '\x00')
+	if idx < 0 {
+		return "", "", false
+	}
+	return k[:idx], k[idx+1:], true
 }
 
 // Open loads (or creates) the Shadow for a space. spaceRoot is the
@@ -181,7 +194,7 @@ func (s *Shadow) RecordReceipt(r types.Receipt) error {
 	if r.ID == "" {
 		return fmt.Errorf("crdtshadow: receipt missing id")
 	}
-	return s.putBlob(s.receiptsObj, r.ID, r, "receipt:"+r.ID)
+	return s.putBlobRoot(prefixReceipts, r.ID, r, "receipt:"+r.ID)
 }
 
 // RecordEdge mirrors an Edge into the CRDT.
@@ -189,7 +202,7 @@ func (s *Shadow) RecordEdge(e types.Edge) error {
 	if e.ID == "" {
 		return fmt.Errorf("crdtshadow: edge missing id")
 	}
-	return s.putBlob(s.edgesObj, e.ID, e, "edge:"+e.ID)
+	return s.putBlobRoot(prefixEdges, e.ID, e, "edge:"+e.ID)
 }
 
 // SporeSummary is the compact, federation-friendly view of a spore
@@ -213,7 +226,7 @@ func (s *Shadow) RecordSpore(sum SporeSummary) error {
 	if sum.ID == "" {
 		return fmt.Errorf("crdtshadow: spore missing id")
 	}
-	return s.putBlob(s.sporesObj, sum.ID, sum, "spore:"+sum.ID)
+	return s.putBlobRoot(prefixSpores, sum.ID, sum, "spore:"+sum.ID)
 }
 
 // RecordSporeStatus is a convenience for the spore-review path that
@@ -227,14 +240,14 @@ func (s *Shadow) RecordSporeStatus(sporeID, newStatus string) error {
 	defer s.mu.Unlock()
 
 	var sum SporeSummary
-	if existing, ok := s.readBlobLocked(s.sporesObj, sporeID); ok {
+	if existing, ok := s.readBytesLocked(crdt.Root, flatKey(prefixSpores, sporeID)); ok {
 		_ = json.Unmarshal(existing, &sum)
 	}
 	if sum.ID == "" {
 		sum.ID = sporeID
 	}
 	sum.Status = newStatus
-	return s.putBlobLocked(s.sporesObj, sporeID, sum, "spore-status:"+sporeID)
+	return s.putBlobRootLocked(prefixSpores, sporeID, sum, "spore-status:"+sporeID)
 }
 
 // TraceSummary is the compact federation-friendly view of a trace.
@@ -266,12 +279,13 @@ func (s *Shadow) RecordTrace(t TraceSummary) error {
 	if t.ID == "" {
 		return fmt.Errorf("crdtshadow: trace missing id")
 	}
-	return s.putBlob(s.tracesObj, t.ID, t, "trace:"+t.ID)
+	return s.putBlobRoot(prefixTraces, t.ID, t, "trace:"+t.ID)
 }
 
 // RecordCanonicalWrite mirrors the post-write contents of a canonical
-// file. Phase 1: stores the full bytes as a LWW blob keyed by path.
-// Phase 5 replaces this with block-level CRDT for structural merge.
+// file. Phase 5: decomposes the file into per-section CRDT entries
+// (frontmatter + preamble + one Bytes entry per heading slug) so that
+// independent-region grafts auto-merge structurally on sync.
 //
 // path should be the absolute file path; the shadow stores it relative
 // to spaceRoot so multi-machine replicas can rebase paths.
@@ -283,69 +297,34 @@ func (s *Shadow) RecordCanonicalWrite(path string, after []byte) error {
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-
-	if err := s.doc.Put(s.canonicalObj, crdt.Prop(rel), crdt.BytesValue(append([]byte{}, after...))); err != nil {
-		return fmt.Errorf("crdtshadow: put canonical %q: %w", rel, err)
-	}
-	if _, err := s.doc.Commit("canonical:" + rel); err != nil {
-		return fmt.Errorf("crdtshadow: commit canonical %q: %w", rel, err)
-	}
-	return s.persistLocked(false)
+	return s.recordCanonicalSectioned(rel, after)
 }
 
 // ─── internals ────────────────────────────────────────────────────────────
 
-func (s *Shadow) bootstrap() error {
+// bootstrap is now a no-op: the Shadow stores everything under Root
+// with flat-key namespacing, so there's no per-category sub-map to
+// pre-create. Kept as a hook for future migrations.
+func (s *Shadow) bootstrap() error { return nil }
+
+func (s *Shadow) putBlobRoot(prefix, key string, payload any, msg string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	var err error
-	if s.receiptsObj, err = getOrMakeMap(s.doc, crdt.Root, keyReceipts); err != nil {
-		return err
-	}
-	if s.edgesObj, err = getOrMakeMap(s.doc, crdt.Root, keyEdges); err != nil {
-		return err
-	}
-	if s.sporesObj, err = getOrMakeMap(s.doc, crdt.Root, keySpores); err != nil {
-		return err
-	}
-	if s.tracesObj, err = getOrMakeMap(s.doc, crdt.Root, keyTraces); err != nil {
-		return err
-	}
-	if s.canonicalObj, err = getOrMakeMap(s.doc, crdt.Root, keyCanonical); err != nil {
-		return err
-	}
-	return s.persistLocked(false)
+	return s.putBlobRootLocked(prefix, key, payload, msg)
 }
 
-func (s *Shadow) putBlob(parent crdt.ObjID, key string, payload any, msg string) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.putBlobLocked(parent, key, payload, msg)
-}
-
-func (s *Shadow) putBlobLocked(parent crdt.ObjID, key string, payload any, msg string) error {
+func (s *Shadow) putBlobRootLocked(prefix, key string, payload any, msg string) error {
 	blob, err := json.Marshal(payload)
 	if err != nil {
 		return fmt.Errorf("crdtshadow: marshal %s: %w", msg, err)
 	}
-	if err := s.doc.Put(parent, crdt.Prop(key), crdt.BytesValue(blob)); err != nil {
+	if err := s.doc.Put(crdt.Root, crdt.Prop(flatKey(prefix, key)), crdt.BytesValue(blob)); err != nil {
 		return fmt.Errorf("crdtshadow: put %s: %w", msg, err)
 	}
 	if _, err := s.doc.Commit(msg); err != nil {
 		return fmt.Errorf("crdtshadow: commit %s: %w", msg, err)
 	}
 	return s.persistLocked(false)
-}
-
-func (s *Shadow) readBlobLocked(parent crdt.ObjID, key string) ([]byte, bool) {
-	val, _, err := s.doc.Get(parent, crdt.Prop(key))
-	if err != nil {
-		return nil, false
-	}
-	if val.Kind != crdt.ValueKindBytes {
-		return nil, false
-	}
-	return append([]byte{}, val.Bytes...), true
 }
 
 // persistLocked flushes any uncommitted ops to disk via the change log.
@@ -359,22 +338,5 @@ func (s *Shadow) persistLocked(_ bool) error {
 		return fmt.Errorf("crdtshadow: append changes: %w", err)
 	}
 	return nil
-}
-
-// getOrMakeMap returns the ObjID of the map at parent[prop], creating
-// it if absent. Idempotent across opens.
-func getOrMakeMap(doc *crdt.Doc, parent crdt.ObjID, prop string) (crdt.ObjID, error) {
-	val, objID, err := doc.Get(parent, crdt.Prop(prop))
-	if err == nil && objID != "" && val.Kind == crdt.ValueKindMap {
-		return objID, nil
-	}
-	newID, err := doc.MakeMap(parent, crdt.Prop(prop))
-	if err != nil {
-		return "", fmt.Errorf("make map %q: %w", prop, err)
-	}
-	if _, err := doc.Commit("bootstrap:" + prop); err != nil {
-		return "", fmt.Errorf("commit bootstrap %q: %w", prop, err)
-	}
-	return newID, nil
 }
 

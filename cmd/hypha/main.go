@@ -566,17 +566,28 @@ func cmdSyncImport(args []string) error {
 	if _, err := sh.Store().AppendChangesFromDoc(sh.Doc()); err != nil {
 		return fmt.Errorf("sync import: persist: %w", err)
 	}
+	var materialized []string
+	if delta > 0 {
+		materialized, _ = sh.MaterializeAll()
+	}
 	payload := map[string]any{
-		"space":            targetSpace,
-		"in":               *in,
-		"changes_absorbed": delta,
-		"from_actor":       bundle.FromActor,
-		"from_heads":       bundle.FromHeads,
+		"space":              targetSpace,
+		"in":                 *in,
+		"changes_absorbed":   delta,
+		"materialized_files": materialized,
+		"from_actor":         bundle.FromActor,
+		"from_heads":         bundle.FromHeads,
 	}
 	return emit("sync import", payload, *format, func(w io.Writer, _ any) error {
 		fmt.Fprintf(w, "Imported %s\n", targetSpace)
-		fmt.Fprintf(w, "  from:   %s (actor %s)\n", *in, bundle.FromActor)
+		fmt.Fprintf(w, "  from:     %s (actor %s)\n", *in, bundle.FromActor)
 		fmt.Fprintf(w, "  absorbed: %d new change(s)\n", delta)
+		if len(materialized) > 0 {
+			fmt.Fprintf(w, "  files:    %d canonical file(s) updated on disk\n", len(materialized))
+			for _, p := range materialized {
+				fmt.Fprintf(w, "    - %s\n", p)
+			}
+		}
 		return nil
 	})
 }

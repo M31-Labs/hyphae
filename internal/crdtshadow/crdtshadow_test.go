@@ -83,7 +83,7 @@ func TestShadowRoundTripsAllRecorders(t *testing.T) {
 	}
 
 	// Spore status should be "accepted" after the LWW flip.
-	sporeRaw := extractMapBlob(t, s2.Doc(), "spores", "spore.test.1")
+	sporeRaw := extractRootBlob(t, s2.Doc(), "spores\x00spore.test.1")
 	var sum crdtshadow.SporeSummary
 	if err := json.Unmarshal(sporeRaw, &sum); err != nil {
 		t.Fatalf("unmarshal spore summary: %v", err)
@@ -201,18 +201,16 @@ func dumpDoc(t *testing.T, doc *crdt.Doc) string {
 	return string(data)
 }
 
-func extractMapBlob(t *testing.T, doc *crdt.Doc, topProp, key string) []byte {
+// extractRootBlob reads a flat-namespaced bytes value directly from
+// Root. Keys take the form "<prefix>\x00<id>".
+func extractRootBlob(t *testing.T, doc *crdt.Doc, key string) []byte {
 	t.Helper()
-	_, parent, err := doc.Get(crdt.Root, crdt.Prop(topProp))
+	val, _, err := doc.Get(crdt.Root, crdt.Prop(key))
 	if err != nil {
-		t.Fatalf("get top %q: %v", topProp, err)
-	}
-	val, _, err := doc.Get(parent, crdt.Prop(key))
-	if err != nil {
-		t.Fatalf("get %q.%q: %v", topProp, key, err)
+		t.Fatalf("get root[%q]: %v", key, err)
 	}
 	if val.Kind != crdt.ValueKindBytes {
-		t.Fatalf("%q.%q kind = %v, want bytes", topProp, key, val.Kind)
+		t.Fatalf("root[%q] kind = %v, want bytes", key, val.Kind)
 	}
 	return val.Bytes
 }
