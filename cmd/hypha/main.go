@@ -63,7 +63,7 @@ Usage:
   hypha cap      issue --subject <uri> --space <uri> [--permissions p1,p2] [--expires 24h] [--format text|json|compact]
   hypha identity init --name <name> --authority <auth> --space <uri> [--expires 1y] [--format text|json|compact]
   hypha identity list [--format text|json|compact]
-  hypha graft    <spore-id> --as <identity-uri> [--space <hypha-uri>] [--verify] [--no-fmt] [--format text|json|compact]
+  hypha graft    <spore-id> --as <identity-uri> [--space <hypha-uri>] [--verify] [--no-fmt] [--dry-run] [--diff] [--apply] [--format text|json|compact]
   hypha graph    backlinks <object-id> [--kind k1,k2] [--limit N] [--format text|json|compact]
   hypha graph    related   <object-id> [--kind k1,k2] [--limit N] [--format text|json|compact]
   hypha graph    trace     <object-id> [--kind derived_from,cites] [--max-depth 4] [--format text|json|compact]
@@ -1421,6 +1421,9 @@ func cmdGraft(args []string) error {
 	spaceURI := fs.String("space", "", "space URI override (auto-detected from inbox if omitted)")
 	verify := fs.Bool("verify", false, "verify Ed25519 signature on the spore before applying")
 	noFmt := fs.Bool("no-fmt", false, "skip the mdpp.fmt pass on touched canonical files (formatting on by default)")
+	dryRun := fs.Bool("dry-run", false, "plan the graft without persisting any file, spore-status, or edge changes")
+	showDiff := fs.Bool("diff", false, "render a unified diff per touched file (implies --dry-run unless --apply also set)")
+	apply := fs.Bool("apply", false, "with --diff: persist the graft after printing the diff (default is preview-only)")
 	format := formatFlag(fs)
 	if err := fs.Parse(reorderFlagsFirst(args)); err != nil {
 		return err
@@ -1473,15 +1476,20 @@ func cmdGraft(args []string) error {
 		fmt.Fprintln(os.Stderr, "verified spore signature")
 	}
 
-	result, err := graft.Apply(conn, root, spaceRoot, sporeID, *grafter)
+	// --diff defaults to preview-only; opt back in with --apply to persist.
+	effectiveDryRun := *dryRun || (*showDiff && !*apply)
+
+	result, err := graft.ApplyWithOpts(conn, root, spaceRoot, sporeID, *grafter, graft.ApplyOpts{
+		DryRun: effectiveDryRun,
+	})
 	if err != nil {
 		return fmt.Errorf("graft: %w", err)
 	}
 
 	// mdpp.fmt pass on touched files: normalize canonical state so the
 	// post-graft tree stays canonical. Best-effort — failures are logged
-	// but don't unwind the graft (the apply already persisted).
-	if !*noFmt {
+	// but don't unwind the graft (the apply already persisted). Skip in dry-run.
+	if !*noFmt && !effectiveDryRun {
 		for _, p := range result.TouchedFiles {
 			if changed, ferr := formatMdppFile(p); ferr != nil {
 				fmt.Fprintf(os.Stderr, "warn: mdpp.fmt %s: %v\n", p, ferr)
@@ -1491,9 +1499,11 @@ func cmdGraft(args []string) error {
 		}
 	}
 
-	// Persist the graft receipt to the audit log.
-	if wErr := receipts.Write(conn, result.Receipt); wErr != nil && !errors.Is(wErr, receipts.ErrAlreadyExists) {
-		fmt.Fprintf(os.Stderr, "warn: failed to persist graft receipt: %v\n", wErr)
+	// Persist the graft receipt to the audit log (skipped in dry-run).
+	if !effectiveDryRun {
+		if wErr := receipts.Write(conn, result.Receipt); wErr != nil && !errors.Is(wErr, receipts.ErrAlreadyExists) {
+			fmt.Fprintf(os.Stderr, "warn: failed to persist graft receipt: %v\n", wErr)
+		}
 	}
 
 	return emit("graft", result, *format, func(w io.Writer, data any) error {
@@ -1501,13 +1511,26 @@ func cmdGraft(args []string) error {
 		if !ok {
 			return fmt.Errorf("graft: text renderer got %T", data)
 		}
-		fmt.Fprintf(w, "Grafted %s → status: %s (applied %d, skipped %d)\n",
-			r.SporeID, r.NewSporeStatus, len(r.AppliedWrites), len(r.SkippedWrites))
-		fmt.Fprintf(w, "  Receipt: %s\n", r.Receipt.ID)
+		verb := "Grafted"
+		if r.DryRun {
+			verb = "DRY-RUN — would graft"
+		}
+		fmt.Fprintf(w, "%s %s → status: %s (applied %d, skipped %d)\n",
+			verb, r.SporeID, r.NewSporeStatus, len(r.AppliedWrites), len(r.SkippedWrites))
+		if !r.DryRun {
+			fmt.Fprintf(w, "  Receipt: %s\n", r.Receipt.ID)
+		}
 		if len(r.TouchedFiles) > 0 {
 			fmt.Fprintln(w, "  Touched:")
 			for _, p := range r.TouchedFiles {
 				fmt.Fprintf(w, "    - %s\n", p)
+			}
+		}
+		if *showDiff {
+			fmt.Fprintln(w)
+			for _, d := range r.Deltas {
+				fmt.Fprint(w, graft.RenderDelta(d))
+				fmt.Fprintln(w)
 			}
 		}
 		return nil

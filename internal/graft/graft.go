@@ -19,9 +19,27 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"m31labs.dev/hyphae/internal/atomicfs"
 	"m31labs.dev/hyphae/internal/types"
 	"m31labs.dev/mdpp"
 )
+
+// ApplyOpts tunes a graft. DryRun computes the same plan a real apply would
+// execute (handlers run, byte-deltas are produced) but no canonical files,
+// spore status updates, or edges are persisted.
+type ApplyOpts struct {
+	DryRun bool
+}
+
+// FileDelta captures one canonical-file change that a graft proposed.
+// OldBytes is nil when the delta represents a new file (create_file).
+// In a real apply, NewBytes is what was written; in a dry-run, NewBytes is
+// what *would have been* written.
+type FileDelta struct {
+	Path     string
+	OldBytes []byte
+	NewBytes []byte
+}
 
 // tagsFlowRe matches an inline flow-style tags line: tags: [a, b, c]
 var tagsFlowRe = regexp.MustCompile(`(?m)^(tags:\s*\[)(.*?)(\]\s*)$`)
@@ -37,8 +55,10 @@ type Result struct {
 	AppliedWrites  []AppliedWrite
 	SkippedWrites  []SkippedWrite
 	AppliedEdges   []types.Edge
-	TouchedFiles   []string // absolute paths of canonical files modified
+	TouchedFiles   []string    // absolute paths of canonical files modified
+	Deltas         []FileDelta // per-file before/after bytes (populated in both real and dry-run modes)
 	Receipt        types.Receipt
+	DryRun         bool
 }
 
 // AppliedWrite records where a proposed write landed.
@@ -59,16 +79,74 @@ type SkippedWrite struct {
 // unsupportedWriteKinds lists kinds not yet implemented; empty as of v0.1.2.
 var unsupportedWriteKinds = map[string]bool{}
 
-// Apply loads spore <sporeID> from <spaceRoot>/inbox/agents/, applies its
-// proposed_writes and proposed_edges to canonical files under installRoot
-// (which is the directory containing spaces/), and returns the Result.
+// applyContext threads dry-run + rollback + delta tracking through every
+// write a handler makes. Replace handler os.WriteFile sites with
+// ctx.writeFile(path, newBytes) so they participate in dry-run uniformly.
+type applyContext struct {
+	dryRun   bool
+	rollback map[string][]byte // path → original bytes (nil for new files)
+	deltas   []FileDelta
+}
+
+func (c *applyContext) seedRollback(path string, origBytes []byte) {
+	if _, saved := c.rollback[path]; !saved {
+		c.rollback[path] = origBytes
+	}
+}
+
+// writeFile records a delta and, when not in dry-run mode, persists the
+// new bytes atomically. oldBytes is taken from the rollback map (set by
+// the handler's pre-mutation read) or derived from disk; pass nil to
+// indicate a brand-new file.
+func (c *applyContext) writeFile(path string, newBytes []byte) error {
+	old, isMod := c.rollback[path]
+	if !isMod {
+		// New file path — confirm nothing exists at the destination.
+		old = nil
+	}
+	c.deltas = append(c.deltas, FileDelta{Path: path, OldBytes: old, NewBytes: append([]byte{}, newBytes...)})
+	if c.dryRun {
+		return nil
+	}
+	return atomicfs.WriteFile(path, newBytes, 0o644)
+}
+
+// rollbackTouched reverts every modified file to its pre-graft bytes. No-op
+// in dry-run mode (nothing was written).
+func (c *applyContext) rollbackTouched() {
+	if c.dryRun {
+		return
+	}
+	for path, orig := range c.rollback {
+		if orig == nil {
+			_ = os.Remove(path)
+			continue
+		}
+		_ = atomicfs.WriteFile(path, orig, 0o644)
+	}
+}
+
+// Apply applies a spore in real (non-dry-run) mode. See ApplyWithOpts for
+// the dry-run path.
+func Apply(conn *sql.DB, installRoot, spaceRoot, sporeID, grafter string) (Result, error) {
+	return ApplyWithOpts(conn, installRoot, spaceRoot, sporeID, grafter, ApplyOpts{})
+}
+
+// ApplyWithOpts loads spore <sporeID> from <spaceRoot>/inbox/agents/,
+// applies its proposed_writes and proposed_edges to canonical files under
+// installRoot (which is the directory containing spaces/), and returns the
+// Result.
+//
+// When opts.DryRun is true the handlers run to completion against in-memory
+// byte buffers and the resulting Deltas are returned, but no file writes,
+// spore-status updates, or edge persistence happen.
 //
 // grafter is the identity URI of the human or agent invoking the graft;
 // it is recorded in the receipt and on each derived_from edge.
 //
-// On any unrecoverable error mid-graft, Apply MUST roll back any file
-// writes it has made and return without persisting partial state.
-func Apply(conn *sql.DB, installRoot, spaceRoot, sporeID, grafter string) (Result, error) {
+// On any unrecoverable error mid-graft, ApplyWithOpts MUST roll back any
+// file writes it has made and return without persisting partial state.
+func ApplyWithOpts(conn *sql.DB, installRoot, spaceRoot, sporeID, grafter string, opts ApplyOpts) (Result, error) {
 	// ── Step 1: locate and read the spore file ──────────────────────────────
 	sporeFile, sporeBytes, err := findSpore(spaceRoot, sporeID)
 	if err != nil {
@@ -86,15 +164,15 @@ func Apply(conn *sql.DB, installRoot, spaceRoot, sporeID, grafter string) (Resul
 
 	now := time.Now().UTC()
 
-	// Track rollback state: original bytes for each modified canonical file.
-	rollback := map[string][]byte{}
+	ctx := &applyContext{
+		dryRun:   opts.DryRun,
+		rollback: map[string][]byte{},
+	}
 	// Ensure rollback on unrecoverable error.
 	needRollback := true
 	defer func() {
 		if needRollback {
-			for path, orig := range rollback {
-				_ = os.WriteFile(path, orig, 0o644)
-			}
+			ctx.rollbackTouched()
 		}
 	}()
 
@@ -126,13 +204,13 @@ func Apply(conn *sql.DB, installRoot, spaceRoot, sporeID, grafter string) (Resul
 
 		switch pw.Kind {
 		case "append_section", "insert_after":
-			aw, skip, edgeSrc, fatalErr = applyInsertWrite(pw, installRoot, rollback)
+			aw, skip, edgeSrc, fatalErr = applyInsertWrite(pw, installRoot, ctx)
 		case "create_file":
-			aw, skip, edgeSrc, fatalErr = applyCreateFile(pw, installRoot)
+			aw, skip, edgeSrc, fatalErr = applyCreateFile(pw, installRoot, ctx)
 		case "replace_block":
-			aw, skip, edgeSrc, fatalErr = applyReplaceBlock(pw, installRoot, rollback)
+			aw, skip, edgeSrc, fatalErr = applyReplaceBlock(pw, installRoot, ctx)
 		case "add_tag":
-			aw, skip, edgeSrc, fatalErr = applyAddTag(pw, installRoot, rollback)
+			aw, skip, edgeSrc, fatalErr = applyAddTag(pw, installRoot, ctx)
 		default:
 			skippedWrites = append(skippedWrites, SkippedWrite{
 				Kind:      pw.Kind,
@@ -167,8 +245,10 @@ func Apply(conn *sql.DB, installRoot, spaceRoot, sporeID, grafter string) (Resul
 			CreatedBy:   grafter,
 			CreatedAt:   now,
 		}
-		if dbErr := persistEdge(conn, edge); dbErr != nil {
-			return Result{}, fmt.Errorf("graft: persist derived_from edge: %w", dbErr)
+		if !opts.DryRun {
+			if dbErr := persistEdge(conn, edge); dbErr != nil {
+				return Result{}, fmt.Errorf("graft: persist derived_from edge: %w", dbErr)
+			}
 		}
 		appliedEdges = append(appliedEdges, edge)
 	}
@@ -186,8 +266,10 @@ func Apply(conn *sql.DB, installRoot, spaceRoot, sporeID, grafter string) (Resul
 			CreatedBy:   grafter,
 			CreatedAt:   now,
 		}
-		if dbErr := persistEdge(conn, edge); dbErr != nil {
-			return Result{}, fmt.Errorf("graft: persist proposed edge: %w", dbErr)
+		if !opts.DryRun {
+			if dbErr := persistEdge(conn, edge); dbErr != nil {
+				return Result{}, fmt.Errorf("graft: persist proposed edge: %w", dbErr)
+			}
 		}
 		appliedEdges = append(appliedEdges, edge)
 	}
@@ -201,13 +283,15 @@ func Apply(conn *sql.DB, installRoot, spaceRoot, sporeID, grafter string) (Resul
 	// If all proposed_writes applied, status = "accepted".
 	newStatus := computeStatus(len(spore.ProposedWrites), len(appliedWrites))
 
-	// Update the spore frontmatter on disk.
+	// Update the spore frontmatter on disk (skipped in dry-run).
 	updatedSporeBytes, updateErr := updateSporeStatus(sporeBytes, newStatus)
 	if updateErr != nil {
 		return Result{}, fmt.Errorf("graft: update spore status: %w", updateErr)
 	}
-	if writeErr := os.WriteFile(sporeFile, updatedSporeBytes, 0o644); writeErr != nil {
-		return Result{}, fmt.Errorf("graft: write spore file: %w", writeErr)
+	if !opts.DryRun {
+		if writeErr := atomicfs.WriteFile(sporeFile, updatedSporeBytes, 0o644); writeErr != nil {
+			return Result{}, fmt.Errorf("graft: write spore file: %w", writeErr)
+		}
 	}
 
 	// ── Step 8: build receipt ────────────────────────────────────────────────
@@ -243,7 +327,9 @@ func Apply(conn *sql.DB, installRoot, spaceRoot, sporeID, grafter string) (Resul
 		SkippedWrites:  skippedWrites,
 		AppliedEdges:   appliedEdges,
 		TouchedFiles:   touchedFiles,
+		Deltas:         ctx.deltas,
 		Receipt:        receipt,
+		DryRun:         opts.DryRun,
 	}, nil
 }
 
@@ -256,7 +342,7 @@ func Apply(conn *sql.DB, installRoot, spaceRoot, sporeID, grafter string) (Resul
 func applyInsertWrite(
 	pw types.ProposedWrite,
 	installRoot string,
-	rollback map[string][]byte,
+	ctx *applyContext,
 ) (*AppliedWrite, *SkippedWrite, string, error) {
 	skip := func(reason string) (*AppliedWrite, *SkippedWrite, string, error) {
 		return nil, &SkippedWrite{Kind: pw.Kind, TargetURI: pw.Target, Reason: reason}, "", nil
@@ -274,9 +360,7 @@ func applyInsertWrite(
 	if readErr != nil {
 		return skip(fmt.Sprintf("read target file: %v", readErr))
 	}
-	if _, saved := rollback[targetFile]; !saved {
-		rollback[targetFile] = origBytes
-	}
+	ctx.seedRollback(targetFile, origBytes)
 
 	insertText, buildErr := buildInsertText(pw)
 	if buildErr != nil {
@@ -290,12 +374,10 @@ func applyInsertWrite(
 
 	newBytes := spliceBytes(origBytes, insertOffset, insertText)
 	if _, parseErr := mdpp.Parse(newBytes); parseErr != nil {
-		_ = os.WriteFile(targetFile, rollback[targetFile], 0o644)
-		delete(rollback, targetFile)
-		return skip(fmt.Sprintf("post-edit re-parse failed: %v; rolled back", parseErr))
+		return skip(fmt.Sprintf("post-edit re-parse failed: %v", parseErr))
 	}
 
-	if writeErr := os.WriteFile(targetFile, newBytes, 0o644); writeErr != nil {
+	if writeErr := ctx.writeFile(targetFile, newBytes); writeErr != nil {
 		return nil, nil, "", fmt.Errorf("graft: write canonical file %s: %w", targetFile, writeErr)
 	}
 
@@ -314,6 +396,7 @@ func applyInsertWrite(
 func applyCreateFile(
 	pw types.ProposedWrite,
 	installRoot string,
+	ctx *applyContext,
 ) (*AppliedWrite, *SkippedWrite, string, error) {
 	skip := func(reason string) (*AppliedWrite, *SkippedWrite, string, error) {
 		return nil, &SkippedWrite{Kind: pw.Kind, TargetURI: pw.Target, Reason: reason}, "", nil
@@ -346,20 +429,23 @@ func applyCreateFile(
 		return skip("target file already exists; create_file refuses to overwrite")
 	}
 
-	// Create parent directories.
-	if mkdirErr := os.MkdirAll(filepath.Dir(absFile), 0o755); mkdirErr != nil {
-		return nil, nil, "", fmt.Errorf("graft: create directories for %s: %w", absFile, mkdirErr)
-	}
-
-	// Write the file.
-	if writeErr := os.WriteFile(absFile, []byte(body), 0o644); writeErr != nil {
-		return nil, nil, "", fmt.Errorf("graft: write new file %s: %w", absFile, writeErr)
-	}
-
-	// Verify it parses cleanly.
+	// Verify body parses cleanly BEFORE we commit the write so we never
+	// leave a malformed file on disk (the old version wrote-then-checked).
 	if _, parseErr := mdpp.Parse([]byte(body)); parseErr != nil {
-		_ = os.Remove(absFile)
 		return skip(fmt.Sprintf("new file does not parse: %v", parseErr))
+	}
+
+	// Create parent directories. Safe in dry-run: makes empty dirs, no harm.
+	if !ctx.dryRun {
+		if mkdirErr := os.MkdirAll(filepath.Dir(absFile), 0o755); mkdirErr != nil {
+			return nil, nil, "", fmt.Errorf("graft: create directories for %s: %w", absFile, mkdirErr)
+		}
+	}
+
+	// Mark as new file (rollback removes it on failure) and write.
+	ctx.seedRollback(absFile, nil)
+	if writeErr := ctx.writeFile(absFile, []byte(body)); writeErr != nil {
+		return nil, nil, "", fmt.Errorf("graft: write new file %s: %w", absFile, writeErr)
 	}
 
 	// Build the canonical URI for this new file.
@@ -382,7 +468,7 @@ func applyCreateFile(
 func applyReplaceBlock(
 	pw types.ProposedWrite,
 	installRoot string,
-	rollback map[string][]byte,
+	ctx *applyContext,
 ) (*AppliedWrite, *SkippedWrite, string, error) {
 	skip := func(reason string) (*AppliedWrite, *SkippedWrite, string, error) {
 		return nil, &SkippedWrite{Kind: pw.Kind, TargetURI: pw.Target, Reason: reason}, "", nil
@@ -411,9 +497,7 @@ func applyReplaceBlock(
 	if readErr != nil {
 		return skip(fmt.Sprintf("read target file: %v", readErr))
 	}
-	if _, saved := rollback[targetFile]; !saved {
-		rollback[targetFile] = origBytes
-	}
+	ctx.seedRollback(targetFile, origBytes)
 
 	// Parse and find the target heading.
 	doc, parseErr := mdpp.Parse(origBytes)
@@ -462,14 +546,12 @@ func applyReplaceBlock(
 	newBytes = append(newBytes, []byte(replacement)...)
 	newBytes = append(newBytes, origBytes[sectionEnd:]...)
 
-	// Verify.
+	// Verify before committing the write.
 	if _, reParseErr := mdpp.Parse(newBytes); reParseErr != nil {
-		_ = os.WriteFile(targetFile, rollback[targetFile], 0o644)
-		delete(rollback, targetFile)
-		return skip(fmt.Sprintf("post-edit re-parse failed: %v; rolled back", reParseErr))
+		return skip(fmt.Sprintf("post-edit re-parse failed: %v", reParseErr))
 	}
 
-	if writeErr := os.WriteFile(targetFile, newBytes, 0o644); writeErr != nil {
+	if writeErr := ctx.writeFile(targetFile, newBytes); writeErr != nil {
 		return nil, nil, "", fmt.Errorf("graft: write canonical file %s: %w", targetFile, writeErr)
 	}
 
@@ -488,7 +570,7 @@ func applyReplaceBlock(
 func applyAddTag(
 	pw types.ProposedWrite,
 	installRoot string,
-	rollback map[string][]byte,
+	ctx *applyContext,
 ) (*AppliedWrite, *SkippedWrite, string, error) {
 	skip := func(reason string) (*AppliedWrite, *SkippedWrite, string, error) {
 		return nil, &SkippedWrite{Kind: pw.Kind, TargetURI: pw.Target, Reason: reason}, "", nil
@@ -538,11 +620,8 @@ func applyAddTag(
 		}
 	}
 
-	// Save rollback AFTER confirming we'll modify.
-	if _, saved := rollback[targetFile]; !saved {
-		rollback[targetFile] = origBytes
-	}
-
+	// Compute the proposed new bytes in-memory; only seed rollback + write
+	// once we've verified the post-edit parses cleanly.
 	fmSlice := origBytes[fmStart:fmEnd]
 	newFMSlice, editErr := addTagToFrontmatter(fmSlice, tag)
 	if editErr != nil {
@@ -554,20 +633,16 @@ func applyAddTag(
 	newBytes = append(newBytes, newFMSlice...)
 	newBytes = append(newBytes, origBytes[fmEnd:]...)
 
-	// Verify tag was actually added.
 	verDoc, verErr := mdpp.Parse(newBytes)
 	if verErr != nil {
-		_ = os.WriteFile(targetFile, rollback[targetFile], 0o644)
-		delete(rollback, targetFile)
-		return skip(fmt.Sprintf("post-edit re-parse failed: %v; rolled back", verErr))
+		return skip(fmt.Sprintf("post-edit re-parse failed: %v", verErr))
 	}
 	if !tagInList(verDoc.Frontmatter()["tags"], tag) {
-		_ = os.WriteFile(targetFile, rollback[targetFile], 0o644)
-		delete(rollback, targetFile)
-		return skip("post-edit verification: tag not found in parsed frontmatter; rolled back")
+		return skip("post-edit verification: tag not found in parsed frontmatter")
 	}
 
-	if writeErr := os.WriteFile(targetFile, newBytes, 0o644); writeErr != nil {
+	ctx.seedRollback(targetFile, origBytes)
+	if writeErr := ctx.writeFile(targetFile, newBytes); writeErr != nil {
 		return nil, nil, "", fmt.Errorf("graft: write canonical file %s: %w", targetFile, writeErr)
 	}
 

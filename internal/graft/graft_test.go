@@ -76,6 +76,80 @@ func makeCanonicalFile(t *testing.T, spacesDir, relPath, content string) string 
 
 // ─── Test 1: append_section happy path ────────────────────────────────────────
 
+func TestApplyWithOpts_DryRunDoesNotMutate(t *testing.T) {
+	conn := openTestDB(t)
+	installRoot := t.TempDir()
+	spaceRoot := filepath.Join(installRoot, "spaces", "test-space")
+
+	canonicalContent := `---
+mdpp: "0.1"
+id: concept.target
+type: concept
+space: hypha://test/space
+status: canonical
+---
+
+# Target
+
+## Section One
+
+Original content.
+`
+	canonicalFile := makeCanonicalFile(t,
+		filepath.Join(installRoot, "spaces"),
+		"test-space/concepts/target.md",
+		canonicalContent,
+	)
+	origBytes, _ := os.ReadFile(canonicalFile)
+
+	sporeID := "spore.2026-05-28.test.dryrun"
+	agentID := "agent://test/agent"
+	pwYAML := `proposed_writes:
+  - kind: append_section
+    target: hypha://test/space/concepts/target#section-one
+    body: |
+      Dry-run probe text.
+`
+	sporeFile := makeSporeFile(t, spaceRoot, sporeID, agentID, "unreviewed", pwYAML)
+	origSpore, _ := os.ReadFile(sporeFile)
+
+	result, err := ApplyWithOpts(conn, installRoot, spaceRoot, sporeID, "identity://odvcencio", ApplyOpts{DryRun: true})
+	if err != nil {
+		t.Fatalf("dry-run ApplyWithOpts: %v", err)
+	}
+
+	if !result.DryRun {
+		t.Error("expected Result.DryRun = true")
+	}
+	if len(result.AppliedWrites) != 1 {
+		t.Fatalf("AppliedWrites: want 1, got %d", len(result.AppliedWrites))
+	}
+	if len(result.Deltas) != 1 {
+		t.Fatalf("Deltas: want 1, got %d", len(result.Deltas))
+	}
+	if !strings.Contains(string(result.Deltas[0].NewBytes), "Dry-run probe text.") {
+		t.Errorf("Delta.NewBytes missing probe text")
+	}
+
+	// The canonical file must be untouched.
+	curBytes, _ := os.ReadFile(canonicalFile)
+	if string(curBytes) != string(origBytes) {
+		t.Errorf("dry-run mutated canonical file; before/after diverged")
+	}
+
+	// The spore status must NOT have flipped to "accepted".
+	curSpore, _ := os.ReadFile(sporeFile)
+	if string(curSpore) != string(origSpore) {
+		t.Errorf("dry-run mutated spore file; before/after diverged")
+	}
+
+	// Diff renderer should produce something.
+	diff := RenderDelta(result.Deltas[0])
+	if !strings.Contains(diff, "+Dry-run probe text.") {
+		t.Errorf("RenderDelta missing inserted line in unified diff; got:\n%s", diff)
+	}
+}
+
 func TestApply_AppendSection(t *testing.T) {
 	conn := openTestDB(t)
 	installRoot := t.TempDir()
