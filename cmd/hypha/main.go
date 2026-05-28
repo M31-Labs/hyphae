@@ -32,6 +32,7 @@ import (
 	"m31labs.dev/hyphae/internal/assess"
 	"m31labs.dev/hyphae/internal/atomicfs"
 	"m31labs.dev/hyphae/internal/capability"
+	"m31labs.dev/hyphae/internal/crdtshadow"
 	"m31labs.dev/hyphae/internal/db"
 	"m31labs.dev/hyphae/internal/envelope"
 	"m31labs.dev/hyphae/internal/graft"
@@ -932,6 +933,10 @@ func cmdSporeReview(args []string, newStatus string) error {
 		}
 	}
 
+	// Mirror status flip + receipt into the per-space CRDT shadow.
+	crdtshadow.MirrorSporeStatus(root, spaceURI, sporeID, newStatus)
+	crdtshadow.MirrorReceipt(root, receipt)
+
 	out := map[string]any{
 		"spore_id":     sporeID,
 		"status_was":   cur,
@@ -1108,6 +1113,12 @@ func cmdSporeSubmit(rest []string) error {
 	} else {
 		fmt.Fprintf(os.Stderr, "warn: receipt not persisted (index unavailable: %v)\n", dbErr)
 	}
+
+	// Mirror the spore + receipt into the per-space CRDT shadow.
+	sp.FilePath = filePath
+	sp.ContentHash = receipt.ContentHash
+	crdtshadow.MirrorSpore(root, sp)
+	crdtshadow.MirrorReceipt(root, receipt)
 
 	payload := map[string]any{
 		"receipt":   receipt,
@@ -1330,6 +1341,7 @@ func cmdCap(args []string) error {
 	if wErr := receipts.Write(conn, rcpt); wErr != nil && !errors.Is(wErr, receipts.ErrAlreadyExists) {
 		fmt.Fprintf(os.Stderr, "warn: failed to persist cap:issue receipt: %v\n", wErr)
 	}
+	crdtshadow.MirrorReceipt(root, rcpt)
 
 	payload := map[string]any{
 		"token":      cap.ID,
@@ -1530,6 +1542,15 @@ func cmdGraft(args []string) error {
 		if wErr := receipts.Write(conn, result.Receipt); wErr != nil && !errors.Is(wErr, receipts.ErrAlreadyExists) {
 			fmt.Fprintf(os.Stderr, "warn: failed to persist graft receipt: %v\n", wErr)
 		}
+
+		// Mirror canonical writes + receipt + applied edges into the per-space CRDT shadow.
+		crdtshadow.MirrorReceipt(root, result.Receipt)
+		crdtshadow.MirrorCanonical(root, result.Receipt.SpaceID, result.TouchedFiles)
+		for _, e := range result.AppliedEdges {
+			crdtshadow.MirrorEdge(root, result.Receipt.SpaceID, e)
+		}
+		// Spore status flipped (accepted/partial) — mirror that too.
+		crdtshadow.MirrorSporeStatus(root, result.Receipt.SpaceID, result.SporeID, result.NewSporeStatus)
 	}
 
 	return emit("graft", result, *format, func(w io.Writer, data any) error {
@@ -1916,6 +1937,7 @@ func cmdTraceStart(args []string) error {
 	if err != nil {
 		return err
 	}
+	crdtshadow.MirrorTrace(root, tr)
 
 	return emit("trace start", tr, *format, func(w io.Writer, data any) error {
 		t, ok := data.(types.Trace)
@@ -1945,12 +1967,19 @@ func cmdTraceTick(args []string) error {
 	if err != nil {
 		return err
 	}
-	spaceRoot, _, err := resolveSpaceForTrace(root, *spaceFlag)
+	spaceRoot, spaceURI, err := resolveSpaceForTrace(root, *spaceFlag)
 	if err != nil {
 		return err
 	}
 	if err := trace.Tick(spaceRoot, traceID, msg); err != nil {
 		return err
+	}
+	// Best-effort mirror: re-load the trace to capture the new tick state.
+	if updated, lerr := trace.LoadByID(spaceRoot, traceID); lerr == nil {
+		if updated.SpaceID == "" {
+			updated.SpaceID = spaceURI
+		}
+		crdtshadow.MirrorTrace(root, updated)
 	}
 	fmt.Fprintf(os.Stderr, "tick: %s  %s\n", traceID, msg)
 	return nil
@@ -1982,6 +2011,7 @@ func cmdTraceDone(args []string) error {
 	if err != nil {
 		return err
 	}
+	crdtshadow.MirrorTrace(root, tr)
 
 	return emit("trace done", tr, *format, func(w io.Writer, data any) error {
 		t, ok := data.(types.Trace)
@@ -2100,6 +2130,15 @@ func cmdTraceReap(args []string) error {
 		}
 		all = append(all, spaceReap{Space: "hypha://" + sp.URI, Report: rep})
 		totalReaped += len(rep.Reaped)
+		// Mirror the reaped (now-killed) traces.
+		for _, reaped := range rep.Reaped {
+			if updated, lerr := trace.LoadByID(sp.Path, reaped.ID); lerr == nil {
+				if updated.SpaceID == "" {
+					updated.SpaceID = "hypha://" + sp.URI
+				}
+				crdtshadow.MirrorTrace(root, updated)
+			}
+		}
 	}
 
 	payload := map[string]any{

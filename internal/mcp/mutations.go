@@ -13,6 +13,7 @@ import (
 	"m31labs.dev/hyphae/internal/analyze"
 	"m31labs.dev/hyphae/internal/atomicfs"
 	"m31labs.dev/hyphae/internal/capability"
+	"m31labs.dev/hyphae/internal/crdtshadow"
 	"m31labs.dev/hyphae/internal/db"
 	"m31labs.dev/hyphae/internal/graft"
 	"m31labs.dev/hyphae/internal/identity"
@@ -154,6 +155,9 @@ func writeTools(s *Server) []toolSpec {
 				if err := trace.Tick(root, id, msg); err != nil {
 					return nil, err
 				}
+				if updated, lerr := trace.LoadByID(root, id); lerr == nil {
+					crdtshadow.MirrorTrace(s.installRoot, updated)
+				}
 				return map[string]any{"trace_id": id, "message": msg, "ok": true}, nil
 			},
 		},
@@ -180,7 +184,12 @@ func writeTools(s *Server) []toolSpec {
 				if err != nil {
 					return nil, err
 				}
-				return trace.Done(root, id, status, stringArg(args, "link_spore"))
+				tr, err := trace.Done(root, id, status, stringArg(args, "link_spore"))
+				if err != nil {
+					return nil, err
+				}
+				crdtshadow.MirrorTrace(s.installRoot, tr)
+				return tr, nil
 			},
 		},
 		{
@@ -388,6 +397,10 @@ func doSporeSubmit(installRoot, path string, sign bool, signer string) (any, err
 	if wErr := receipts.Write(conn, receipt); wErr != nil && !errors.Is(wErr, receipts.ErrAlreadyExists) {
 		return nil, fmt.Errorf("persist receipt: %w", wErr)
 	}
+	sp.FilePath = filePath
+	sp.ContentHash = receipt.ContentHash
+	crdtshadow.MirrorSpore(installRoot, sp)
+	crdtshadow.MirrorReceipt(installRoot, receipt)
 	return map[string]any{"receipt": receipt, "file_path": filePath, "signed": sign}, nil
 }
 
@@ -448,6 +461,8 @@ func doSporeReview(installRoot, sporeID, reviewer, reason, spaceFlag, newStatus 
 		defer conn.Close()
 		_ = receipts.Write(conn, receipt) // best-effort
 	}
+	crdtshadow.MirrorSporeStatus(installRoot, spaceURI, sporeID, newStatus)
+	crdtshadow.MirrorReceipt(installRoot, receipt)
 	return map[string]any{
 		"spore_id":     sporeID,
 		"status_was":   cur,
@@ -504,6 +519,16 @@ func doGraft(conn *sql.DB, installRoot, sporeID, grafter, spaceURI string, apply
 		_ = res
 	}
 
+	// Mirror canonical writes + receipt + edges + spore status into the per-space CRDT shadow (skipped in dry-run).
+	if !res.DryRun {
+		crdtshadow.MirrorReceipt(installRoot, res.Receipt)
+		crdtshadow.MirrorCanonical(installRoot, res.Receipt.SpaceID, res.TouchedFiles)
+		for _, e := range res.AppliedEdges {
+			crdtshadow.MirrorEdge(installRoot, res.Receipt.SpaceID, e)
+		}
+		crdtshadow.MirrorSporeStatus(installRoot, res.Receipt.SpaceID, res.SporeID, res.NewSporeStatus)
+	}
+
 	payload := map[string]any{
 		"spore_id":     res.SporeID,
 		"status_now":   res.NewSporeStatus,
@@ -536,11 +561,16 @@ func doTraceStart(installRoot, agent, task, phase, parent, session, spaceFlag st
 	if err != nil {
 		return nil, err
 	}
-	return trace.Start(trace.StartOpts{
+	tr, err := trace.Start(trace.StartOpts{
 		SpaceRoot: spaceRoot, SpaceID: spaceURI,
 		AgentID: agent, AgentParent: parent, AgentSession: session,
 		TaskRef: task, Phase: phase,
 	})
+	if err != nil {
+		return nil, err
+	}
+	crdtshadow.MirrorTrace(installRoot, tr)
+	return tr, nil
 }
 
 func doTraceReap(installRoot, spaceFilter string, older time.Duration) (any, error) {
@@ -564,6 +594,14 @@ func doTraceReap(installRoot, spaceFilter string, older time.Duration) (any, err
 		}
 		all = append(all, out{Space: "hypha://" + sp.URI, Report: rep})
 		total += len(rep.Reaped)
+		for _, reaped := range rep.Reaped {
+			if updated, lerr := trace.LoadByID(sp.Path, reaped.ID); lerr == nil {
+				if updated.SpaceID == "" {
+					updated.SpaceID = "hypha://" + sp.URI
+				}
+				crdtshadow.MirrorTrace(installRoot, updated)
+			}
+		}
 	}
 	return map[string]any{
 		"older_than":   older.String(),
@@ -623,6 +661,19 @@ func doCapIssue(installRoot, subject, space, permsCSV string, expires time.Durat
 	if err != nil {
 		return nil, err
 	}
+	// Mirror as a cap:issue receipt for federation.
+	crdtshadow.MirrorReceipt(installRoot, types.Receipt{
+		ID:              fmt.Sprintf("hypha-receipt:%s:capissue-%s", time.Now().UTC().Format("2006-01-02"), cap.ID),
+		SpaceID:         cap.SpaceID,
+		SubjectID:       cap.Subject,
+		SubjectKind:     "agent",
+		Action:          "cap:issue",
+		Status:          "issued",
+		IdentityID:      cap.IssuedBy,
+		CreatedAt:       cap.IssuedAt,
+		PermissionsUsed: []string{"permission:grant"},
+		NextState:       "active",
+	})
 	return map[string]any{"token": cap.ID, "capability": cap}, nil
 }
 
