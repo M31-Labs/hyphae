@@ -37,6 +37,7 @@ import (
 	"m31labs.dev/hyphae/internal/graft"
 	"m31labs.dev/hyphae/internal/graph"
 	"m31labs.dev/hyphae/internal/identity"
+	"m31labs.dev/hyphae/internal/mcp"
 	"m31labs.dev/hyphae/internal/parser"
 	"m31labs.dev/hyphae/internal/pulse"
 	"m31labs.dev/hyphae/internal/recall"
@@ -83,6 +84,7 @@ Usage:
   hypha analyze  list   [--kind <k>] [--space <uri>] [--target-file <path>] [--format text|json|compact]
   hypha analyze  refresh <id> [--space <uri>] [--source <path>]
   hypha receipts list   [--space <uri>] [--subject <uri>] [--action <name>] [--since 24h] [--limit N] [--format text|json|compact]
+  hypha mcp      serve                              MCP stdio server (JSON-RPC 2.0; read-only tools)
 
 Separate binary for the browser visualization (GoSX-based):
   hypha-viz       [--addr 127.0.0.1:7777] [--root <hyphae-home>]
@@ -174,9 +176,33 @@ func run(args []string) error {
 		return cmdTrace(rest)
 	case "analyze":
 		return cmdAnalyze(rest)
+	case "mcp":
+		return cmdMCP(rest)
 	default:
 		return fmt.Errorf("unknown command %q (try `hypha help`)", group)
 	}
+}
+
+// --- mcp -------------------------------------------------------------------
+
+func cmdMCP(args []string) error {
+	if len(args) == 0 || args[0] != "serve" {
+		return errors.New("usage: hypha mcp serve")
+	}
+	root, err := resolveRoot("")
+	if err != nil {
+		return err
+	}
+	conn, err := openIndex(root)
+	if err != nil {
+		return err
+	}
+	defer conn.Close()
+	srv := mcp.NewServer(conn, root, mcp.ServerInfo{
+		Name:    "hyphae",
+		Version: hyphaeVersion,
+	})
+	return srv.Serve()
 }
 
 // --- pulse -----------------------------------------------------------------

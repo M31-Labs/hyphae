@@ -1,0 +1,95 @@
+package mcp
+
+import (
+	"bytes"
+	"encoding/json"
+	"path/filepath"
+	"strings"
+	"testing"
+
+	"m31labs.dev/hyphae/internal/db"
+	"m31labs.dev/hyphae/internal/recall"
+	"m31labs.dev/hyphae/internal/types"
+)
+
+func TestServer_InitializeListAndCall(t *testing.T) {
+	conn, err := db.Open(filepath.Join(t.TempDir(), "mcp.db"))
+	if err != nil {
+		t.Fatalf("db.Open: %v", err)
+	}
+	defer conn.Close()
+
+	// Seed one indexable object so recall has something to find.
+	if err := recall.IndexBatch(conn, []types.Object{
+		{
+			ID: "concept.envelope", Type: types.TypeConcept,
+			SpaceID: "test/space", Title: "Envelope",
+			Summary: "Uniform JSON envelope for hyphae CLI output.",
+			Body:    "The envelope wraps every command's data under a stable schema. Agents reach for it because parsing is uniform.",
+		},
+	}); err != nil {
+		t.Fatalf("seed IndexBatch: %v", err)
+	}
+
+	requests := []string{
+		`{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","clientInfo":{"name":"t","version":"0"},"capabilities":{}}}`,
+		`{"jsonrpc":"2.0","id":2,"method":"tools/list"}`,
+		`{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"hypha_recall","arguments":{"query":"envelope"}}}`,
+	}
+	in := strings.NewReader(strings.Join(requests, "\n") + "\n")
+	out := &bytes.Buffer{}
+
+	s := NewServer(conn, t.TempDir(), ServerInfo{Name: "test", Version: "0"})
+	s.in = in
+	s.out = out
+	s.log = &bytes.Buffer{}
+
+	if err := s.Serve(); err != nil {
+		t.Fatalf("Serve: %v", err)
+	}
+
+	lines := strings.Split(strings.TrimSpace(out.String()), "\n")
+	if len(lines) != 3 {
+		t.Fatalf("expected 3 response lines, got %d:\n%s", len(lines), out.String())
+	}
+
+	// 1. initialize response carries serverInfo + protocolVersion.
+	var init map[string]any
+	if err := json.Unmarshal([]byte(lines[0]), &init); err != nil {
+		t.Fatalf("init: bad json: %v", err)
+	}
+	result, _ := init["result"].(map[string]any)
+	if result["protocolVersion"] != ProtocolVersion {
+		t.Errorf("init.result.protocolVersion = %v, want %s", result["protocolVersion"], ProtocolVersion)
+	}
+
+	// 2. tools/list response has > 0 tools.
+	var list map[string]any
+	if err := json.Unmarshal([]byte(lines[1]), &list); err != nil {
+		t.Fatalf("tools/list: bad json: %v", err)
+	}
+	lr, _ := list["result"].(map[string]any)
+	tools, _ := lr["tools"].([]any)
+	if len(tools) == 0 {
+		t.Error("tools/list returned no tools")
+	}
+
+	// 3. tools/call hypha_recall returns content with embedded envelope.
+	var call map[string]any
+	if err := json.Unmarshal([]byte(lines[2]), &call); err != nil {
+		t.Fatalf("tools/call: bad json: %v", err)
+	}
+	cr, _ := call["result"].(map[string]any)
+	content, _ := cr["content"].([]any)
+	if len(content) != 1 {
+		t.Fatalf("expected 1 content block, got %d", len(content))
+	}
+	textBlock, _ := content[0].(map[string]any)
+	text, _ := textBlock["text"].(string)
+	if !strings.Contains(text, `"command": "hypha_recall"`) {
+		t.Errorf("envelope command missing in tool response; got: %s", text)
+	}
+	if !strings.Contains(text, `"Envelope"`) {
+		t.Errorf("expected to find the seeded object's title 'Envelope' in response; got: %s", text)
+	}
+}
