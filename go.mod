@@ -6,6 +6,7 @@ require (
 	github.com/google/uuid v1.6.0
 	github.com/gorilla/websocket v1.5.3
 	github.com/mattn/go-isatty v0.0.20
+	golang.org/x/sys v0.42.0
 	gopkg.in/yaml.v3 v3.0.1
 	m31labs.dev/gosx v0.21.0
 	m31labs.dev/mdpp v0.4.0
@@ -25,7 +26,6 @@ require (
 	github.com/rivo/uniseg v0.4.7 // indirect
 	golang.org/x/image v0.38.0 // indirect
 	golang.org/x/net v0.52.0 // indirect
-	golang.org/x/sys v0.42.0 // indirect
 	golang.org/x/text v0.35.0 // indirect
 	google.golang.org/genproto/googleapis/rpc v0.0.0-20260120221211-b8f7ae30c516 // indirect
 	google.golang.org/grpc v1.80.0 // indirect

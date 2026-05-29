@@ -16,6 +16,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"time"
 )
 
 // ProtocolVersion is the MCP version this server advertises.
@@ -29,14 +30,21 @@ type ServerInfo struct {
 
 // Server is the long-lived stdio MCP server.
 type Server struct {
-	conn       *sql.DB
+	conn        *sql.DB
 	installRoot string
-	in         io.Reader
-	out        io.Writer
-	log        io.Writer
-	info       ServerInfo
-	tools      []toolSpec
+	in          io.Reader
+	out         io.Writer
+	log         io.Writer
+	info        ServerInfo
+	tools       []toolSpec
+	idleTimeout time.Duration // 0 = no timeout (run until stdin closes)
 }
+
+// SetIdleTimeout makes Serve return (drain) after d elapses with no input.
+// Zero (the default) disables it — Serve then runs until stdin closes. Used
+// by `hypha mcp serve` so an idle or hung session can't pin the daemon's
+// memory indefinitely.
+func (s *Server) SetIdleTimeout(d time.Duration) { s.idleTimeout = d }
 
 // NewServer builds an MCP server bound to a hyphae index DB and the
 // install root that owns its spaces.
@@ -53,25 +61,70 @@ func NewServer(conn *sql.DB, installRoot string, info ServerInfo) *Server {
 	return s
 }
 
-// Serve runs the request/response loop until stdin closes or a fatal
-// transport error occurs.
+// Serve runs the request/response loop until stdin closes, a fatal
+// transport error occurs, or — when SetIdleTimeout is set — the client
+// stays idle longer than the timeout. Reading happens on a goroutine so the
+// idle timer can fire while we're blocked waiting for the next message.
 func (s *Server) Serve() error {
-	scanner := bufio.NewScanner(s.in)
-	// MCP messages can be larger than the default 64 KiB scanner buffer.
-	scanner.Buffer(make([]byte, 0, 64*1024), 8*1024*1024)
-	for scanner.Scan() {
-		line := scanner.Bytes()
-		if len(line) == 0 {
-			continue
+	lines := make(chan []byte)
+	scanErr := make(chan error, 1)
+	done := make(chan struct{})
+	defer close(done) // releases the reader goroutine when Serve returns
+
+	go func() {
+		scanner := bufio.NewScanner(s.in)
+		// MCP messages can be larger than the default 64 KiB scanner buffer.
+		scanner.Buffer(make([]byte, 0, 64*1024), 8*1024*1024)
+		for scanner.Scan() {
+			// scanner reuses its internal buffer; copy before handing off.
+			b := append([]byte(nil), scanner.Bytes()...)
+			select {
+			case lines <- b:
+			case <-done:
+				return
+			}
 		}
-		var msg rpcRequest
-		if err := json.Unmarshal(line, &msg); err != nil {
-			fmt.Fprintf(s.log, "mcp: bad json from client: %v\n", err)
-			continue
-		}
-		s.dispatch(msg)
+		scanErr <- scanner.Err()
+		close(lines)
+	}()
+
+	var idleC <-chan time.Time
+	var timer *time.Timer
+	if s.idleTimeout > 0 {
+		timer = time.NewTimer(s.idleTimeout)
+		defer timer.Stop()
+		idleC = timer.C
 	}
-	return scanner.Err()
+
+	for {
+		select {
+		case line, ok := <-lines:
+			if !ok {
+				return <-scanErr
+			}
+			if timer != nil {
+				if !timer.Stop() {
+					select {
+					case <-timer.C:
+					default:
+					}
+				}
+				timer.Reset(s.idleTimeout)
+			}
+			if len(line) == 0 {
+				continue
+			}
+			var msg rpcRequest
+			if err := json.Unmarshal(line, &msg); err != nil {
+				fmt.Fprintf(s.log, "mcp: bad json from client: %v\n", err)
+				continue
+			}
+			s.dispatch(msg)
+		case <-idleC:
+			fmt.Fprintf(s.log, "mcp: idle for %s, draining\n", s.idleTimeout)
+			return nil
+		}
+	}
 }
 
 // rpcRequest is one JSON-RPC 2.0 request envelope. Notifications have no

@@ -47,6 +47,7 @@ import (
 	"m31labs.dev/hyphae/internal/mcp"
 	"m31labs.dev/hyphae/internal/parser"
 	"m31labs.dev/hyphae/internal/peers"
+	"m31labs.dev/hyphae/internal/proclife"
 	"m31labs.dev/hyphae/internal/pulse"
 	"m31labs.dev/hyphae/internal/recall"
 	"m31labs.dev/hyphae/internal/receipts"
@@ -613,6 +614,11 @@ func cmdHubServe(args []string) error {
 		return err
 	}
 
+	// Don't outlive the session that spawned us: a crashed/OOM-killed parent
+	// must not leave this hub resident holding every space's CRDT doc. Sends
+	// SIGTERM on parent death, which the signal handler below drains cleanly.
+	_ = proclife.DieWithParent()
+
 	root, err := resolveRoot("")
 	if err != nil {
 		return err
@@ -956,8 +962,19 @@ func cmdPeerRemove(args []string) error {
 
 func cmdMCP(args []string) error {
 	if len(args) == 0 || args[0] != "serve" {
-		return errors.New("usage: hypha mcp serve")
+		return errors.New("usage: hypha mcp serve [--idle-timeout DUR]")
 	}
+	fs := flag.NewFlagSet("mcp serve", flag.ContinueOnError)
+	idle := fs.Duration("idle-timeout", mcpIdleTimeoutDefault(),
+		"self-drain after this much inactivity (0 disables); overridable via HYPHA_MCP_IDLE_TIMEOUT")
+	if err := fs.Parse(args[1:]); err != nil {
+		return err
+	}
+
+	// Don't outlive the session that spawned us: a crashed/OOM-killed parent
+	// must not leave this daemon resident. Linux-only; no-op elsewhere.
+	_ = proclife.DieWithParent()
+
 	root, err := resolveRoot("")
 	if err != nil {
 		return err
@@ -971,7 +988,19 @@ func cmdMCP(args []string) error {
 		Name:    "hyphae",
 		Version: hyphaeVersion,
 	})
+	srv.SetIdleTimeout(*idle)
 	return srv.Serve()
+}
+
+// mcpIdleTimeoutDefault is the default `mcp serve` idle drain, overridable
+// via HYPHA_MCP_IDLE_TIMEOUT (e.g. "0" to disable, "10m", "1h").
+func mcpIdleTimeoutDefault() time.Duration {
+	if v := os.Getenv("HYPHA_MCP_IDLE_TIMEOUT"); v != "" {
+		if d, err := time.ParseDuration(v); err == nil {
+			return d
+		}
+	}
+	return 30 * time.Minute
 }
 
 // --- pulse -----------------------------------------------------------------

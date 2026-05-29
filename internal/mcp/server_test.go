@@ -4,10 +4,12 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"m31labs.dev/hyphae/internal/db"
 	"m31labs.dev/hyphae/internal/recall"
@@ -170,5 +172,38 @@ func TestServer_TruncationWarningsWhenOverBudget(t *testing.T) {
 	// Empty spaces → empty list → response well-formed and tiny.
 	if !strings.Contains(out.String(), `\"command\":\"hypha_spore_list\"`) {
 		t.Errorf("expected command spore_list in response; got: %s", out.String())
+	}
+}
+
+// TestServe_IdleTimeoutDrains verifies a long-running mcp serve process
+// self-drains after the idle timeout when its (live) client sends nothing —
+// so an idle/hung session can't pin the daemon's memory indefinitely.
+func TestServe_IdleTimeoutDrains(t *testing.T) {
+	conn, err := db.Open(filepath.Join(t.TempDir(), "mcp.db"))
+	if err != nil {
+		t.Fatalf("db.Open: %v", err)
+	}
+	defer conn.Close()
+
+	// A pipe with no writes: the reader stays open (client alive) but idle.
+	pr, pw := io.Pipe()
+	defer pw.Close() // release the scan goroutine after the assertion
+
+	s := NewServer(conn, t.TempDir(), ServerInfo{Name: "test", Version: "0"})
+	s.in = pr
+	s.out = &bytes.Buffer{}
+	s.log = &bytes.Buffer{}
+	s.SetIdleTimeout(50 * time.Millisecond)
+
+	done := make(chan error, 1)
+	go func() { done <- s.Serve() }()
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("Serve returned error on idle drain: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Serve did not drain after idle timeout — still blocked on input")
 	}
 }
