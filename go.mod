@@ -9,7 +9,7 @@ require (
 	golang.org/x/sys v0.42.0
 	gopkg.in/yaml.v3 v3.0.1
 	m31labs.dev/gosx v0.21.0
-	m31labs.dev/mdpp v0.4.0
+	m31labs.dev/mdpp v0.4.1
 	modernc.org/sqlite v1.34.5
 )
 
@@ -18,7 +18,7 @@ require (
 	github.com/klauspost/cpuid/v2 v2.0.9 // indirect
 	github.com/ncruces/go-strftime v0.1.9 // indirect
 	github.com/odvcencio/corkscrewdb v0.2.0 // indirect
-	github.com/odvcencio/gotreesitter v0.20.0-rc2.0.20260528222341-03fd3f7251f6 // indirect
+	github.com/odvcencio/gotreesitter v0.20.0-rc2.0.20260529194451-f42a68be4f9f // indirect
 	github.com/odvcencio/manta v0.0.13 // indirect
 	github.com/odvcencio/mll v0.0.1 // indirect
 	github.com/odvcencio/turboquant v0.1.3 // indirect
