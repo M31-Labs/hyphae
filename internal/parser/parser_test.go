@@ -1,7 +1,9 @@
 package parser
 
 import (
+	"errors"
 	"os"
+	"path/filepath"
 	"testing"
 
 	"m31labs.dev/hyphae/internal/types"
@@ -118,6 +120,110 @@ func TestParseFile(t *testing.T) {
 		obj.Title, obj.Summary, len(anchors), len(edges))
 }
 
+func TestParseFileWithLimitsRefusesOversizedFile(t *testing.T) {
+	root := t.TempDir()
+	path := filepath.Join(root, "big.md")
+	writeParserTestFile(t, path, `---
+id: concept.big
+type: concept
+---
+
+# Big
+
+This file is intentionally larger than the configured parser limit.
+`)
+
+	_, _, _, err := ParseFileWithLimits(path, "test/space", Limits{MaxFileBytes: 32})
+	if !errors.Is(err, ErrLimitExceeded) {
+		t.Fatalf("ParseFileWithLimits error = %v, want ErrLimitExceeded", err)
+	}
+}
+
+func TestParseFileWithLimitsCapsAnchorsAndEdges(t *testing.T) {
+	root := t.TempDir()
+	path := filepath.Join(root, "capped.md")
+	writeParserTestFile(t, path, `---
+id: concept.capped
+type: concept
+related: [concept.one, concept.two, concept.three]
+---
+
+# Capped
+
+[[alpha]] [[beta]] [[gamma]]
+
+## One
+
+## Two
+
+## Three
+`)
+
+	_, anchors, edges, err := ParseFileWithLimits(path, "test/space", Limits{MaxAnchors: 2, MaxEdges: 2})
+	if err != nil {
+		t.Fatalf("ParseFileWithLimits: %v", err)
+	}
+	if len(anchors) != 2 {
+		t.Fatalf("anchors = %d, want 2", len(anchors))
+	}
+	if len(edges) != 2 {
+		t.Fatalf("edges = %d, want 2", len(edges))
+	}
+}
+
+func TestWalkSpaceWithOptionsHonorsMarkdownLimit(t *testing.T) {
+	root := t.TempDir()
+	writeParserTestFile(t, filepath.Join(root, "one.md"), objectBody("concept.one"))
+	writeParserTestFile(t, filepath.Join(root, "two.md"), objectBody("concept.two"))
+
+	opts := DefaultWalkOptions()
+	opts.Limits.MaxMarkdownFiles = 1
+	_, err := WalkSpaceWithOptions(root, "test/space", opts, nil)
+	if !errors.Is(err, ErrLimitExceeded) {
+		t.Fatalf("WalkSpaceWithOptions error = %v, want ErrLimitExceeded", err)
+	}
+}
+
+func TestWalkSpaceWithOptionsSkipsDeepFiles(t *testing.T) {
+	root := t.TempDir()
+	writeParserTestFile(t, filepath.Join(root, "deep", "too-deep.md"), objectBody("concept.deep"))
+
+	opts := DefaultWalkOptions()
+	opts.Limits.MaxDepth = 1
+	stats, err := WalkSpaceWithOptions(root, "test/space", opts, nil)
+	if err != nil {
+		t.Fatalf("WalkSpaceWithOptions: %v", err)
+	}
+	if stats.FilesParsed != 0 {
+		t.Fatalf("FilesParsed = %d, want 0", stats.FilesParsed)
+	}
+	if stats.FilesSkipped != 1 {
+		t.Fatalf("FilesSkipped = %d, want 1", stats.FilesSkipped)
+	}
+}
+
+func objectBody(id string) string {
+	return `---
+id: ` + id + `
+type: concept
+---
+
+# Test
+
+Body.
+`
+}
+
+func writeParserTestFile(t *testing.T, path, body string) {
+	t.Helper()
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatalf("MkdirAll: %v", err)
+	}
+	if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+}
+
 // TestSlugify tests the slug helper.
 func TestSlugify(t *testing.T) {
 	cases := []struct {
@@ -176,7 +282,7 @@ func TestResolveWikilink(t *testing.T) {
 		{"spore", "concept.spore"},
 		{"../concepts/spore", "concept.spore"},
 		{"../decisions/0001-foo", "decision.0001-foo"},
-		{"concept.hyphae", "concept.hyphae"},                         // already qualified
+		{"concept.hyphae", "concept.hyphae"},                                           // already qualified
 		{"hypha://m31labs/hyphae/concepts/foo", "hypha://m31labs/hyphae/concepts/foo"}, // URI
 	}
 	for _, c := range cases {
