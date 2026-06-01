@@ -1,2 +1,38 @@
-{"_id":"q1","text":"how is the knowledge index stored"}
-{"_id":"q2","text":"what is a spore"}
+{"_id":"q01","text":"how is the knowledge index stored and what is the source of truth"}
+{"_id":"q02","text":"what is a spore"}
+{"_id":"q03","text":"how do agents contribute changes to canonical knowledge"}
+{"_id":"q04","text":"why don't ephemeral agents write directly to canonical files"}
+{"_id":"q05","text":"how does grafting a spore into canonical notes work"}
+{"_id":"q06","text":"capability token permission model"}
+{"_id":"q07","text":"how does hyphae handle identity signing and verification"}
+{"_id":"q08","text":"why are responses token budgeted and how does the context budget work"}
+{"_id":"q09","text":"how does federation share and version hyphae networks"}
+{"_id":"q10","text":"where does hyphae install and why not into source repos"}
+{"_id":"q11","text":"what is a lesson and when do we write one"}
+{"_id":"q12","text":"what does pulse show about recent activity"}
+{"_id":"q13","text":"what is a trace and how does in-flight process telemetry work"}
+{"_id":"q14","text":"what is a skill in hyphae"}
+{"_id":"q15","text":"what are specs and plans as first class types"}
+{"_id":"q16","text":"how is initiative alignment scored for a task or change"}
+{"_id":"q17","text":"agent runtime adapters across claude and codex"}
+{"_id":"q18","text":"what is hyphae the federated knowledge graph for agents"}
+{"_id":"q19","text":"why is markdown plus plus the substrate"}
+{"_id":"q20","text":"selective adoption of mdast conventions"}
+{"_id":"q21","text":"crdt and sqlite change log as the federation substrate"}
+{"_id":"q22","text":"real time federation via crdt design"}
+{"_id":"q23","text":"what did we learn shipping the v0.1.6 local loop"}
+{"_id":"q24","text":"signed spores must not be mutated after signing"}
+{"_id":"q25","text":"gbrain comparison what to adapt for hybrid retrieval"}
+{"_id":"q26","text":"buckley and hyphae alignment integration"}
+{"_id":"q27","text":"hyphae federation and agent report back initiative"}
+{"_id":"q28","text":"retrieval eval harness does dense embedder beat fts5"}
+{"_id":"q29","text":"how to evaluate retrieval quality with a gold set"}
+{"_id":"q30","text":"capability surface what operations does hyphae expose"}
+{"_id":"q31","text":"hyphae http api endpoints"}
+{"_id":"q32","text":"using canopy code intelligence for go blast radius"}
+{"_id":"q33","text":"when to emit trace ticks at natural boundaries"}
+{"_id":"q34","text":"assessing changes before non trivial work alignment gate"}
+{"_id":"q35","text":"how to recall and contribute using hyphae"}
+{"_id":"q36","text":"gosx engine surface completion spec"}
+{"_id":"q37","text":"plan phases for real time federation v0.2"}
+{"_id":"q38","text":"when should embeddings be added and why were they deferred"}
