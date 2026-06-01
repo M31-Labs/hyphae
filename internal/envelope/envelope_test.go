@@ -193,6 +193,8 @@ func TestParseFormat(t *testing.T) {
 	}{
 		{"text", FormatText, false},
 		{"json", FormatJSON, false},
+		{"jsonline", FormatJSONLine, false},
+		{"line", FormatJSONLine, false},
 		{"compact", FormatCompact, false},
 		{"JSON", FormatJSON, false},
 		{" Compact ", FormatCompact, false},
@@ -208,5 +210,12 @@ func TestParseFormat(t *testing.T) {
 				t.Errorf("ParseFormat(%q) = %v, want %v", c.in, got, c.want)
 			}
 		})
+	}
+}
+
+func TestAutoDetectHonorsJSONLineEnv(t *testing.T) {
+	t.Setenv("HYPHAE_FORMAT", "jsonline")
+	if got := AutoDetect(); got != FormatJSONLine {
+		t.Fatalf("AutoDetect() = %v, want %v", got, FormatJSONLine)
 	}
 }

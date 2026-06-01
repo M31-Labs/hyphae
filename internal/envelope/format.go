@@ -79,6 +79,8 @@ func AutoDetect() Format {
 			return FormatText
 		case "json":
 			return FormatJSON
+		case "jsonline", "json-line", "line":
+			return FormatJSONLine
 		case "compact":
 			return FormatCompact
 		}
