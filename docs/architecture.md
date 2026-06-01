@@ -15,10 +15,12 @@ hyphae/
 │   ├── atomicfs/          # temp+rename atomic file writes
 │   ├── capability/        # Scoped capability tokens
 │   ├── db/                # SQLite open + schema migration
+│   ├── doctor/            # Read-only install diagnostics
 │   ├── envelope/          # Uniform JSON envelope, four formats, TTY detect
 │   ├── graft/             # Spore application engine + dry-run + diff renderer
 │   ├── graph/             # Backlinks/Related/Trace queries over edges
 │   ├── identity/          # Ed25519 keypair gen + identity files
+│   ├── indexer/           # Bounded canonical-file promotion into SQLite/FTS
 │   ├── mcp/               # Model Context Protocol stdio server
 │   ├── parser/            # Walk a space, extract Objects/Anchors/Edges
 │   ├── pulse/             # Time-windowed signal aggregation + cache
@@ -45,7 +47,7 @@ hyphae/
 cmd/hypha  ──┐
              ├─► internal/{envelope, recall, spore, graft, trace, identity,
              │             capability, receipts, graph, pulse, assess, analyze,
-             │             parser, db, mcp, atomicfs, types}
+             │             parser, db, doctor, indexer, mcp, atomicfs, types}
              │
 cmd/hypha-viz ─► internal/{server, vizdata, recall, graph, db}
 
@@ -53,8 +55,11 @@ internal/mcp ────► internal/{recall, spore, graft, trace, identity, ca
                               receipts, graph, pulse, assess, analyze, parser,
                               db, atomicfs, envelope, types}
 
-internal/graft ──► internal/{atomicfs, types, recall (for indexing after apply)}
+internal/graft ──► internal/{atomicfs, types}
                   + m31labs.dev/mdpp (bounded structural edits)
+
+internal/indexer ─► internal/{parser, recall, types}
+                   (streams parser output into objects/anchors/edges/FTS)
 
 internal/trace ──► internal/{atomicfs, types}
 

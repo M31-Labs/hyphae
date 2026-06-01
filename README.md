@@ -133,7 +133,8 @@ post-graft, GoSX-based browser viz (mid-flight).
 Today you can:
 
 - `hypha index rebuild` — walk an install root and populate a SQLite
-  index (FTS5 + objects + anchors + edges) over every space.
+  index (FTS5 + objects + anchors + edges) over every space. Rebuilds
+  stream in bounded batches with file-size/depth/count guards.
 - `hypha recall <query>` — BM25-ranked, token-budgeted full-text search
   returning a compact `summary + hits` response. Each hit carries up to
   three body snippets with anchor-URI + line-range **citations**, so
@@ -142,6 +143,9 @@ Today you can:
   prints the full file; `--path` / `--json` / `--frontmatter` / `--body`
   select a slice. Closes the recall→read loop without URI→path translation.
 - `hypha spaces list` — enumerate installed spaces under `$HYPHAE_HOME/spaces`.
+- `hypha doctor [--strict]` — inspect an install root without mutating it:
+  spaces, parser health, index counts, optional Canopy availability, and
+  actionable recommendations such as `hypha index rebuild`.
 - `hypha spore submit <file> [--sign --as <id>]` — validate, optionally
   Ed25519-sign, write to inbox **atomically**, emit + persist a
   content-hashed receipt.
@@ -186,7 +190,7 @@ For the browser visualization (separate binary, GoSX-based):
 
 ### Output formats
 
-Every read/write command supports `--format text|json|compact|jsonline`:
+Every read/write command supports `--format text|json|jsonline|compact`:
 
 | Format | What | Use when |
 | --- | --- | --- |
@@ -279,6 +283,8 @@ federated independently of any one codebase.
 | `cmd/hypha-viz` | GoSX-based browser visualization (separate binary) |
 | `internal/types` | Object / Anchor / Edge / Spore / Capability / Receipt |
 | `internal/db` | SQLite open + embedded schema migration |
+| `internal/doctor` | Read-only install diagnostics for `hypha doctor` |
+| `internal/indexer` | Bounded canonical-file promotion into objects / anchors / edges / FTS |
 | `internal/parser` | Walk an mdpp space, extract Objects + Anchors + Edges |
 | `internal/spore` | Validate spore frontmatter, sign/verify (Ed25519), write to inbox, emit receipt |
 | `internal/recall` | FTS5 indexer + token-budgeted recall query with snippet/citation extraction |

@@ -5,7 +5,7 @@ in-binary version; this doc is the explained form.
 
 ## Conventions
 
-- All commands accept `--format text|json|compact|jsonline`. See
+- All commands accept `--format text|json|jsonline|compact`. See
   [output-formats.md](output-formats.md). The default auto-detects from
   the TTY.
 - `--space <uri>` filters to one installed space (default: all).
@@ -21,7 +21,10 @@ data payload).
 ## `hypha index rebuild`
 
 Walk the install root and (re)populate `~/.hyphae/.index/hyphae.db`
-(FTS5 + objects + anchors + edges tables) over every space.
+(FTS5 + objects + anchors + edges tables) over every space. The rebuild
+streams files in bounded batches and refuses runaway inputs: oversized
+files, symlinks, excessive directory depth, and excessive markdown counts
+are skipped or rejected before they can dominate memory.
 
 ```bash
 hypha index rebuild [--root <path>]
@@ -98,6 +101,27 @@ Enumerate installed spaces under `$HYPHAE_HOME/spaces`.
 ```bash
 hypha spaces list [--format ...]
 ```
+
+## `hypha doctor`
+
+Inspect an install root without mutating it. Checks the root, installed
+spaces, mdpp/parser health, SQLite index counts, and optional Canopy
+availability. Useful after first setup, before filing a bug, or in CI.
+
+```bash
+hypha doctor [--root <path>] [--skip-canopy] [--strict] [--format ...]
+```
+
+| Flag | Default | Meaning |
+| --- | --- | --- |
+| `--root <path>` | `HYPHAE_HOME` or `~/.hyphae` | Install root override |
+| `--skip-canopy` | `false` | Skip the optional `canopy --version` check |
+| `--strict` | `false` | Exit non-zero if any check is warning or error |
+| `--format ...` | auto | Output format |
+
+The response includes a top-level `status` (`ok`, `warning`, `error`),
+per-space counts, parse errors, index table counts, optional tool checks,
+and recommendations such as running `hypha index rebuild`.
 
 ## `hypha spore submit`
 

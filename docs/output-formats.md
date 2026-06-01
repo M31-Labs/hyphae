@@ -43,7 +43,7 @@ A `Note` looks like:
 
 ## The four formats
 
-Pick with `--format text|json|compact|jsonline`. The default
+Pick with `--format text|json|jsonline|compact`. The default
 auto-detects.
 
 | Format | Bytes | Readable | Use when |

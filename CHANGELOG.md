@@ -5,6 +5,28 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/);
 versioning is [SemVer](https://semver.org/spec/v2.0.0.html) (pre-1.0 — the
 surface can break between minors).
 
+## Unreleased
+
+### Added
+
+- **`hypha doctor`** — read-only install diagnostics for the Hyphae root,
+  installed spaces, parser health, SQLite index counts, optional Canopy
+  availability, and actionable setup/index recommendations. `--strict`
+  exits non-zero on warning/error status for CI.
+- **Bounded streaming index promotion** — `hypha index rebuild` and
+  `hypha_index_rebuild` now stream spaces in small batches with parser
+  guards for file size, markdown count, depth, symlinks, body bytes,
+  anchors, edges, and recorded skip output.
+
+### Fixed
+
+- `HYPHAE_FORMAT=jsonline` is now honored by format auto-detection,
+  matching the documented output-format contract.
+- Real grafts now promote touched canonical files into the object,
+  anchor, edge, and FTS index immediately. `create_file` grafts also
+  refuse canonical files missing object `id`/`type` frontmatter, avoiding
+  silent knowledge loss where a file exists on disk but cannot be recalled.
+
 ## [0.1.8] — 2026-05-28
 
 The "everyday driver" release: standardize the agent-facing surface,
