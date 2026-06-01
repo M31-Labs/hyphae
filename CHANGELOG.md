@@ -7,6 +7,11 @@ surface can break between minors).
 
 ## Unreleased
 
+## [0.1.9] — 2026-06-01
+
+The "measure, don't guess" release: a retrieval-quality eval harness, a major
+recall fix it surfaced, and read-only install diagnostics.
+
 ### Added
 
 - **`hypha doctor`** — read-only install diagnostics for the Hyphae root,
@@ -17,6 +22,12 @@ surface can break between minors).
   `hypha_index_rebuild` now stream spaces in small batches with parser
   guards for file size, markdown count, depth, symlinks, body bytes,
   anchors, edges, and recorded skip output.
+- **`hypha eval retrieval`** — retrieval-quality eval harness. Scores the
+  production FTS5 retriever against manta BM25 and (optional) manta dense on a
+  human-labeled gold set in BEIR format, reporting nDCG@10 / MRR@10 / recall@k
+  and a go/no-go recommendation. Reuses the manta CLI when present and degrades
+  to FTS5-only when it is absent. Results are written under the space root's
+  gitignored `.analyses/eval/`.
 
 ### Fixed
 
@@ -26,6 +37,17 @@ surface can break between minors).
   anchor, edge, and FTS index immediately. `create_file` grafts also
   refuse canonical files missing object `id`/`type` frontmatter, avoiding
   silent knowledge loss where a file exists on disk but cannot be recalled.
+- **Recall uses OR-mode FTS5 matching** instead of implicit-AND. Multi-term
+  natural-language queries no longer match zero documents when a single term
+  (e.g. a stopword) is absent; `bm25` column weights still rank multi-term
+  matches highest. Measured on a 38-query gold set: nDCG@10 0.45 → 0.82,
+  recall@10 0.45 → 0.95.
+
+### Removed
+
+- **`hypha hub`** — the embedded hub-serve command and its GitHub OAuth
+  configuration variables were removed. Hub sync is now client-only against an
+  external hub.
 
 ## [0.1.8] — 2026-05-28
 
