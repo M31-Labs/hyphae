@@ -131,6 +131,53 @@ func objectURI(spaceID, id string) string {
 	return fmt.Sprintf("hypha://%s/object/%s", spaceID, id)
 }
 
+// ScoredID is one ranked object id with its raw FTS5 BM25 score (lower = better
+// per FTS5). Only the order is meaningful to downstream metrics — never the raw
+// magnitude.
+type ScoredID struct {
+	ID    string  `json:"id"`
+	Score float64 `json:"score"`
+}
+
+const rankSQL = `
+SELECT id, bm25(objects_fts, 3.0, 2.0, 2.0, 1.0) AS rank
+FROM objects_fts
+WHERE objects_fts MATCH ? AND space_id = ?
+ORDER BY rank
+LIMIT ?`
+
+// RankIDs returns the top-k object ids for a query against one space's FTS5
+// rows, ordered best-first. spaceID must be the BARE space id (e.g.
+// "m31labs/hyphae", not the "hypha://..." URI). It reuses the same column
+// weights as Recall so it measures the production retriever exactly.
+//
+// An empty or no-term query (the sanitizer keeps only ASCII alphanumerics and
+// spaces) returns (nil, nil); callers score such a query as 0 relevance.
+func RankIDs(conn *sql.DB, spaceID, query string, k int) ([]ScoredID, error) {
+	sanitized := sanitizeQuery(query)
+	if sanitized == "" {
+		return nil, nil
+	}
+	if k <= 0 {
+		k = 100
+	}
+	rows, err := conn.Query(rankSQL, sanitized, spaceID, k)
+	if err != nil {
+		return nil, fmt.Errorf("recall: rank query: %w", err)
+	}
+	defer rows.Close()
+
+	var out []ScoredID
+	for rows.Next() {
+		var s ScoredID
+		if err := rows.Scan(&s.ID, &s.Score); err != nil {
+			return nil, fmt.Errorf("recall: rank scan: %w", err)
+		}
+		out = append(out, s)
+	}
+	return out, rows.Err()
+}
+
 // Recall runs an FTS5 query and returns a budgeted Response.
 // If budget.Shape is empty, defaults to summary+anchors.
 // If budget.MaxResponseTokens is 0, defaults to 800.
