@@ -1,3 +1,7 @@
+// Package hubsync is the client for Hyphae's WebSocket CRDT federation:
+// `hypha sync pull` dials a peer hub and exchanges sync messages. The
+// in-tree hub *server* was removed (2026-05-29) — point pulls at an
+// external or host-managed hub.
 package hubsync
 
 import (
@@ -17,14 +21,14 @@ import (
 
 // PullStats describes one sync pass for reporting.
 type PullStats struct {
-	BytesSent          int      `json:"bytes_sent"`
-	BytesReceived      int      `json:"bytes_received"`
-	FramesSent         int      `json:"frames_sent"`
-	FramesRecv         int      `json:"frames_received"`
-	ChangesBefore      int      `json:"changes_before"`
-	ChangesAfter       int      `json:"changes_after"`
-	Once               bool     `json:"once"`
-	MaterializedFiles  []string `json:"materialized_files,omitempty"`
+	BytesSent         int      `json:"bytes_sent"`
+	BytesReceived     int      `json:"bytes_received"`
+	FramesSent        int      `json:"frames_sent"`
+	FramesRecv        int      `json:"frames_received"`
+	ChangesBefore     int      `json:"changes_before"`
+	ChangesAfter      int      `json:"changes_after"`
+	Once              bool     `json:"once"`
+	MaterializedFiles []string `json:"materialized_files,omitempty"`
 }
 
 // Pull opens a websocket connection to the peer's hub for spaceURI,
@@ -69,9 +73,8 @@ func Pull(ctx context.Context, peerURL, spaceURI, token string, sh *crdtshadow.S
 	beforeCount, _ := sh.Store().CountChanges()
 	stats.ChangesBefore = beforeCount
 
-	// Shared state for one-shot synchronization. The server uses prefix
-	// byte 1 because SyncDocName is registered first; clients send the
-	// same prefix.
+	// Shared state for one-shot synchronization. The hub multiplexes one
+	// CRDT doc on prefix byte 1; clients send the same prefix.
 	const syncPrefix byte = 1
 	state := crdtsync.NewState()
 
@@ -178,6 +181,17 @@ func SchemeForBase(base string) string {
 		return "wss://" + strings.TrimPrefix(base, "https://")
 	}
 	return base
+}
+
+// PathPrefix is the URL path prefix a hub serves each space under, e.g.
+// /sync/hypha%3A%2F%2Fmyorg%2Fknowledge. Clients build peer URLs from it.
+const PathPrefix = "/sync/"
+
+// EndpointURL builds the websocket URL for one space relative to a hub's
+// base URL ("ws://host:port" or "wss://…").
+func EndpointURL(baseURL, spaceURI string) string {
+	base := strings.TrimRight(baseURL, "/")
+	return base + PathPrefix + url.PathEscape(spaceURI)
 }
 
 var _ = crdt.Root // keep the crdt import even when only types used elsewhere
