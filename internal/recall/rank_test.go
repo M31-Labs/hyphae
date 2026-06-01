@@ -49,3 +49,33 @@ func TestRankIDs(t *testing.T) {
 		t.Fatalf("expected nil slice for no-term query, got %v", empty)
 	}
 }
+
+func TestRankIDsORSemantics(t *testing.T) {
+	conn, err := db.Open(t.TempDir() + "/index.db")
+	if err != nil {
+		t.Fatalf("db.Open: %v", err)
+	}
+	defer conn.Close()
+
+	objs := []types.Object{
+		{ID: "concept.spore", Type: "concept", SpaceID: "m31labs/hyphae", Title: "Spore", Summary: "agent contribution unit", Body: "a spore is submitted to the inbox for review"},
+		{ID: "concept.graft", Type: "concept", SpaceID: "m31labs/hyphae", Title: "Graft", Summary: "accepting a spore", Body: "graft applies proposed writes to canonical files"},
+	}
+	if err := IndexBatch(conn, objs); err != nil {
+		t.Fatalf("IndexBatch: %v", err)
+	}
+
+	// Natural-language query: only "spore" appears in any doc; "explain" and
+	// "lifecycle" appear nowhere. Under implicit-AND this matches zero rows;
+	// OR semantics must still surface concept.spore.
+	got, err := RankIDs(conn, "m31labs/hyphae", "explain the spore lifecycle", 10)
+	if err != nil {
+		t.Fatalf("RankIDs: %v", err)
+	}
+	if len(got) == 0 {
+		t.Fatalf("OR-mode should return matches for a partial-term NL query; got none (implicit-AND?)")
+	}
+	if got[0].ID != "concept.spore" {
+		t.Fatalf("top id = %q, want concept.spore", got[0].ID)
+	}
+}

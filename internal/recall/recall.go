@@ -121,6 +121,16 @@ func sanitizeQuery(q string) string {
 	return strings.Join(strings.Fields(b.String()), " ")
 }
 
+// matchExpr builds an FTS5 MATCH expression from free-text by OR-joining the
+// sanitized terms. Implicit-AND (space-joined) made multi-term natural-language
+// queries match zero rows whenever any single term (e.g. a stopword) was absent
+// from a document; the retrieval eval harness measured this capping recall at
+// ~0.45. OR lets bm25() rank documents matching ANY term, favoring those that
+// match more (and higher-weighted) terms. Returns "" when there are no terms.
+func matchExpr(query string) string {
+	return strings.Join(strings.Fields(sanitizeQuery(query)), " OR ")
+}
+
 // estimateTokens returns a rough token count for a string using the len/4 heuristic.
 func estimateTokens(s string) int {
 	return (len(s) + 3) / 4 // ceiling division
@@ -154,7 +164,7 @@ LIMIT ?`
 // An empty or no-term query (the sanitizer keeps only ASCII alphanumerics and
 // spaces) returns (nil, nil); callers score such a query as 0 relevance.
 func RankIDs(conn *sql.DB, spaceID, query string, k int) ([]ScoredID, error) {
-	sanitized := sanitizeQuery(query)
+	sanitized := matchExpr(query)
 	if sanitized == "" {
 		return nil, nil
 	}
@@ -202,7 +212,7 @@ func Recall(conn *sql.DB, query string, limit int, budget types.Budget) (Respons
 		// CitedSpans now naturally maps to hits+snippets+citations; fall through.
 	}
 
-	sanitized := sanitizeQuery(query)
+	sanitized := matchExpr(query)
 
 	// No query terms after sanitization — return empty.
 	if sanitized == "" {
