@@ -1,10 +1,10 @@
 //go:build linux
 
-// Package proclife keeps long-running daemons from outliving the session
-// that spawned them. A `hypha hub serve` / `hypha mcp serve` orphaned by a
-// crashed Claude session would otherwise linger holding every space's CRDT
-// doc in memory — the node-`chi` 2026-05-28 OOM was a ~22 GB orphaned hypha
-// daemon.
+// Package proclife keeps a long-running daemon from outliving the session
+// that spawned it. `hypha mcp serve`, if orphaned by a crashed Claude
+// session, would otherwise linger; the now-removed hub daemon used to hold
+// every space's CRDT doc in memory (the node-`chi` 2026-05-28 OOM was a
+// ~22 GB orphaned hypha daemon).
 package proclife
 
 import "golang.org/x/sys/unix"
