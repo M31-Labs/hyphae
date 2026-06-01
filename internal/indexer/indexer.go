@@ -1,0 +1,224 @@
+// Package indexer promotes canonical Markdown files into the SQLite index.
+package indexer
+
+import (
+	"database/sql"
+	"encoding/json"
+	"fmt"
+	"path/filepath"
+	"time"
+
+	"m31labs.dev/hyphae/internal/parser"
+	"m31labs.dev/hyphae/internal/recall"
+	"m31labs.dev/hyphae/internal/types"
+)
+
+const DefaultBatchSize = 64
+
+// Promotion reports the rows derived from one canonical file.
+type Promotion struct {
+	Object  types.Object
+	Anchors int
+	Edges   int
+}
+
+// RebuildStats describes a bounded space rebuild.
+type RebuildStats struct {
+	Objects        int           `json:"objects"`
+	Anchors        int           `json:"anchors"`
+	Edges          int           `json:"edges"`
+	MarkdownSeen   int           `json:"markdown_seen"`
+	FilesParsed    int           `json:"files_parsed"`
+	FilesSkipped   int           `json:"files_skipped"`
+	DirsSkipped    int           `json:"dirs_skipped"`
+	BytesRead      int64         `json:"bytes_read"`
+	Skips          []parser.Skip `json:"skips,omitempty"`
+	SkipsTruncated bool          `json:"skips_truncated,omitempty"`
+}
+
+// RebuildSpace streams one space through the parser and index in bounded
+// batches. It never stores the whole space in memory.
+func RebuildSpace(conn *sql.DB, spaceRoot, spaceID string, walkOpts parser.WalkOptions, batchSize int) (RebuildStats, error) {
+	if batchSize <= 0 {
+		batchSize = DefaultBatchSize
+	}
+
+	var objects []types.Object
+	var anchors []types.Anchor
+	var edges []types.Edge
+	flush := func() error {
+		if len(objects) == 0 {
+			return nil
+		}
+		if err := recall.IndexBatch(conn, objects); err != nil {
+			return err
+		}
+		if err := PersistObjectsAnchorsEdges(conn, spaceRoot, objects, anchors, edges); err != nil {
+			return err
+		}
+		objects = objects[:0]
+		anchors = anchors[:0]
+		edges = edges[:0]
+		return nil
+	}
+
+	walkStats, err := parser.WalkSpaceWithOptions(spaceRoot, normalizeSpaceID(spaceID), walkOpts, func(item parser.ParsedFile) error {
+		objects = append(objects, item.Object)
+		anchors = append(anchors, item.Anchors...)
+		edges = append(edges, item.Edges...)
+		if len(objects) >= batchSize {
+			return flush()
+		}
+		return nil
+	})
+	if err != nil {
+		return RebuildStats{}, err
+	}
+	if err := flush(); err != nil {
+		return RebuildStats{}, err
+	}
+	return RebuildStats{
+		Objects:        walkStats.Objects,
+		Anchors:        walkStats.Anchors,
+		Edges:          walkStats.Edges,
+		MarkdownSeen:   walkStats.MarkdownSeen,
+		FilesParsed:    walkStats.FilesParsed,
+		FilesSkipped:   walkStats.FilesSkipped,
+		DirsSkipped:    walkStats.DirsSkipped,
+		BytesRead:      walkStats.BytesRead,
+		Skips:          walkStats.Skips,
+		SkipsTruncated: walkStats.SkipsTruncated,
+	}, nil
+}
+
+// PromoteFile parses one canonical Markdown file and updates the object,
+// anchor, parser-derived edge, and FTS rows for it.
+func PromoteFile(conn *sql.DB, spaceRoot, spaceID, path string) (Promotion, error) {
+	spaceID = normalizeSpaceID(spaceID)
+	obj, anchors, edges, err := parser.ParseFile(path, spaceID)
+	if err != nil {
+		return Promotion{}, err
+	}
+	if err := recall.Index(conn, obj); err != nil {
+		return Promotion{}, err
+	}
+	if err := PersistObjectsAnchorsEdges(conn, spaceRoot, []types.Object{obj}, anchors, edges); err != nil {
+		return Promotion{}, err
+	}
+	return Promotion{Object: obj, Anchors: len(anchors), Edges: len(edges)}, nil
+}
+
+// PromoteFiles promotes several canonical files and returns aggregate counts.
+func PromoteFiles(conn *sql.DB, spaceRoot, spaceID string, paths []string) (objects, anchors, edges int, err error) {
+	seen := map[string]bool{}
+	for _, path := range paths {
+		if seen[path] {
+			continue
+		}
+		seen[path] = true
+		p, perr := PromoteFile(conn, spaceRoot, spaceID, path)
+		if perr != nil {
+			return objects, anchors, edges, fmt.Errorf("promote %s: %w", path, perr)
+		}
+		objects++
+		anchors += p.Anchors
+		edges += p.Edges
+	}
+	return objects, anchors, edges, nil
+}
+
+// PersistObjectsAnchorsEdges writes parser output to objects/anchors/edges
+// tables. It refreshes parser-derived rows for each object without touching
+// graft/manual edges.
+func PersistObjectsAnchorsEdges(conn *sql.DB, spacePath string, objects []types.Object, anchors []types.Anchor, edges []types.Edge) error {
+	tx, err := conn.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback() //nolint:errcheck
+
+	now := time.Now().UTC().Format(time.RFC3339)
+
+	for _, o := range objects {
+		if _, err := tx.Exec(`DELETE FROM anchors WHERE object_id = ?`, o.ID); err != nil {
+			return fmt.Errorf("delete stale anchors %q: %w", o.ID, err)
+		}
+		if _, err := tx.Exec(`
+			DELETE FROM edges
+			WHERE src_id = ?
+			  AND COALESCE(derivation, '') IN ('frontmatter', 'linkref', 'wikilink')`,
+			o.ID); err != nil {
+			return fmt.Errorf("delete stale parser edges %q: %w", o.ID, err)
+		}
+
+		tagsJSON := "[]"
+		if len(o.Tags) > 0 {
+			if b, jerr := json.Marshal(o.Tags); jerr == nil {
+				tagsJSON = string(b)
+			}
+		}
+		fileID, _ := filepath.Rel(spacePath, o.FilePath)
+		if fileID == "" {
+			fileID = o.FilePath
+		}
+		updated := now
+		if !o.UpdatedAt.IsZero() {
+			updated = o.UpdatedAt.UTC().Format(time.RFC3339)
+		}
+		if _, err := tx.Exec(`
+			INSERT INTO objects (id, type, space_id, file_id, status, title, tags_json, summary, updated_at)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+			ON CONFLICT(id) DO UPDATE SET
+				type = excluded.type,
+				space_id = excluded.space_id,
+				file_id = excluded.file_id,
+				status = excluded.status,
+				title = excluded.title,
+				tags_json = excluded.tags_json,
+				summary = excluded.summary,
+				updated_at = excluded.updated_at`,
+			o.ID, string(o.Type), o.SpaceID, fileID, o.Status, o.Title, tagsJSON, o.Summary, updated); err != nil {
+			return fmt.Errorf("upsert object %q: %w", o.ID, err)
+		}
+	}
+
+	for _, a := range anchors {
+		if _, err := tx.Exec(`
+			INSERT INTO anchors (id, object_id, heading_path, start_byte, end_byte, start_line, end_line, node_kind)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+			ON CONFLICT(id) DO UPDATE SET
+				object_id = excluded.object_id,
+				heading_path = excluded.heading_path,
+				start_byte = excluded.start_byte,
+				end_byte = excluded.end_byte,
+				start_line = excluded.start_line,
+				end_line = excluded.end_line,
+				node_kind = excluded.node_kind`,
+			a.ID, a.ObjectID, a.HeadingPath, a.StartByte, a.EndByte, a.StartLine, a.EndLine, a.NodeKind); err != nil {
+			return fmt.Errorf("upsert anchor %q: %w", a.ID, err)
+		}
+	}
+
+	for _, e := range edges {
+		conf := e.Confidence
+		if conf == 0 {
+			conf = 1.0
+		}
+		if _, err := tx.Exec(`
+			INSERT OR IGNORE INTO edges (id, kind, src_id, dst_id, confidence, derivation, created_at)
+			VALUES (?, ?, ?, ?, ?, ?, ?)`,
+			e.ID, string(e.Kind), e.SrcID, e.DstID, conf, e.Derivation, now); err != nil {
+			return fmt.Errorf("upsert edge %q: %w", e.ID, err)
+		}
+	}
+
+	return tx.Commit()
+}
+
+func normalizeSpaceID(spaceID string) string {
+	const prefix = "hypha://"
+	if len(spaceID) >= len(prefix) && spaceID[:len(prefix)] == prefix {
+		return spaceID[len(prefix):]
+	}
+	return spaceID
+}
