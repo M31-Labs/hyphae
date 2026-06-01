@@ -17,8 +17,8 @@ import (
 	"m31labs.dev/hyphae/internal/db"
 	"m31labs.dev/hyphae/internal/graft"
 	"m31labs.dev/hyphae/internal/identity"
+	"m31labs.dev/hyphae/internal/indexer"
 	"m31labs.dev/hyphae/internal/parser"
-	"m31labs.dev/hyphae/internal/recall"
 	"m31labs.dev/hyphae/internal/receipts"
 	"m31labs.dev/hyphae/internal/spore"
 	"m31labs.dev/hyphae/internal/trace"
@@ -166,10 +166,10 @@ func writeTools(s *Server) []toolSpec {
 			Description:      "Close a trace with terminal status.",
 			DefaultMaxTokens: 400,
 			InputSchema: schema(merge(map[string]any{
-				"trace_id":    stringProp("trace id (required)"),
-				"status":      enumProp([]string{"succeeded", "failed", "killed", "superseded"}, "terminal status (default succeeded)"),
-				"link_spore":  stringProp("spore id to attribute the work log to"),
-				"space":       stringProp("space URI"),
+				"trace_id":   stringProp("trace id (required)"),
+				"status":     enumProp([]string{"succeeded", "failed", "killed", "superseded"}, "terminal status (default succeeded)"),
+				"link_spore": stringProp("spore id to attribute the work log to"),
+				"space":      stringProp("space URI"),
 			}, budgetProps), []string{"trace_id"}),
 			Handler: func(args map[string]any) (any, error) {
 				id := stringArg(args, "trace_id")
@@ -310,30 +310,24 @@ func doIndexRebuild(installRoot string) (any, error) {
 		return nil, fmt.Errorf("no spaces under %s/spaces/", installRoot)
 	}
 
-	var totalObj, totalAnc, totalEdg int
+	var totalObj, totalAnc, totalEdg, totalSkipped int
 	for _, sp := range spaces {
-		objects, anchors, edges, err := parser.WalkSpace(sp.Path, "hypha://"+sp.URI, false)
+		stats, err := indexer.RebuildSpace(conn, sp.Path, sp.URI, parser.DefaultWalkOptions(), indexer.DefaultBatchSize)
 		if err != nil {
-			return nil, fmt.Errorf("walk %s: %w", sp.Path, err)
-		}
-		if err := recall.IndexBatch(conn, objects); err != nil {
 			return nil, fmt.Errorf("index %s: %w", sp.URI, err)
 		}
-		// Note: MCP rebuild only refreshes FTS; the richer indexer in cmd/hypha
-		// also persists anchors/edges, but those tables are owned by the CLI
-		// path. Here we count what we walked for the response and rely on the
-		// CLI for the full rebuild when needed.
-		totalObj += len(objects)
-		totalAnc += len(anchors)
-		totalEdg += len(edges)
+		totalObj += stats.Objects
+		totalAnc += stats.Anchors
+		totalEdg += stats.Edges
+		totalSkipped += stats.FilesSkipped
 	}
 	return map[string]any{
 		"db":              dbPath,
 		"spaces_indexed":  len(spaces),
 		"objects_indexed": totalObj,
-		"anchors_walked":  totalAnc,
-		"edges_walked":    totalEdg,
-		"note":            "MCP rebuild refreshes FTS only; for full anchors/edges tables run `hypha index rebuild`",
+		"anchors_indexed": totalAnc,
+		"edges_indexed":   totalEdg,
+		"files_skipped":   totalSkipped,
 	}, nil
 }
 
@@ -521,6 +515,10 @@ func doGraft(conn *sql.DB, installRoot, sporeID, grafter, spaceURI string, apply
 
 	// Mirror canonical writes + receipt + edges + spore status into the per-space CRDT shadow (skipped in dry-run).
 	if !res.DryRun {
+		if _, _, _, perr := indexer.PromoteFiles(conn, spaceRoot, res.Receipt.SpaceID, res.TouchedFiles); perr != nil {
+			return nil, fmt.Errorf("promote grafted canonical files into index: %w", perr)
+		}
+
 		crdtshadow.MirrorReceipt(installRoot, res.Receipt)
 		crdtshadow.MirrorCanonical(installRoot, res.Receipt.SpaceID, res.TouchedFiles)
 		for _, e := range res.AppliedEdges {
@@ -530,12 +528,12 @@ func doGraft(conn *sql.DB, installRoot, sporeID, grafter, spaceURI string, apply
 	}
 
 	payload := map[string]any{
-		"spore_id":     res.SporeID,
-		"status_now":   res.NewSporeStatus,
-		"applied":      len(res.AppliedWrites),
-		"skipped":      len(res.SkippedWrites),
-		"touched":     res.TouchedFiles,
-		"dry_run":      res.DryRun,
+		"spore_id":   res.SporeID,
+		"status_now": res.NewSporeStatus,
+		"applied":    len(res.AppliedWrites),
+		"skipped":    len(res.SkippedWrites),
+		"touched":    res.TouchedFiles,
+		"dry_run":    res.DryRun,
 	}
 	if !res.DryRun {
 		payload["receipt"] = res.Receipt
