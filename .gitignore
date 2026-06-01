@@ -2,6 +2,7 @@
 /hypha
 /hypha-viz
 /hypha-lsp
+/dist/
 *.exe
 *.dll
 *.so
