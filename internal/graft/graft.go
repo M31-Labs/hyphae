@@ -9,6 +9,7 @@
 package graft
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"database/sql"
 	"fmt"
@@ -19,6 +20,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"gopkg.in/yaml.v3"
 	"m31labs.dev/hyphae/internal/atomicfs"
 	"m31labs.dev/hyphae/internal/types"
 	"m31labs.dev/mdpp"
@@ -63,9 +65,9 @@ type Result struct {
 
 // AppliedWrite records where a proposed write landed.
 type AppliedWrite struct {
-	Kind       string     // e.g. "append_section"
+	Kind       string // e.g. "append_section"
 	TargetURI  string
-	TargetFile string    // absolute path
+	TargetFile string     // absolute path
 	InsertedAt mdpp.Range // byte range of the inserted content
 }
 
@@ -196,10 +198,10 @@ func ApplyWithOpts(conn *sql.DB, installRoot, spaceRoot, sporeID, grafter string
 		}
 
 		var (
-			aw          *AppliedWrite
-			skip        *SkippedWrite
-			edgeSrc     string
-			fatalErr    error
+			aw       *AppliedWrite
+			skip     *SkippedWrite
+			edgeSrc  string
+			fatalErr error
 		)
 
 		switch pw.Kind {
@@ -429,10 +431,11 @@ func applyCreateFile(
 		return skip("target file already exists; create_file refuses to overwrite")
 	}
 
-	// Verify body parses cleanly BEFORE we commit the write so we never
-	// leave a malformed file on disk (the old version wrote-then-checked).
-	if _, parseErr := mdpp.Parse([]byte(body)); parseErr != nil {
-		return skip(fmt.Sprintf("new file does not parse: %v", parseErr))
+	// Verify body parses cleanly and can become an indexed Hyphae object
+	// BEFORE writing. A canonical file without id/type is silent knowledge
+	// loss: it exists on disk, but recall/index cannot promote it.
+	if objErr := validateCanonicalObjectFrontmatter([]byte(body)); objErr != nil {
+		return skip(objErr.Error())
 	}
 
 	// Create parent directories. Safe in dry-run: makes empty dirs, no harm.
@@ -460,6 +463,67 @@ func applyCreateFile(
 		InsertedAt: mdpp.Range{StartByte: 0, EndByte: len(body)},
 	}
 	return aw, nil, fileCanonicalURI, nil
+}
+
+func validateCanonicalObjectFrontmatter(body []byte) error {
+	fm, err := parseCanonicalFrontmatter(body)
+	if err != nil {
+		return fmt.Errorf("new file frontmatter parse failed: %w", err)
+	}
+	if fm == nil {
+		return fmt.Errorf("new file missing frontmatter")
+	}
+	id, _ := fm["id"].(string)
+	if strings.TrimSpace(id) == "" {
+		return fmt.Errorf("new file frontmatter missing id")
+	}
+	objType, _ := fm["type"].(string)
+	if strings.TrimSpace(objType) == "" {
+		return fmt.Errorf("new file frontmatter missing type")
+	}
+	return nil
+}
+
+func parseCanonicalFrontmatter(data []byte) (map[string]any, error) {
+	firstEnd, firstNext := nextLine(data, 0)
+	if strings.TrimSpace(string(trimCR(data[:firstEnd]))) != "---" {
+		return nil, nil
+	}
+	for pos := firstNext; pos <= len(data); {
+		lineEnd, next := nextLine(data, pos)
+		line := strings.TrimSpace(string(trimCR(data[pos:lineEnd])))
+		if line == "---" || line == "..." {
+			raw := data[firstNext:pos]
+			fm := map[string]any{}
+			if len(bytes.TrimSpace(raw)) == 0 {
+				return fm, nil
+			}
+			if err := yaml.Unmarshal(raw, &fm); err != nil {
+				return nil, err
+			}
+			return fm, nil
+		}
+		if next <= pos {
+			break
+		}
+		pos = next
+	}
+	return nil, nil
+}
+
+func nextLine(data []byte, pos int) (lineEnd, next int) {
+	if pos >= len(data) {
+		return len(data), len(data) + 1
+	}
+	idx := bytes.IndexByte(data[pos:], '\n')
+	if idx < 0 {
+		return len(data), len(data) + 1
+	}
+	return pos + idx, pos + idx + 1
+}
+
+func trimCR(line []byte) []byte {
+	return bytes.TrimSuffix(line, []byte("\r"))
 }
 
 // applyReplaceBlock handles the replace_block write kind.
@@ -541,7 +605,7 @@ func applyReplaceBlock(
 	replacement := headingLine + body
 
 	// Splice: original[:sectionStart] + replacement + original[sectionEnd:]
-	newBytes := make([]byte, 0, len(origBytes)-( sectionEnd-sectionStart)+len(replacement))
+	newBytes := make([]byte, 0, len(origBytes)-(sectionEnd-sectionStart)+len(replacement))
 	newBytes = append(newBytes, origBytes[:sectionStart]...)
 	newBytes = append(newBytes, []byte(replacement)...)
 	newBytes = append(newBytes, origBytes[sectionEnd:]...)

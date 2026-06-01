@@ -506,6 +506,48 @@ func TestApply_CreateFile(t *testing.T) {
 	}
 }
 
+func TestApply_CreateFileRequiresObjectFrontmatter(t *testing.T) {
+	conn := openTestDB(t)
+	installRoot := t.TempDir()
+	spaceRoot := filepath.Join(installRoot, "spaces", "test-space")
+	if err := os.MkdirAll(filepath.Join(spaceRoot, "specs"), 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+
+	sporeID := "spore.2026-05-30.test.missing-object-frontmatter"
+	proposedWritesYAML := `proposed_writes:
+  - kind: create_file
+    target: hypha://test/space
+    path: specs/not-indexable.md
+    body: |
+      ---
+      status: canonical
+      ---
+
+      # Not Indexable
+
+      This should never become canonical without an object id/type.
+`
+	makeSporeFile(t, spaceRoot, sporeID, "agent://test/agent", "unreviewed", proposedWritesYAML)
+
+	result, err := Apply(conn, installRoot, spaceRoot, sporeID, "identity://odvcencio")
+	if err != nil {
+		t.Fatalf("Apply returned error: %v", err)
+	}
+	if len(result.AppliedWrites) != 0 {
+		t.Fatalf("AppliedWrites: want 0, got %d", len(result.AppliedWrites))
+	}
+	if len(result.SkippedWrites) != 1 {
+		t.Fatalf("SkippedWrites: want 1, got %d", len(result.SkippedWrites))
+	}
+	if !strings.Contains(result.SkippedWrites[0].Reason, "missing id") {
+		t.Fatalf("skip reason = %q, want missing id", result.SkippedWrites[0].Reason)
+	}
+	if _, err := os.Stat(filepath.Join(spaceRoot, "specs", "not-indexable.md")); !os.IsNotExist(err) {
+		t.Fatalf("non-object create_file should not be written, stat err=%v", err)
+	}
+}
+
 // ─── Test 5: replace_block ────────────────────────────────────────────────────
 
 func TestApply_ReplaceBlock(t *testing.T) {
