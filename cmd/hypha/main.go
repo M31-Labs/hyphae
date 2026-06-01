@@ -22,14 +22,11 @@ import (
 	"flag"
 	"fmt"
 	"io"
-	"net/url"
 	"os"
 	"os/exec"
-	"os/signal"
 	"path/filepath"
 	"sort"
 	"strings"
-	"syscall"
 	"time"
 
 	"m31labs.dev/hyphae/internal/analyze"
@@ -39,11 +36,14 @@ import (
 	"m31labs.dev/hyphae/internal/crdtconflict"
 	"m31labs.dev/hyphae/internal/crdtshadow"
 	"m31labs.dev/hyphae/internal/db"
+	"m31labs.dev/hyphae/internal/doctor"
 	"m31labs.dev/hyphae/internal/envelope"
+	"m31labs.dev/hyphae/internal/eval"
 	"m31labs.dev/hyphae/internal/graft"
 	"m31labs.dev/hyphae/internal/graph"
 	"m31labs.dev/hyphae/internal/hubsync"
 	"m31labs.dev/hyphae/internal/identity"
+	"m31labs.dev/hyphae/internal/indexer"
 	"m31labs.dev/hyphae/internal/mcp"
 	"m31labs.dev/hyphae/internal/parser"
 	"m31labs.dev/hyphae/internal/peers"
@@ -64,51 +64,52 @@ const usage = `hypha — Hyphae v0.1.8 CLI
 
 Usage:
   hypha index    rebuild [--root <path>]
-  hypha recall   <query> [--limit N] [--max-tokens N] [--shape headline|summary+anchors] [--format text|json|compact]
+  hypha recall   <query> [--limit N] [--max-tokens N] [--shape headline|summary+anchors] [--format text|json|jsonline|compact]
   hypha show     <id-or-hypha-uri> [--path] [--json] [--frontmatter] [--body]
-  hypha spaces   list [--format text|json|compact]
-  hypha spore    submit <file> [--sign --as <identity-uri>] [--format text|json|compact]
-  hypha spore    list   [--space <uri>] [--status <state>] [--since 24h] [--limit N] [--format text|json|compact]
-  hypha spore    accept <spore-id> --as <identity> [--reason "..."] [--space <uri>] [--format text|json|compact]
-  hypha spore    reject <spore-id> --as <identity> [--reason "..."] [--space <uri>] [--format text|json|compact]
-  hypha cap      issue  --subject <uri> --space <uri> [--permissions p1,p2] [--expires 24h] [--format text|json|compact]
-  hypha cap      revoke <token-id> [--format text|json|compact]
-  hypha cap      list   [--space <uri>] [--include-revoked] [--format text|json|compact]
-  hypha identity init --name <name> --authority <auth> --space <uri> [--expires 1y] [--format text|json|compact]
-  hypha identity list [--format text|json|compact]
-  hypha graft    <spore-id> --as <identity-uri> [--space <hypha-uri>] [--verify] [--no-fmt] [--dry-run] [--diff] [--apply] [--format text|json|compact]
-  hypha graph    backlinks <object-id> [--kind k1,k2] [--limit N] [--format text|json|compact]
-  hypha graph    related   <object-id> [--kind k1,k2] [--limit N] [--format text|json|compact]
-  hypha graph    trace     <object-id> [--kind derived_from,cites] [--max-depth 4] [--format text|json|compact]
-  hypha pulse    [--space <uri>] [--window 30d] [--ttl 5m] [--format text|json|compact]
-  hypha assess   change --task <text> [--files p1,p2] [--diff-summary <text>] [--space <uri>] [--source <path>] [--format text|json|compact]
-  hypha assess   task   --task <text> [--space <uri>] [--format text|json|compact]
-  hypha assess   pr     --task <text> --base <ref> [--space <uri>] [--source <path>] [--format text|json|compact]
-  hypha trace    start  --agent <uri> [--task <id>] [--phase <text>] [--space <uri>] [--format text|json|compact]
-  hypha trace    tick   <trace-id> "<checkpoint>" [--space <uri>] [--format text|json|compact]
-  hypha trace    done   <trace-id> [--status succeeded|failed|killed|superseded] [--link-spore <id>] [--space <uri>] [--format text|json|compact]
-  hypha trace    list   [--active] [--agent <uri>] [--space <uri>] [--format text|json|compact]
-  hypha trace    history [--similar <q>] [--task <id>] [--agent <uri>] [--include-open] [--limit N] [--space <uri>] [--format text|json|compact]
+  hypha spaces   list [--format text|json|jsonline|compact]
+  hypha spore    submit <file> [--sign --as <identity-uri>] [--format text|json|jsonline|compact]
+  hypha spore    list   [--space <uri>] [--status <state>] [--since 24h] [--limit N] [--format text|json|jsonline|compact]
+  hypha spore    accept <spore-id> --as <identity> [--reason "..."] [--space <uri>] [--format text|json|jsonline|compact]
+  hypha spore    reject <spore-id> --as <identity> [--reason "..."] [--space <uri>] [--format text|json|jsonline|compact]
+  hypha cap      issue  --subject <uri> --space <uri> [--permissions p1,p2] [--expires 24h] [--format text|json|jsonline|compact]
+  hypha cap      revoke <token-id> [--format text|json|jsonline|compact]
+  hypha cap      list   [--space <uri>] [--include-revoked] [--format text|json|jsonline|compact]
+  hypha identity init --name <name> --authority <auth> --space <uri> [--expires 1y] [--format text|json|jsonline|compact]
+  hypha identity list [--format text|json|jsonline|compact]
+  hypha graft    <spore-id> --as <identity-uri> [--space <hypha-uri>] [--verify] [--no-fmt] [--dry-run] [--diff] [--apply] [--format text|json|jsonline|compact]
+  hypha graph    backlinks <object-id> [--kind k1,k2] [--limit N] [--format text|json|jsonline|compact]
+  hypha graph    related   <object-id> [--kind k1,k2] [--limit N] [--format text|json|jsonline|compact]
+  hypha graph    trace     <object-id> [--kind derived_from,cites] [--max-depth 4] [--format text|json|jsonline|compact]
+  hypha pulse    [--space <uri>] [--window 30d] [--ttl 5m] [--format text|json|jsonline|compact]
+  hypha assess   change --task <text> [--files p1,p2] [--diff-summary <text>] [--space <uri>] [--source <path>] [--format text|json|jsonline|compact]
+  hypha assess   task   --task <text> [--space <uri>] [--format text|json|jsonline|compact]
+  hypha assess   pr     --task <text> --base <ref> [--space <uri>] [--source <path>] [--format text|json|jsonline|compact]
+  hypha trace    start  --agent <uri> [--task <id>] [--phase <text>] [--space <uri>] [--format text|json|jsonline|compact]
+  hypha trace    tick   <trace-id> "<checkpoint>" [--space <uri>] [--format text|json|jsonline|compact]
+  hypha trace    done   <trace-id> [--status succeeded|failed|killed|superseded] [--link-spore <id>] [--space <uri>] [--format text|json|jsonline|compact]
+  hypha trace    list   [--active] [--agent <uri>] [--space <uri>] [--format text|json|jsonline|compact]
+  hypha trace    history [--similar <q>] [--task <id>] [--agent <uri>] [--include-open] [--limit N] [--space <uri>] [--format text|json|jsonline|compact]
   hypha trace    tail   [--id <trace-id>] [--agent <uri>] [--interval 1s] [--timeout 5m] [--space <uri>]
-  hypha trace    reap   [--older-than 1h] [--space <uri>] [--format text|json|compact]
+  hypha trace    reap   [--older-than 1h] [--space <uri>] [--format text|json|jsonline|compact]
   hypha analyze  <kind> [target] [--space <uri>] [--source <path>] [--diff-ref <ref>] [--max-depth N] [--refresh]
                        kinds: impact, callgraph, refs, hotspot, dead, review
-  hypha analyze  list   [--kind <k>] [--space <uri>] [--target-file <path>] [--format text|json|compact]
+  hypha analyze  list   [--kind <k>] [--space <uri>] [--target-file <path>] [--format text|json|jsonline|compact]
   hypha analyze  refresh <id> [--space <uri>] [--source <path>]
-  hypha db       history  --space <uri> [--limit N] [--format text|json|compact]
-  hypha db       compact  --space <uri> [--format text|json|compact]
-  hypha sync     export   --space <uri> [--out <file>] [--format text|json|compact]
-  hypha sync     import   [--space <uri>] [--in <file>] [--format text|json|compact]
-  hypha sync     pull     --peer <ws-url> --space <uri> [--token X] [--once] [--timeout 30s] [--format text|json|compact]
-  hypha hub      serve    [--addr 127.0.0.1:7777] [--require-auth] [--admin] [--base-url <url>]
-  hypha conflict list     --space <uri> [--format text|json|compact]
-  hypha conflict show     <id> --space <uri> [--format text|json|compact]
-  hypha conflict resolve  <id> --space <uri> --keep <actor-prefix> [--format text|json|compact]
-  hypha peer     add      <uri> [--name <name>] [--format text|json|compact]
-  hypha peer     list     [--format text|json|compact]
-  hypha peer     remove   <name-or-uri> [--format text|json|compact]
-  hypha receipts list   [--space <uri>] [--subject <uri>] [--action <name>] [--since 24h] [--limit N] [--format text|json|compact]
-  hypha mcp      serve                              MCP stdio server (JSON-RPC 2.0; read-only tools)
+  hypha eval     retrieval --gold <dir> [--space <uri>] [--model <path.embedding.mll>] [--top-k N] [--threshold-ndcg F] [--format text|json|jsonline|compact]
+  hypha db       history  --space <uri> [--limit N] [--format text|json|jsonline|compact]
+  hypha db       compact  --space <uri> [--format text|json|jsonline|compact]
+  hypha sync     export   --space <uri> [--out <file>] [--format text|json|jsonline|compact]
+  hypha sync     import   [--space <uri>] [--in <file>] [--format text|json|jsonline|compact]
+  hypha sync     pull     --peer <ws-url> --space <uri> [--token X] [--once] [--timeout 30s] [--format text|json|jsonline|compact]
+  hypha conflict list     --space <uri> [--format text|json|jsonline|compact]
+  hypha conflict show     <id> --space <uri> [--format text|json|jsonline|compact]
+  hypha conflict resolve  <id> --space <uri> --keep <actor-prefix> [--format text|json|jsonline|compact]
+  hypha peer     add      <uri> [--name <name>] [--format text|json|jsonline|compact]
+  hypha peer     list     [--format text|json|jsonline|compact]
+  hypha peer     remove   <name-or-uri> [--format text|json|jsonline|compact]
+  hypha doctor   [--root <path>] [--skip-canopy] [--strict] [--format text|json|jsonline|compact]
+  hypha receipts list   [--space <uri>] [--subject <uri>] [--action <name>] [--since 24h] [--limit N] [--format text|json|jsonline|compact]
+  hypha mcp      serve                              MCP stdio server (JSON-RPC 2.0; read + mutate tools)
 
 Separate binary for the browser visualization (GoSX-based):
   hypha-viz       [--addr 127.0.0.1:7777] [--root <hyphae-home>]
@@ -116,6 +117,7 @@ Separate binary for the browser visualization (GoSX-based):
 Output formats:
   --format text       human-readable. Default when stdout is a terminal.
   --format json       full-key indented JSON envelope (Envelope schema v1).
+  --format jsonline   full-key single-line JSON envelope.
   --format compact    same data, single-line + documented short-key map.
                       Default when stdout is piped or redirected.
   HYPHAE_FORMAT       env override for the auto-detected default.
@@ -123,15 +125,6 @@ Output formats:
 Environment:
   HYPHAE_HOME                  install root (default: $HOME/.hyphae)
   HYPHAE_FORMAT                default output format when --format is not given
-  HYPHAE_GITHUB_CLIENT_ID      GitHub OAuth app client id. With CLIENT_SECRET
-                               and 'hub serve --admin --base-url', gates the
-                               admin UI behind GitHub login.
-  HYPHAE_GITHUB_CLIENT_SECRET  GitHub OAuth app client secret
-  HYPHAE_ADMIN_LOGINS          comma-separated GitHub logins allowed admin
-                               access; combine with HYPHAE_ADMIN_ORG
-  HYPHAE_ADMIN_ORG             GitHub org whose members get admin access
-                               (requested with read:org). Set logins and/or
-                               org; with neither, the gate admits no one
 `
 
 func main() {
@@ -143,10 +136,10 @@ func main() {
 }
 
 // formatFlag declares the standard --format flag on fs. Pass the result to
-// envelope.ParseFormat after fs.Parse to resolve text|json|compact (and
-// auto-detect when blank).
+// envelope.ParseFormat after fs.Parse to resolve text|json|jsonline|compact
+// (and auto-detect when blank).
 func formatFlag(fs *flag.FlagSet) *string {
-	return fs.String("format", "", "text | json | compact (default: text on TTY, compact on pipe)")
+	return fs.String("format", "", "text | json | jsonline | compact (default: text on TTY, compact on pipe)")
 }
 
 // emit is a tiny convenience wrapper around envelope.Emit. The text
@@ -209,21 +202,60 @@ func run(args []string) error {
 		return cmdTrace(rest)
 	case "analyze":
 		return cmdAnalyze(rest)
+	case "eval":
+		return cmdEval(rest)
 	case "db":
 		return cmdDB(rest)
 	case "sync":
 		return cmdSync(rest)
 	case "peer":
 		return cmdPeer(rest)
-	case "hub":
-		return cmdHub(rest)
 	case "conflict":
 		return cmdConflict(rest)
+	case "doctor":
+		return cmdDoctor(rest)
 	case "mcp":
 		return cmdMCP(rest)
 	default:
 		return fmt.Errorf("unknown command %q (try `hypha help`)", group)
 	}
+}
+
+// --- doctor ----------------------------------------------------------------
+
+func cmdDoctor(args []string) error {
+	fs := flag.NewFlagSet("doctor", flag.ContinueOnError)
+	rootFlag := fs.String("root", "", "Hyphae install root override")
+	skipCanopy := fs.Bool("skip-canopy", false, "skip checking the optional canopy binary")
+	strict := fs.Bool("strict", false, "exit non-zero when any check is warning or error")
+	format := formatFlag(fs)
+	if err := fs.Parse(reorderFlagsFirst(args)); err != nil {
+		return err
+	}
+	root, err := resolveRoot(*rootFlag)
+	if err != nil {
+		return err
+	}
+	report, err := doctor.Run(context.Background(), doctor.Options{
+		Root:        root,
+		CheckCanopy: !*skipCanopy,
+	})
+	if err != nil {
+		return err
+	}
+	if err := emit("doctor", report, *format, func(w io.Writer, data any) error {
+		rep, ok := data.(doctor.Report)
+		if !ok {
+			return fmt.Errorf("doctor: text renderer got %T", data)
+		}
+		return doctor.WriteText(w, rep)
+	}); err != nil {
+		return err
+	}
+	if *strict && report.Status != doctor.StatusOK {
+		return fmt.Errorf("doctor found %s status", report.Status)
+	}
+	return nil
 }
 
 // --- db --------------------------------------------------------------------
@@ -593,134 +625,6 @@ func isTextish(b []byte) bool {
 		}
 	}
 	return true
-}
-
-// --- hub -------------------------------------------------------------------
-
-func cmdHub(args []string) error {
-	if len(args) == 0 || args[0] != "serve" {
-		return errors.New("usage: hypha hub serve [flags]")
-	}
-	return cmdHubServe(args[1:])
-}
-
-func cmdHubServe(args []string) error {
-	fs := flag.NewFlagSet("hub serve", flag.ContinueOnError)
-	addr := fs.String("addr", "127.0.0.1:7777", "listen address")
-	requireAuth := fs.Bool("require-auth", false, "require a valid cap-token Bearer header on every connection")
-	admin := fs.Bool("admin", false, "mount the server-rendered admin UI at /admin (keys, peers, audit)")
-	baseURL := fs.String("base-url", "", "public base URL of this hub (e.g. https://hub.example.com), used for the GitHub OAuth callback")
-	if err := fs.Parse(reorderFlagsFirst(args)); err != nil {
-		return err
-	}
-
-	// Don't outlive the session that spawned us: a crashed/OOM-killed parent
-	// must not leave this hub resident holding every space's CRDT doc. Sends
-	// SIGTERM on parent death, which the signal handler below drains cleanly.
-	_ = proclife.DieWithParent()
-
-	root, err := resolveRoot("")
-	if err != nil {
-		return err
-	}
-	spaces, err := listSpaces(root)
-	if err != nil {
-		return err
-	}
-
-	// The admin surface needs the index DB (capabilities + receipts) even
-	// when --require-auth is off, so open it for either flag.
-	var authConn *sql.DB
-	if *requireAuth || *admin {
-		conn, dbErr := openIndex(root)
-		if dbErr != nil {
-			return fmt.Errorf("hub serve: open auth DB: %w", dbErr)
-		}
-		defer conn.Close()
-		authConn = conn
-	}
-
-	srv := hubsync.NewServer(root, crdtshadow.Default, authConn, *requireAuth)
-	registered := 0
-	for _, sp := range spaces {
-		uri := "hypha://" + sp.URI
-		if err := srv.Register(uri); err != nil {
-			fmt.Fprintf(os.Stderr, "warn: register %s: %v\n", uri, err)
-			continue
-		}
-		registered++
-	}
-	if registered == 0 {
-		return fmt.Errorf("hub serve: no spaces could be registered under %s", root)
-	}
-
-	// Mount the admin UI (+ optional GitHub OAuth gate) on the same mux.
-	var oauthEnabled bool
-	if *admin {
-		oauth := hubsync.NewOAuth(hubsync.OAuthConfig{
-			ClientID:     os.Getenv("HYPHAE_GITHUB_CLIENT_ID"),
-			ClientSecret: os.Getenv("HYPHAE_GITHUB_CLIENT_SECRET"),
-			BaseURL:      *baseURL,
-			AdminLogins:  splitCSV(os.Getenv("HYPHAE_ADMIN_LOGINS")),
-			AdminOrg:     strings.TrimSpace(os.Getenv("HYPHAE_ADMIN_ORG")),
-			Store:        authConn, // persist sessions across hub restarts
-		})
-		// OAuth needs a base URL for its callback; disable it (the admin
-		// surface then runs ungated, local-only) if one wasn't provided.
-		if oauth != nil && *baseURL == "" {
-			fmt.Fprintln(os.Stderr, "hub: GitHub OAuth env set but --base-url missing; OAuth gate disabled (admin is ungated — bind 127.0.0.1 only)")
-			oauth = nil
-		}
-		if oauth != nil && !oauth.AdmitsAnyone() {
-			fmt.Fprintln(os.Stderr, "hub: warning: GitHub OAuth gate enabled but neither HYPHAE_ADMIN_LOGINS nor HYPHAE_ADMIN_ORG is set — no one will be granted admin access")
-		}
-		oauthEnabled = oauth != nil
-		hubsync.NewAdmin(root, authConn, srv, oauth).Mount(srv.Mux())
-	}
-
-	// Graceful shutdown on SIGINT/SIGTERM.
-	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer cancel()
-
-	ready := make(chan string, 1)
-	errCh := make(chan error, 1)
-	go func() { errCh <- srv.Serve(ctx, *addr, ready) }()
-
-	select {
-	case actual := <-ready:
-		fmt.Fprintf(os.Stderr, "hub: listening on %s  (%d space(s))\n", actual, registered)
-		if *requireAuth {
-			fmt.Fprintln(os.Stderr, "hub: auth required (Bearer token)")
-		}
-		if *admin {
-			fmt.Fprintf(os.Stderr, "hub: admin UI at %s/admin\n", strings.TrimRight(nonEmpty(*baseURL, "http://"+actual), "/"))
-			if oauthEnabled {
-				fmt.Fprintln(os.Stderr, "hub: admin gated by GitHub OAuth (allowlist)")
-			} else {
-				fmt.Fprintln(os.Stderr, "hub: admin UNGATED — keep this bound to 127.0.0.1 or front it with auth")
-			}
-		}
-		for _, sp := range spaces {
-			fmt.Fprintf(os.Stderr, "  hypha://%s → %s%s%s\n",
-				sp.URI,
-				schemeForListenAddr(actual),
-				hubsync.PathPrefix,
-				urlEscape("hypha://"+sp.URI),
-			)
-		}
-	case err := <-errCh:
-		return err
-	}
-
-	return <-errCh
-}
-
-func schemeForListenAddr(addr string) string {
-	return "ws://" + addr
-}
-
-func urlEscape(s string) string {
-	return url.PathEscape(s)
 }
 
 func cmdSyncExport(args []string) error {
@@ -1446,22 +1350,22 @@ func cmdIndex(args []string) error {
 		return fmt.Errorf("no spaces found under %s/spaces/", root)
 	}
 
-	var totalObj, totalAnc, totalEdg int
+	var totalObj, totalAnc, totalEdg, totalSkipped int
+	var totalBytes int64
 	for _, sp := range spaces {
 		fmt.Fprintf(os.Stderr, "indexing %s …\n", sp.URI)
-		objects, anchors, edges, err := parser.WalkSpace(sp.Path, sp.URI, false)
+		stats, err := indexer.RebuildSpace(conn, sp.Path, sp.URI, parser.DefaultWalkOptions(), indexer.DefaultBatchSize)
 		if err != nil {
-			return fmt.Errorf("walk %s: %w", sp.Path, err)
+			return fmt.Errorf("index %s: %w", sp.URI, err)
 		}
-		if err := recall.IndexBatch(conn, objects); err != nil {
-			return fmt.Errorf("index FTS %s: %w", sp.URI, err)
+		totalObj += stats.Objects
+		totalAnc += stats.Anchors
+		totalEdg += stats.Edges
+		totalSkipped += stats.FilesSkipped
+		totalBytes += stats.BytesRead
+		if stats.FilesSkipped > 0 {
+			fmt.Fprintf(os.Stderr, "warn: skipped %d file(s) in %s\n", stats.FilesSkipped, sp.URI)
 		}
-		if err := persistObjectsAnchorsEdges(conn, sp.Path, objects, anchors, edges); err != nil {
-			return fmt.Errorf("index tables %s: %w", sp.URI, err)
-		}
-		totalObj += len(objects)
-		totalAnc += len(anchors)
-		totalEdg += len(edges)
 	}
 
 	payload := map[string]any{
@@ -1470,10 +1374,15 @@ func cmdIndex(args []string) error {
 		"objects_indexed": totalObj,
 		"anchors_indexed": totalAnc,
 		"edges_indexed":   totalEdg,
+		"files_skipped":   totalSkipped,
+		"bytes_read":      totalBytes,
 	}
 	return emit("index rebuild", payload, *format, func(w io.Writer, _ any) error {
 		fmt.Fprintf(w, "Indexed %d objects, %d anchors, %d edges across %d space(s)\n",
 			totalObj, totalAnc, totalEdg, len(spaces))
+		if totalSkipped > 0 {
+			fmt.Fprintf(w, "  skipped: %d file(s)\n", totalSkipped)
+		}
 		fmt.Fprintf(w, "  db: %s\n", dbPath)
 		return nil
 	})
@@ -2448,6 +2357,14 @@ func cmdGraft(args []string) error {
 
 	// Persist the graft receipt to the audit log (skipped in dry-run).
 	if !effectiveDryRun {
+		objectsPromoted, anchorsPromoted, edgesPromoted, perr := indexer.PromoteFiles(conn, spaceRoot, result.Receipt.SpaceID, result.TouchedFiles)
+		if perr != nil {
+			return fmt.Errorf("promote grafted canonical files into index: %w", perr)
+		}
+		if objectsPromoted > 0 {
+			fmt.Fprintf(os.Stderr, "index: promoted %d object(s), %d anchor(s), %d edge(s)\n", objectsPromoted, anchorsPromoted, edgesPromoted)
+		}
+
 		if wErr := receipts.Write(conn, result.Receipt); wErr != nil && !errors.Is(wErr, receipts.ErrAlreadyExists) {
 			fmt.Fprintf(os.Stderr, "warn: failed to persist graft receipt: %v\n", wErr)
 		}
@@ -2724,7 +2641,7 @@ func splitFrontmatter(content []byte) (frontmatter, body []byte) {
 
 func cmdSpaces(args []string) error {
 	if len(args) == 0 || args[0] != "list" {
-		return errors.New("usage: hypha spaces list [--format text|json|compact]")
+		return errors.New("usage: hypha spaces list [--format text|json|jsonline|compact]")
 	}
 	fs := flag.NewFlagSet("spaces list", flag.ContinueOnError)
 	format := formatFlag(fs)
@@ -3443,6 +3360,89 @@ func cmdAnalyzeRun(kind string, args []string) error {
 		return err
 	}
 	return emitAnalysis(a, *format)
+}
+
+// cmdEval dispatches `hypha eval <subcommand>`.
+func cmdEval(args []string) error {
+	if len(args) == 0 {
+		return errors.New("usage: hypha eval retrieval --gold <dir> [--space <uri>] [--model <path.embedding.mll>] [--top-k N] [--threshold-ndcg F]")
+	}
+	switch args[0] {
+	case "retrieval":
+		return cmdEvalRetrieval(args[1:])
+	default:
+		return fmt.Errorf("unknown eval subcommand %q (want: retrieval)", args[0])
+	}
+}
+
+// cmdEvalRetrieval scores hyphae's FTS5 retriever (R1) against manta BM25 (R2)
+// and manta dense (R3) on a human-labeled gold set, writing a results JSON and
+// printing a go/no-go comparison. See spec.retrieval-eval-harness.
+func cmdEvalRetrieval(args []string) error {
+	fs := flag.NewFlagSet("eval retrieval", flag.ContinueOnError)
+	spaceFlag := fs.String("space", "", "space URI (default: only installed space)")
+	model := fs.String("model", "", "sealed .embedding.mll for dense (R3); omit to skip dense")
+	gold := fs.String("gold", "", "gold-set dir with queries.jsonl + qrels.tsv")
+	topK := fs.Int("top-k", 100, "retrieval depth")
+	threshold := fs.Float64("threshold-ndcg", 0.03, "min nDCG@10 gain for a build_hybrid recommendation")
+	format := formatFlag(fs)
+	if err := fs.Parse(reorderFlagsFirst(args)); err != nil {
+		return err
+	}
+	if *gold == "" {
+		return emitErr("eval retrieval", *format, "gold_required",
+			"no --gold dir provided",
+			"pass --gold <dir> containing queries.jsonl + qrels.tsv (see internal/eval/testdata/gold)")
+	}
+
+	root, err := resolveRoot("")
+	if err != nil {
+		return err
+	}
+	spaceRoot, spaceURI, err := resolveSpaceForTrace(root, *spaceFlag)
+	if err != nil {
+		return err
+	}
+	bareSpace := strings.TrimPrefix(spaceURI, "hypha://")
+
+	conn, err := openIndex(root)
+	if err != nil {
+		return err
+	}
+	defer conn.Close()
+
+	// manta is optional: absence degrades to R1-only (Run records a note).
+	manta, _ := eval.NewMantaRunner()
+
+	beirDir, err := os.MkdirTemp("", "hypha-eval-beir-*")
+	if err != nil {
+		return err
+	}
+	defer os.RemoveAll(beirDir)
+
+	res, err := eval.Run(context.Background(), eval.RunOpts{
+		Conn:    conn,
+		SpaceID: bareSpace,
+		GoldDir: *gold,
+		BeirDir: beirDir,
+		Model:   *model,
+		TopK:    *topK,
+		Manta:   manta,
+	})
+	if err != nil {
+		return err
+	}
+
+	decision := eval.Decide(res, *threshold)
+	date := time.Now().UTC().Format("2006-01-02")
+	path, err := eval.WriteResult(spaceRoot, date, res, decision)
+	if err != nil {
+		return err
+	}
+
+	return emit("eval retrieval",
+		eval.Outcome{Result: res, Decision: decision, ResultPath: path},
+		*format, eval.RenderTable)
 }
 
 func cmdAnalyzeList(args []string) error {
