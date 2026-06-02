@@ -248,3 +248,132 @@ func TestCacheRoundtrip(t *testing.T) {
 		t.Errorf("Cached (wrong space): want ErrNoCache, got %v", err)
 	}
 }
+
+// Test 4: Space filtering ----------------------------------------------------
+
+// TestComputeScopesBySpace proves a non-empty spaceID scopes Activity,
+// RecentPressure, and EdgeKindDist to that space, while spaceID == "" still
+// aggregates across all spaces. Regression test for the bug where
+// queryActivity/queryRecentPressure/queryEdgeKindDist accepted spaceID but
+// ignored it, so every space reported the same global aggregate.
+func TestComputeScopesBySpace(t *testing.T) {
+	conn := openDB(t)
+
+	now := time.Now().UTC()
+	inWindow := now.Add(-5 * 24 * time.Hour).Format(time.RFC3339)
+	nowStr := now.Format(time.RFC3339)
+
+	const spaceA = "hypha://acme/a"
+	const spaceB = "hypha://acme/b"
+
+	// Space A: 2 objects, 2 edges (src in A), 1 spore + 1 graft receipt.
+	insertObject(t, conn, "a.init", "initiative", spaceA, "active", "A Initiative", nowStr)
+	insertObject(t, conn, "a.concept", "concept", spaceA, "", "A Concept", inWindow)
+	insertEdge(t, conn, "ea1", "related", "a.concept", "a.init", inWindow)
+	insertEdge(t, conn, "ea2", "derived_from", "a.concept", "a.init", inWindow)
+	insertReceipt(t, conn, "ra1", spaceA, "spore:create", inWindow)
+	insertReceipt(t, conn, "ra2", spaceA, "graft", inWindow)
+
+	// Space B: 1 object, 3 edges (src in B), 3 spore receipts.
+	insertObject(t, conn, "b.concept", "concept", spaceB, "", "B Concept", inWindow)
+	insertEdge(t, conn, "eb1", "related", "b.concept", "b.concept", inWindow)
+	insertEdge(t, conn, "eb2", "related", "b.concept", "b.concept", inWindow)
+	insertEdge(t, conn, "eb3", "wikilink", "b.concept", "b.concept", inWindow)
+	insertReceipt(t, conn, "rb1", spaceB, "spore:create", inWindow)
+	insertReceipt(t, conn, "rb2", spaceB, "spore:create", inWindow)
+	insertReceipt(t, conn, "rb3", spaceB, "spore:create", inWindow)
+
+	// --- Scoped to space A: B's rows must be excluded ---
+	a, err := pulse.Compute(conn, spaceA, 30*24*time.Hour)
+	if err != nil {
+		t.Fatalf("Compute(A): %v", err)
+	}
+	if a.Activity.SporesSubmitted != 1 {
+		t.Errorf("A SporesSubmitted = %d, want 1 (B's 3 excluded)", a.Activity.SporesSubmitted)
+	}
+	if a.Activity.GraftsApplied != 1 {
+		t.Errorf("A GraftsApplied = %d, want 1", a.Activity.GraftsApplied)
+	}
+	if a.Activity.NewObjects != 2 {
+		t.Errorf("A NewObjects = %d, want 2 (B's 1 excluded)", a.Activity.NewObjects)
+	}
+	if a.Activity.NewEdges != 2 {
+		t.Errorf("A NewEdges = %d, want 2 (B's 3 excluded)", a.Activity.NewEdges)
+	}
+	for _, pr := range a.RecentPressure {
+		if pr.Topic == "edges" && pr.Kind == "related" && pr.Count != 1 {
+			t.Errorf("A RecentPressure related = %d, want 1 (B's 2 excluded)", pr.Count)
+		}
+		if pr.Topic == "edges" && pr.Kind == "wikilink" {
+			t.Error("A RecentPressure must not include 'wikilink' (only exists in B)")
+		}
+	}
+	for _, kc := range a.EdgeKindDist {
+		if kc.Kind == "wikilink" {
+			t.Errorf("A EdgeKindDist must not include 'wikilink' (only in B); got %+v", a.EdgeKindDist)
+		}
+	}
+
+	// --- Global (spaceID == "") still aggregates both spaces ---
+	g, err := pulse.Compute(conn, "", 30*24*time.Hour)
+	if err != nil {
+		t.Fatalf("Compute(global): %v", err)
+	}
+	if g.Activity.SporesSubmitted != 4 {
+		t.Errorf("global SporesSubmitted = %d, want 4 (1 A + 3 B)", g.Activity.SporesSubmitted)
+	}
+	if g.Activity.GraftsApplied != 1 {
+		t.Errorf("global GraftsApplied = %d, want 1", g.Activity.GraftsApplied)
+	}
+	if g.Activity.NewObjects != 3 {
+		t.Errorf("global NewObjects = %d, want 3 (2 A + 1 B)", g.Activity.NewObjects)
+	}
+	if g.Activity.NewEdges != 5 {
+		t.Errorf("global NewEdges = %d, want 5 (2 A + 3 B)", g.Activity.NewEdges)
+	}
+}
+
+// Test 5: space_id scheme mismatch -------------------------------------------
+
+// TestComputeScopesAcrossSpaceIDFormats reproduces the real-index condition
+// where objects store space_id bare ("m31labs/x") but receipts store it as a
+// full URI ("hypha://m31labs/x"). A --space query in URI form must still match
+// the bare-form objects/edges (and initiatives/hot-zones), otherwise per-space
+// object and edge counts silently collapse to zero.
+func TestComputeScopesAcrossSpaceIDFormats(t *testing.T) {
+	conn := openDB(t)
+
+	now := time.Now().UTC()
+	inWindow := now.Add(-5 * 24 * time.Hour).Format(time.RFC3339)
+	nowStr := now.Format(time.RFC3339)
+
+	const bare = "m31labs/fmt"        // how objects store it
+	const uri = "hypha://m31labs/fmt" // how receipts store it + how --space passes it
+
+	insertObject(t, conn, "fmt.init", "initiative", bare, "active", "Fmt Initiative", nowStr)
+	insertObject(t, conn, "fmt.concept", "concept", bare, "", "Fmt Concept", inWindow)
+	insertEdge(t, conn, "fmt.e1", "related", "fmt.concept", "fmt.init", inWindow)
+	insertReceipt(t, conn, "fmt.r1", uri, "spore:create", inWindow)
+
+	// Query in the URI form (what the CLI passes). Must still see the
+	// bare-form objects and edges.
+	p, err := pulse.Compute(conn, uri, 30*24*time.Hour)
+	if err != nil {
+		t.Fatalf("Compute(uri): %v", err)
+	}
+	if p.Activity.SporesSubmitted != 1 {
+		t.Errorf("SporesSubmitted = %d, want 1", p.Activity.SporesSubmitted)
+	}
+	if p.Activity.NewObjects != 2 {
+		t.Errorf("NewObjects = %d, want 2 (bare-form objects must match a URI-form query)", p.Activity.NewObjects)
+	}
+	if p.Activity.NewEdges != 1 {
+		t.Errorf("NewEdges = %d, want 1 (edge whose src is a bare-form object)", p.Activity.NewEdges)
+	}
+	if len(p.TopInitiatives) != 1 {
+		t.Errorf("TopInitiatives = %d, want 1 (bare-form initiative must match a URI-form query)", len(p.TopInitiatives))
+	}
+	if len(p.HotZones) == 0 {
+		t.Error("HotZones empty; want bare-form objects to register")
+	}
+}

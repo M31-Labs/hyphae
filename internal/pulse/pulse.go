@@ -226,7 +226,7 @@ func queryTopInitiatives(conn *sql.DB, spaceID string) ([]TopInitiative, error) 
 		 FROM objects o
 		 LEFT JOIN edges e ON e.dst_id = o.id
 		 WHERE o.type = 'initiative' AND (o.status = 'active' OR o.status = '' OR o.status IS NULL)
-		   AND (? = '' OR o.space_id = ?)
+		   AND (? = '' OR replace(o.space_id, 'hypha://', '') = replace(?, 'hypha://', ''))
 		 GROUP BY o.id
 		 ORDER BY edges_in DESC
 		 LIMIT 5`,
@@ -256,7 +256,7 @@ func queryHotZones(conn *sql.DB, spaceID, windowStart string) ([]HotZone, error)
 		 FROM objects o
 		 LEFT JOIN edges e_in  ON e_in.dst_id = o.id
 		 LEFT JOIN edges e_out ON e_out.src_id = o.id
-		 WHERE (? = '' OR o.space_id = ?)
+		 WHERE (? = '' OR replace(o.space_id, 'hypha://', '') = replace(?, 'hypha://', ''))
 		 GROUP BY o.id
 		 HAVING graft_in > 0 OR new_out > 0 OR o.updated_at > ?
 		 ORDER BY (graft_in*3 + new_out) DESC
@@ -285,10 +285,11 @@ func queryRecentPressure(conn *sql.DB, spaceID, windowStart string) ([]Pressure,
 		`SELECT kind, COUNT(*) AS c
 		 FROM edges
 		 WHERE created_at > ?
+		   AND (? = '' OR src_id IN (SELECT id FROM objects WHERE replace(space_id, 'hypha://', '') = replace(?, 'hypha://', '')))
 		 GROUP BY kind
 		 ORDER BY c DESC
 		 LIMIT 6`,
-		windowStart,
+		windowStart, spaceID, spaceID,
 	)
 	if err != nil {
 		return nil, err
@@ -313,11 +314,11 @@ func queryRecentPressure(conn *sql.DB, spaceID, windowStart string) ([]Pressure,
 	receiptRows, err := conn.Query(
 		`SELECT action, COUNT(*) AS c
 		 FROM receipts
-		 WHERE created_at > ?
+		 WHERE created_at > ? AND (? = '' OR replace(space_id, 'hypha://', '') = replace(?, 'hypha://', ''))
 		 GROUP BY action
 		 ORDER BY c DESC
 		 LIMIT 4`,
-		windowStart,
+		windowStart, spaceID, spaceID,
 	)
 	if err != nil {
 		return nil, err
@@ -340,8 +341,10 @@ func queryEdgeKindDist(conn *sql.DB, spaceID string) ([]KindCount, error) {
 	rows, err := conn.Query(
 		`SELECT kind, COUNT(*) AS c
 		 FROM edges
+		 WHERE (? = '' OR src_id IN (SELECT id FROM objects WHERE replace(space_id, 'hypha://', '') = replace(?, 'hypha://', '')))
 		 GROUP BY kind
 		 ORDER BY c DESC`,
+		spaceID, spaceID,
 	)
 	if err != nil {
 		return nil, err
@@ -363,29 +366,37 @@ func queryActivity(conn *sql.DB, spaceID, windowStart string) (Activity, error) 
 	var a Activity
 
 	if err := conn.QueryRow(
-		`SELECT COUNT(*) FROM receipts WHERE action = 'spore:create' AND created_at > ?`,
-		windowStart,
+		`SELECT COUNT(*) FROM receipts
+		 WHERE action = 'spore:create' AND created_at > ? AND (? = '' OR replace(space_id, 'hypha://', '') = replace(?, 'hypha://', ''))`,
+		windowStart, spaceID, spaceID,
 	).Scan(&a.SporesSubmitted); err != nil {
 		return Activity{}, err
 	}
 
 	if err := conn.QueryRow(
-		`SELECT COUNT(*) FROM receipts WHERE action = 'graft' AND created_at > ?`,
-		windowStart,
+		`SELECT COUNT(*) FROM receipts
+		 WHERE action = 'graft' AND created_at > ? AND (? = '' OR replace(space_id, 'hypha://', '') = replace(?, 'hypha://', ''))`,
+		windowStart, spaceID, spaceID,
 	).Scan(&a.GraftsApplied); err != nil {
 		return Activity{}, err
 	}
 
 	if err := conn.QueryRow(
-		`SELECT COUNT(*) FROM objects WHERE updated_at > ?`,
-		windowStart,
+		`SELECT COUNT(*) FROM objects WHERE updated_at > ? AND (? = '' OR replace(space_id, 'hypha://', '') = replace(?, 'hypha://', ''))`,
+		windowStart, spaceID, spaceID,
 	).Scan(&a.NewObjects); err != nil {
 		return Activity{}, err
 	}
 
+	// edges carry no space_id; attribute an edge to a space by its source
+	// object's space (mirrors queryHotZones' new_out semantics). The ? = ''
+	// guard keeps the all-spaces total intact — every edge is counted once,
+	// including edges whose src is not a known object.
 	if err := conn.QueryRow(
-		`SELECT COUNT(*) FROM edges WHERE created_at > ?`,
-		windowStart,
+		`SELECT COUNT(*) FROM edges
+		 WHERE created_at > ?
+		   AND (? = '' OR src_id IN (SELECT id FROM objects WHERE replace(space_id, 'hypha://', '') = replace(?, 'hypha://', '')))`,
+		windowStart, spaceID, spaceID,
 	).Scan(&a.NewEdges); err != nil {
 		return Activity{}, err
 	}
