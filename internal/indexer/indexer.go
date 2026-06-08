@@ -38,14 +38,24 @@ type RebuildStats struct {
 
 // RebuildSpace streams one space through the parser and index in bounded
 // batches. It never stores the whole space in memory.
+//
+// RebuildSpace is authoritative for the parser-derived rows of a space: after
+// it returns, the objects/anchors/parser-edges/FTS rows for that space reflect
+// exactly the Markdown files currently on disk. Objects whose source file was
+// renamed or deleted are pruned (see PruneMissing), so `index rebuild` never
+// leaves phantom rows that resolve via `hypha show`/`recall`.
 func RebuildSpace(conn *sql.DB, spaceRoot, spaceID string, walkOpts parser.WalkOptions, batchSize int) (RebuildStats, error) {
 	if batchSize <= 0 {
 		batchSize = DefaultBatchSize
 	}
+	normSpaceID := normalizeSpaceID(spaceID)
 
 	var objects []types.Object
 	var anchors []types.Anchor
 	var edges []types.Edge
+	// seen tracks every object id promoted from a file that still exists on
+	// disk, so PruneMissing can drop rows whose source file is gone.
+	seen := make(map[string]struct{})
 	flush := func() error {
 		if len(objects) == 0 {
 			return nil
@@ -62,7 +72,8 @@ func RebuildSpace(conn *sql.DB, spaceRoot, spaceID string, walkOpts parser.WalkO
 		return nil
 	}
 
-	walkStats, err := parser.WalkSpaceWithOptions(spaceRoot, normalizeSpaceID(spaceID), walkOpts, func(item parser.ParsedFile) error {
+	walkStats, err := parser.WalkSpaceWithOptions(spaceRoot, normSpaceID, walkOpts, func(item parser.ParsedFile) error {
+		seen[item.Object.ID] = struct{}{}
 		objects = append(objects, item.Object)
 		anchors = append(anchors, item.Anchors...)
 		edges = append(edges, item.Edges...)
@@ -75,6 +86,9 @@ func RebuildSpace(conn *sql.DB, spaceRoot, spaceID string, walkOpts parser.WalkO
 		return RebuildStats{}, err
 	}
 	if err := flush(); err != nil {
+		return RebuildStats{}, err
+	}
+	if err := PruneMissing(conn, normSpaceID, seen); err != nil {
 		return RebuildStats{}, err
 	}
 	return RebuildStats{
@@ -157,6 +171,10 @@ func PersistObjectsAnchorsEdges(conn *sql.DB, spacePath string, objects []types.
 				tagsJSON = string(b)
 			}
 		}
+		metadataJSON, err := objectMetadataJSON(o)
+		if err != nil {
+			return err
+		}
 		fileID, _ := filepath.Rel(spacePath, o.FilePath)
 		if fileID == "" {
 			fileID = o.FilePath
@@ -166,8 +184,8 @@ func PersistObjectsAnchorsEdges(conn *sql.DB, spacePath string, objects []types.
 			updated = o.UpdatedAt.UTC().Format(time.RFC3339)
 		}
 		if _, err := tx.Exec(`
-			INSERT INTO objects (id, type, space_id, file_id, status, title, tags_json, summary, updated_at)
-			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+			INSERT INTO objects (id, type, space_id, file_id, status, title, tags_json, summary, metadata_json, updated_at)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 			ON CONFLICT(id) DO UPDATE SET
 				type = excluded.type,
 				space_id = excluded.space_id,
@@ -176,8 +194,9 @@ func PersistObjectsAnchorsEdges(conn *sql.DB, spacePath string, objects []types.
 				title = excluded.title,
 				tags_json = excluded.tags_json,
 				summary = excluded.summary,
+				metadata_json = excluded.metadata_json,
 				updated_at = excluded.updated_at`,
-			o.ID, string(o.Type), o.SpaceID, fileID, o.Status, o.Title, tagsJSON, o.Summary, updated); err != nil {
+			o.ID, string(o.Type), o.SpaceID, fileID, o.Status, o.Title, tagsJSON, o.Summary, metadataJSON, updated); err != nil {
 			return fmt.Errorf("upsert object %q: %w", o.ID, err)
 		}
 	}
@@ -213,6 +232,82 @@ func PersistObjectsAnchorsEdges(conn *sql.DB, spacePath string, objects []types.
 	}
 
 	return tx.Commit()
+}
+
+// PruneMissing removes parser-derived rows for objects in spaceID that were
+// NOT seen during the walk — i.e. whose source Markdown file was renamed or
+// deleted since the last index. This is what makes `index rebuild`
+// authoritative: without it, the upsert path leaves orphaned objects (and
+// their anchors / FTS rows / parser edges) behind, producing phantom
+// `hypha show`/`recall` hits that point at deleted files.
+//
+// spaceID must be the bare/normalized space id (e.g. "m31labs/hyphae"), the
+// same form stored in objects.space_id. seen holds the ids of every object
+// promoted from a file that still exists on disk.
+//
+// Scope mirrors PersistObjectsAnchorsEdges: only parser-derived edges
+// ('frontmatter', 'linkref', 'wikilink') are removed, so manually-authored or
+// graft-applied edges survive a rebuild. Anchors and FTS rows are owned
+// entirely by the parser, so they are removed unconditionally for orphans.
+func PruneMissing(conn *sql.DB, spaceID string, seen map[string]struct{}) error {
+	tx, err := conn.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback() //nolint:errcheck
+
+	rows, err := tx.Query(`SELECT id FROM objects WHERE space_id = ?`, spaceID)
+	if err != nil {
+		return fmt.Errorf("prune: list objects for %q: %w", spaceID, err)
+	}
+	var orphans []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			rows.Close() //nolint:errcheck
+			return fmt.Errorf("prune: scan object id: %w", err)
+		}
+		if _, ok := seen[id]; !ok {
+			orphans = append(orphans, id)
+		}
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close() //nolint:errcheck
+		return fmt.Errorf("prune: iterate objects: %w", err)
+	}
+	rows.Close() //nolint:errcheck
+
+	for _, id := range orphans {
+		if _, err := tx.Exec(`DELETE FROM objects_fts WHERE id = ?`, id); err != nil {
+			return fmt.Errorf("prune: delete fts row %q: %w", id, err)
+		}
+		if _, err := tx.Exec(`DELETE FROM anchors WHERE object_id = ?`, id); err != nil {
+			return fmt.Errorf("prune: delete anchors %q: %w", id, err)
+		}
+		if _, err := tx.Exec(`
+			DELETE FROM edges
+			WHERE src_id = ?
+			  AND COALESCE(derivation, '') IN ('frontmatter', 'linkref', 'wikilink')`,
+			id); err != nil {
+			return fmt.Errorf("prune: delete parser edges %q: %w", id, err)
+		}
+		if _, err := tx.Exec(`DELETE FROM objects WHERE id = ?`, id); err != nil {
+			return fmt.Errorf("prune: delete object %q: %w", id, err)
+		}
+	}
+
+	return tx.Commit()
+}
+
+func objectMetadataJSON(o types.Object) (string, error) {
+	if len(o.Frontmtr) == 0 {
+		return "{}", nil
+	}
+	b, err := json.Marshal(o.Frontmtr)
+	if err != nil {
+		return "", fmt.Errorf("marshal object metadata %q: %w", o.ID, err)
+	}
+	return string(b), nil
 }
 
 func normalizeSpaceID(spaceID string) string {
