@@ -32,3 +32,4 @@ profile.*
 
 # Y.F parity test failure dumps (developer convenience; transient)
 /cmd/hypha-viz/testdata/parity-failures/
+go.work*

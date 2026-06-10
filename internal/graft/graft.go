@@ -12,6 +12,7 @@ import (
 	"bytes"
 	"crypto/sha256"
 	"database/sql"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -25,6 +26,11 @@ import (
 	"m31labs.dev/hyphae/internal/types"
 	"m31labs.dev/mdpp"
 )
+
+// errAnchorNotFound marks a locate failure where the requested anchor heading
+// does not exist in the target file — distinguishable so append_section can
+// fall back to creating the section.
+var errAnchorNotFound = errors.New("anchor not found in target file")
 
 // ApplyOpts tunes a graft. DryRun computes the same plan a real apply would
 // execute (handlers run, byte-deltas are produced) but no canonical files,
@@ -208,6 +214,11 @@ func ApplyWithOpts(conn *sql.DB, installRoot, spaceRoot, sporeID, grafter string
 		case "append_section", "insert_after":
 			aw, skip, edgeSrc, fatalErr = applyInsertWrite(pw, installRoot, ctx)
 		case "create_file":
+			// A spore may omit target for create_file; the file lands in the
+			// spore's own space.
+			if pw.Target == "" {
+				pw.Target = spore.SpaceID
+			}
 			aw, skip, edgeSrc, fatalErr = applyCreateFile(pw, installRoot, ctx)
 		case "replace_block":
 			aw, skip, edgeSrc, fatalErr = applyReplaceBlock(pw, installRoot, ctx)
@@ -369,7 +380,22 @@ func applyInsertWrite(
 		return skip(fmt.Sprintf("build insert text: %v", buildErr))
 	}
 
+	// The anchor heading may come from the URI fragment or, per the spore
+	// authoring contract, from a "heading" payload field.
+	heading, _ := pw.Payload["heading"].(string)
+	heading = strings.TrimSpace(heading)
+	if anchorSlug == "" && heading != "" {
+		anchorSlug = slugify(heading)
+	}
+
 	insertOffset, locErr := locateInsertionPoint(origBytes, anchorSlug, pw.Kind)
+	if errors.Is(locErr, errAnchorNotFound) && pw.Kind == "append_section" && heading != "" && hasContentPayload(pw) {
+		// The named section doesn't exist yet: create it at end of file with
+		// the proposed content under it.
+		insertOffset = len(origBytes)
+		insertText = fmt.Sprintf("\n## %s\n\n%s", heading, insertText)
+		locErr = nil
+	}
 	if locErr != nil {
 		return skip(fmt.Sprintf("locate insertion point: %v", locErr))
 	}
@@ -907,23 +933,44 @@ func resolveTarget(installRoot, targetURI string) (filePath, anchorSlug, canonic
 	return absFile, anchor, canonicalURI, nil
 }
 
+// hasContentPayload reports whether the write carries insertable text in
+// either of the accepted payload fields ("body" or its documented alias
+// "content").
+func hasContentPayload(pw types.ProposedWrite) bool {
+	if body, ok := pw.Payload["body"].(string); ok && body != "" {
+		return true
+	}
+	if content, ok := pw.Payload["content"].(string); ok && content != "" {
+		return true
+	}
+	return false
+}
+
 // buildInsertText constructs the text to insert for a proposed write.
 //
 // Payload fields:
 //   - "body": raw markdown text to insert (used as-is, with trailing newline)
-//   - "heading": if present (and body absent), generate a new H2 with that text
+//   - "content": alias for "body" — the field name the spore authoring
+//     contract documents for append_section/insert_after
+//   - "heading": if present without body/content, generate a new H2 with that
+//     text; with body/content it names the anchor section instead (handled by
+//     the caller) and does not affect the insert text
 func buildInsertText(pw types.ProposedWrite) (string, error) {
-	if body, ok := pw.Payload["body"].(string); ok && body != "" {
+	text, _ := pw.Payload["body"].(string)
+	if text == "" {
+		text, _ = pw.Payload["content"].(string)
+	}
+	if text != "" {
 		// Ensure the text ends with a newline.
-		if !strings.HasSuffix(body, "\n") {
-			body += "\n"
+		if !strings.HasSuffix(text, "\n") {
+			text += "\n"
 		}
-		return body, nil
+		return text, nil
 	}
 	if heading, ok := pw.Payload["heading"].(string); ok && heading != "" {
 		return fmt.Sprintf("\n## %s\n", heading), nil
 	}
-	return "", fmt.Errorf("proposed_write payload must have 'body' or 'heading'")
+	return "", fmt.Errorf("proposed_write payload must have 'body', 'content', or 'heading'")
 }
 
 // locateInsertionPoint finds the byte offset at which to insert content for
@@ -958,7 +1005,7 @@ func locateInsertionPoint(src []byte, anchorSlug, kind string) (int, error) {
 		}
 	}
 	if targetIdx < 0 {
-		return 0, fmt.Errorf("anchor %q not found in target file", anchorSlug)
+		return 0, fmt.Errorf("anchor %q: %w", anchorSlug, errAnchorNotFound)
 	}
 
 	targetHeading := headings[targetIdx]

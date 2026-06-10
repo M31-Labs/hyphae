@@ -805,3 +805,163 @@ func min(a, b int) int {
 	}
 	return b
 }
+
+// ─── Spore authoring contract: heading + content payload ─────────────────────
+
+func TestApply_AppendSection_HeadingContentContract(t *testing.T) {
+	conn := openTestDB(t)
+	installRoot := t.TempDir()
+	spaceRoot := filepath.Join(installRoot, "spaces", "test-space")
+
+	canonicalContent := `---
+mdpp: "0.1"
+id: concept.target
+type: concept
+space: hypha://test/space
+status: canonical
+---
+
+# Target Concept
+
+## Section One
+
+Content of section one.
+
+## Section Two
+
+Content of section two.
+`
+	canonicalFile := makeCanonicalFile(t,
+		filepath.Join(installRoot, "spaces"),
+		"test-space/concepts/target.md",
+		canonicalContent,
+	)
+
+	// The shape every spore-authoring agent uses: no #anchor on the target,
+	// the section named by "heading", the text in "content".
+	sporeID := "spore.2026-06-10.test.agent05"
+	proposedWritesYAML := `proposed_writes:
+  - kind: append_section
+    target: hypha://test/space/concepts/target
+    heading: "Section One"
+    content: |
+      Appended via the heading+content contract.
+`
+	makeSporeFile(t, spaceRoot, sporeID, "agent://test/agent", "unreviewed", proposedWritesYAML)
+
+	result, err := Apply(conn, installRoot, spaceRoot, sporeID, "identity://odvcencio")
+	if err != nil {
+		t.Fatalf("Apply returned error: %v", err)
+	}
+	if len(result.AppliedWrites) != 1 {
+		t.Fatalf("AppliedWrites: want 1, got %d (skipped: %+v)", len(result.AppliedWrites), result.SkippedWrites)
+	}
+
+	newContent, _ := os.ReadFile(canonicalFile)
+	s := string(newContent)
+	insertPos := strings.Index(s, "Appended via the heading+content contract.")
+	sectionTwoPos := strings.Index(s, "## Section Two")
+	if insertPos < 0 {
+		t.Fatalf("content payload was dropped; file:\n%s", s)
+	}
+	if insertPos > sectionTwoPos {
+		t.Errorf("content landed outside Section One (insertPos=%d, sectionTwoPos=%d)", insertPos, sectionTwoPos)
+	}
+	if got := strings.Count(s, "## Section One"); got != 1 {
+		t.Errorf("duplicate anchor heading created: want 1 occurrence of '## Section One', got %d", got)
+	}
+}
+
+func TestApply_AppendSection_CreatesMissingSection(t *testing.T) {
+	conn := openTestDB(t)
+	installRoot := t.TempDir()
+	spaceRoot := filepath.Join(installRoot, "spaces", "test-space")
+
+	canonicalContent := `---
+mdpp: "0.1"
+id: concept.target
+type: concept
+space: hypha://test/space
+status: canonical
+---
+
+# Target Concept
+
+## Section One
+
+Content of section one.
+`
+	canonicalFile := makeCanonicalFile(t,
+		filepath.Join(installRoot, "spaces"),
+		"test-space/concepts/target.md",
+		canonicalContent,
+	)
+
+	sporeID := "spore.2026-06-10.test.agent06"
+	proposedWritesYAML := `proposed_writes:
+  - kind: append_section
+    target: hypha://test/space/concepts/target
+    heading: "Brand New Section"
+    content: |
+      First line of the new section.
+`
+	makeSporeFile(t, spaceRoot, sporeID, "agent://test/agent", "unreviewed", proposedWritesYAML)
+
+	result, err := Apply(conn, installRoot, spaceRoot, sporeID, "identity://odvcencio")
+	if err != nil {
+		t.Fatalf("Apply returned error: %v", err)
+	}
+	if len(result.AppliedWrites) != 1 {
+		t.Fatalf("AppliedWrites: want 1, got %d (skipped: %+v)", len(result.AppliedWrites), result.SkippedWrites)
+	}
+
+	newContent, _ := os.ReadFile(canonicalFile)
+	s := string(newContent)
+	headingPos := strings.Index(s, "## Brand New Section")
+	contentPos := strings.Index(s, "First line of the new section.")
+	if headingPos < 0 || contentPos < 0 {
+		t.Fatalf("missing created section or its content; file:\n%s", s)
+	}
+	if contentPos < headingPos {
+		t.Errorf("content landed before its created heading (contentPos=%d, headingPos=%d)", contentPos, headingPos)
+	}
+}
+
+func TestApply_CreateFile_DefaultsToSporeSpace(t *testing.T) {
+	conn := openTestDB(t)
+	installRoot := t.TempDir()
+	spaceRoot := filepath.Join(installRoot, "spaces", "test-space")
+	if err := os.MkdirAll(spaceRoot, 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+
+	// No target: the file must land in the spore's own space.
+	sporeID := "spore.2026-06-10.test.agent07"
+	proposedWritesYAML := `proposed_writes:
+  - kind: create_file
+    path: specs/test-default-space.md
+    body: |
+      ---
+      mdpp: "0.1"
+      id: spec.test-default-space
+      type: spec
+      space: hypha://test/space
+      status: draft
+      ---
+
+      # Spec created without an explicit target
+`
+	makeSporeFile(t, spaceRoot, sporeID, "agent://test/agent", "unreviewed", proposedWritesYAML)
+
+	result, err := Apply(conn, installRoot, spaceRoot, sporeID, "identity://odvcencio")
+	if err != nil {
+		t.Fatalf("Apply returned error: %v", err)
+	}
+	if len(result.AppliedWrites) != 1 {
+		t.Fatalf("AppliedWrites: want 1, got %d (skipped: %+v)", len(result.AppliedWrites), result.SkippedWrites)
+	}
+	expectedPath := filepath.Join(spaceRoot, "specs", "test-default-space.md")
+	if _, statErr := os.Stat(expectedPath); statErr != nil {
+		t.Fatalf("created file not found at %s: %v", expectedPath, statErr)
+	}
+}
