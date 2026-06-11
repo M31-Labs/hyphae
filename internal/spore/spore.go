@@ -32,6 +32,11 @@ var ErrDuplicate = errors.New("spore: duplicate (id already present in inbox)")
 // flip is not permitted (e.g., re-accepting an already-rejected spore).
 var ErrInvalidStatusTransition = errors.New("spore: invalid status transition")
 
+// ErrNotUnreviewed is returned by Amend when the target spore has already left
+// the "unreviewed" state. Once a spore is accepted, rejected, or archived, its
+// inbox record is immutable — amend is only permitted for pre-review spores.
+var ErrNotUnreviewed = errors.New("spore: amend refused: spore has already left 'unreviewed' status")
+
 // ValidationError describes one required-field violation.
 type ValidationError struct {
 	Field   string // dotted path, e.g. "agent.id"
@@ -387,6 +392,106 @@ func SubmitBytes(source []byte, spaceRoot string) (filePath string, r types.Rece
 		NextState:       "review",
 	}
 	return filePath, r, nil
+}
+
+// Amend replaces the on-disk inbox record for an existing spore with new
+// source bytes. It is the legitimate path for correcting a spore that was
+// submitted but not yet grafted — it avoids the need to hand-edit the inbox
+// file (which would produce a stale signature that Verify now rejects).
+//
+// Amend:
+//   - reads the existing file to confirm current status is "unreviewed";
+//   - validates source as a well-formed spore;
+//   - confirms the id in source matches the id in the existing file;
+//   - overwrites the file atomically;
+//   - returns the file path and a new Receipt.
+//
+// Returns ErrNotUnreviewed if the spore has left the unreviewed state.
+// Callers wishing to sign the amended content should call Sign on source
+// before passing it here (Amend writes source verbatim).
+func Amend(source []byte, spaceRoot string) (filePath string, r types.Receipt, err error) {
+	s, verrs := Parse(source)
+	if len(verrs) > 0 {
+		msgs := make([]string, len(verrs))
+		for i, e := range verrs {
+			msgs[i] = e.Error()
+		}
+		return "", types.Receipt{}, fmt.Errorf("spore failed validation: %s", strings.Join(msgs, "; "))
+	}
+	if s.TokenCount > tokenCap {
+		return "", types.Receipt{}, fmt.Errorf("spore body exceeds hard cap (5000 tokens estimated)")
+	}
+
+	filename := sporeFilename(s)
+	inboxDir := filepath.Join(spaceRoot, "inbox", "agents")
+	filePath = filepath.Join(inboxDir, filename)
+
+	// Confirm the existing file exists and is still unreviewed.
+	existing, readErr := os.ReadFile(filePath)
+	if readErr != nil {
+		return "", types.Receipt{}, fmt.Errorf("spore amend: read existing file: %w", readErr)
+	}
+
+	existingStatus := extractFrontmatterField(existing, "status")
+	if existingStatus != "unreviewed" {
+		return "", types.Receipt{}, fmt.Errorf("%w (status: %q, path: %s)", ErrNotUnreviewed, existingStatus, filePath)
+	}
+
+	existingID := extractFrontmatterField(existing, "id")
+	if existingID != s.ID {
+		return "", types.Receipt{}, fmt.Errorf("spore amend: id mismatch: existing file has id %q, source has %q", existingID, s.ID)
+	}
+
+	if writeErr := atomicfs.WriteFile(filePath, source, 0o644); writeErr != nil {
+		return "", types.Receipt{}, fmt.Errorf("spore amend: write: %w", writeErr)
+	}
+
+	hash := sha256.Sum256(source)
+	contentHash := fmt.Sprintf("%x", hash[:])
+
+	shortID := sporeShortID(s.ID)
+	dateStr := s.SubmittedAt.Format("2006-01-02")
+
+	r = types.Receipt{
+		ID:              fmt.Sprintf("hypha-receipt:%s:%s", dateStr, shortID),
+		SpaceID:         s.SpaceID,
+		SubjectID:       s.AgentID,
+		SubjectKind:     "agent",
+		Action:          "spore:amend",
+		Status:          "accepted_for_review",
+		ContentHash:     contentHash,
+		CreatedAt:       time.Now().UTC(),
+		PermissionsUsed: []string{"spore:create"},
+		NextState:       "review",
+	}
+
+	return filePath, r, nil
+}
+
+// extractFrontmatterField returns the value of a simple scalar top-level field
+// from a raw mdpp document's frontmatter. Returns "" on miss. Used internally
+// by Amend for lightweight status / id checks without a full parse round-trip.
+func extractFrontmatterField(data []byte, key string) string {
+	s := string(data)
+	start := strings.Index(s, "\n")
+	if start < 0 {
+		return ""
+	}
+	end := strings.Index(s[start+1:], "\n---")
+	if end < 0 {
+		return ""
+	}
+	block := s[start+1 : start+1+end]
+	prefix := key + ": "
+	for _, line := range strings.Split(block, "\n") {
+		if strings.HasPrefix(line, prefix) {
+			v := strings.TrimPrefix(line, prefix)
+			v = strings.TrimSpace(v)
+			v = strings.Trim(v, `"`)
+			return v
+		}
+	}
+	return ""
 }
 
 // ─── helpers ──────────────────────────────────────────────────────────────────

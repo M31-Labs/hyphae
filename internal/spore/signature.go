@@ -4,8 +4,10 @@ import (
 	"bytes"
 	"crypto/sha256"
 	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"sort"
 	"strings"
 	"time"
 
@@ -75,8 +77,11 @@ func Sign(source []byte, priv identity.PrivateKey, signedKey string) ([]byte, er
 	bodyHashHex := fmt.Sprintf("%x", bodyHash[:])
 	contentHash := "sha256:" + bodyHashHex
 
+	// Compute frontmatter substance hash (all fields except status + signature).
+	fmSubstanceHashHex := computeFmSubstanceHash(fm)
+
 	// Build canonical payload.
-	payload := buildCanonicalPayload(agentID, sporeID, createdAt, bodyHashHex)
+	payload := buildCanonicalPayload(agentID, sporeID, createdAt, bodyHashHex, fmSubstanceHashHex)
 
 	// Sign.
 	sigBytes := identity.Sign(priv, payload)
@@ -141,6 +146,10 @@ func Verify(source []byte, resolve IdentityResolver) error {
 		return fmt.Errorf("spore: content hash does not match body")
 	}
 
+	// Verify frontmatter substance hasn't changed since signing.
+	// This catches mutations like adding proposed_writes after signing.
+	currentFmSubstanceHashHex := computeFmSubstanceHash(fm)
+
 	// Extract spore fields for canonical payload.
 	agentID := ""
 	if agentBlock, ok := fm["agent"].(map[string]any); ok {
@@ -163,7 +172,7 @@ func Verify(source []byte, resolve IdentityResolver) error {
 	}
 
 	// Build canonical payload.
-	payload := buildCanonicalPayload(agentID, sporeID, createdAt, bodyHashHex)
+	payload := buildCanonicalPayload(agentID, sporeID, createdAt, bodyHashHex, currentFmSubstanceHashHex)
 
 	// Decode signature value.
 	const ed25519Prefix = "ed25519:"
@@ -190,7 +199,15 @@ func Verify(source []byte, resolve IdentityResolver) error {
 //	spore.id\n
 //	created (RFC3339)\n
 //	sha256hex-of-body\n
-func buildCanonicalPayload(agentID, sporeID string, createdAt time.Time, bodyHashHex string) []byte {
+//	sha256hex-of-fm-substance\n
+//
+// The fm-substance hash covers all frontmatter fields except "status" and
+// "signature". Excluding "status" lets review flows promote unreviewed→accepted
+// without invalidating the signature. Excluding "signature" avoids a
+// bootstrapping cycle. Any other frontmatter mutation (e.g. adding
+// proposed_writes after signing) changes the substance hash and fails
+// verification.
+func buildCanonicalPayload(agentID, sporeID string, createdAt time.Time, bodyHashHex, fmSubstanceHashHex string) []byte {
 	var sb strings.Builder
 	sb.WriteString(agentID)
 	sb.WriteByte('\n')
@@ -200,7 +217,79 @@ func buildCanonicalPayload(agentID, sporeID string, createdAt time.Time, bodyHas
 	sb.WriteByte('\n')
 	sb.WriteString(bodyHashHex)
 	sb.WriteByte('\n')
+	sb.WriteString(fmSubstanceHashHex)
+	sb.WriteByte('\n')
 	return []byte(sb.String())
+}
+
+// computeFmSubstanceHash extracts all frontmatter fields from fm except
+// "status" and "signature", serialises them as canonical (sorted-key) JSON,
+// and returns the SHA-256 hex digest.
+//
+// Canonicalization rules:
+//   - Keys "status" and "signature" are always excluded.
+//   - Remaining keys are sorted lexicographically.
+//   - The value is serialised with encoding/json (YAML-parsed values such as
+//     []any, map[string]any, time.Time are all JSON-serialisable). time.Time
+//     values are rendered as RFC3339 UTC strings to keep the digest stable
+//     across runs.
+func computeFmSubstanceHash(fm map[string]any) string {
+	skipped := map[string]bool{"status": true, "signature": true}
+
+	keys := make([]string, 0, len(fm))
+	for k := range fm {
+		if !skipped[k] {
+			keys = append(keys, k)
+		}
+	}
+	sort.Strings(keys)
+
+	substance := make(map[string]any, len(keys))
+	for _, k := range keys {
+		substance[k] = normaliseForJSON(fm[k])
+	}
+
+	b, err := json.Marshal(orderedMap(keys, substance))
+	if err != nil {
+		// Extremely unlikely; fall back to empty hash marker.
+		return "error"
+	}
+	h := sha256.Sum256(b)
+	return fmt.Sprintf("%x", h[:])
+}
+
+// orderedMap builds a json.Marshaler-compatible []any that preserves key order.
+// encoding/json marshals map[string]any in random order; by encoding as an
+// array of [key, value] pairs we get a deterministic digest.
+func orderedMap(keys []string, m map[string]any) any {
+	pairs := make([]any, 0, len(keys))
+	for _, k := range keys {
+		pairs = append(pairs, []any{k, m[k]})
+	}
+	return pairs
+}
+
+// normaliseForJSON converts values that encoding/json cannot serialise
+// portably (primarily time.Time) into their canonical string form.
+func normaliseForJSON(v any) any {
+	switch t := v.(type) {
+	case time.Time:
+		return t.UTC().Format(time.RFC3339)
+	case map[string]any:
+		out := make(map[string]any, len(t))
+		for k, val := range t {
+			out[k] = normaliseForJSON(val)
+		}
+		return out
+	case []any:
+		out := make([]any, len(t))
+		for i, val := range t {
+			out[i] = normaliseForJSON(val)
+		}
+		return out
+	default:
+		return v
+	}
 }
 
 // extractBodyBytes returns the raw body bytes (everything after the closing

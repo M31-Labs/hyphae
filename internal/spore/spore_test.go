@@ -1,6 +1,7 @@
 package spore_test
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
 	"os"
@@ -723,6 +724,256 @@ proposed_edges:
 	}
 	if !found {
 		t.Errorf("expected error on proposed_edges[0].src, got: %v", errs)
+	}
+}
+
+// ─── Signal 1: frontmatter integrity tests ────────────────────────────────────
+
+// TestTamperedFrontmatterAfterSigningFails guards against the production gap:
+// a spore was submitted and signed, then its inbox file was hand-edited to add
+// a proposed_writes block. Before this fix, Verify reported "verified" because
+// it only hashed the body, not the frontmatter substance. After the fix, the
+// frontmatter substance hash is part of the signed payload and any frontmatter
+// mutation (other than status promotion) causes Verify to return an error.
+func TestTamperedFrontmatterAfterSigningFails(t *testing.T) {
+	id, priv := makeTestIdentity(t)
+	resolver := resolverFor(id)
+
+	// Start with a spore that has no proposed_writes.
+	noWrites := []byte(`---
+mdpp: "0.1"
+id: spore.2026-06-10.tamper-test.aa01
+type: spore
+space: hypha://m31labs/research
+status: unreviewed
+created: 2026-06-10T10:00:00Z
+
+agent:
+  id: agent://cloud/test
+  kind: ephemeral
+
+confidence: medium
+
+source_refs:
+  - hypha://m31labs/research/concept.hyphae
+---
+
+# Tamper test body
+`)
+
+	signed, err := spore.Sign(noWrites, priv, id.ID)
+	if err != nil {
+		t.Fatalf("Sign: %v", err)
+	}
+
+	// Verify the clean signed doc passes.
+	if err := spore.Verify(signed, resolver); err != nil {
+		t.Fatalf("Verify on untampered signed doc: %v", err)
+	}
+
+	// Simulate the production incident: hand-edit the frontmatter to add a
+	// proposed_writes block after signing. We do a textual insertion.
+	tampered := bytes.ReplaceAll(signed,
+		[]byte("\nsignature:\n"),
+		[]byte("\nproposed_writes:\n  - kind: create_file\n    target: hypha://m31labs/research\n    path: evil.md\n    body: \"pwned\"\n\nsignature:\n"),
+	)
+
+	err = spore.Verify(tampered, resolver)
+	if err == nil {
+		t.Fatal("Verify must return an error for frontmatter-tampered spore, got nil")
+	}
+	// The error should mention the content/signature mismatch, not just an
+	// unsigned error.
+	if errors.Is(err, spore.ErrUnsigned) {
+		t.Fatalf("expected content mismatch error, got ErrUnsigned (signature block was removed?): %v", err)
+	}
+}
+
+// TestVerifyPassesOnUntamperedDoc is the positive counterpart: a signed spore
+// with no post-sign modifications must verify successfully.
+func TestVerifyPassesOnUntamperedDoc(t *testing.T) {
+	id, priv := makeTestIdentity(t)
+	resolver := resolverFor(id)
+
+	signed, err := spore.Sign(validSporeDoc, priv, id.ID)
+	if err != nil {
+		t.Fatalf("Sign: %v", err)
+	}
+	if err := spore.Verify(signed, resolver); err != nil {
+		t.Fatalf("Verify on untampered doc: %v", err)
+	}
+}
+
+// TestStatusPromotionDoesNotBreakSignature verifies that the review flow
+// (unreviewed → accepted) can flip the status field in-place and Verify still
+// passes. "status" is excluded from the frontmatter substance hash on purpose.
+func TestStatusPromotionDoesNotBreakSignature(t *testing.T) {
+	id, priv := makeTestIdentity(t)
+	resolver := resolverFor(id)
+
+	signed, err := spore.Sign(validSporeDoc, priv, id.ID)
+	if err != nil {
+		t.Fatalf("Sign: %v", err)
+	}
+
+	// Simulate what cmdSporeReview does: replace "status: unreviewed" with
+	// "status: accepted".
+	promoted := bytes.ReplaceAll(signed,
+		[]byte("status: unreviewed\n"),
+		[]byte("status: accepted\n"),
+	)
+
+	if err := spore.Verify(promoted, resolver); err != nil {
+		t.Fatalf("Verify after status promotion must pass, got: %v", err)
+	}
+}
+
+// ─── Signal 2: spore amend tests ──────────────────────────────────────────────
+
+// TestAmendResignsAndVerifies verifies that Amend replaces the inbox file and
+// the new content (pre-signed before calling Amend) passes Verify.
+func TestAmendResignsAndVerifies(t *testing.T) {
+	id, priv := makeTestIdentity(t)
+	resolver := resolverFor(id)
+
+	// Original spore without proposed_writes.
+	original := []byte(`---
+mdpp: "0.1"
+id: spore.2026-06-10.amend-test.bb01
+type: spore
+space: hypha://m31labs/research
+status: unreviewed
+created: 2026-06-10T11:00:00Z
+
+agent:
+  id: agent://cloud/test
+  kind: ephemeral
+
+confidence: medium
+
+source_refs:
+  - hypha://m31labs/research/concept.hyphae
+---
+
+# Amend test body
+`)
+
+	signedOriginal, err := spore.Sign(original, priv, id.ID)
+	if err != nil {
+		t.Fatalf("Sign original: %v", err)
+	}
+
+	spaceRoot := t.TempDir()
+	filePath, _, err := spore.SubmitBytes(signedOriginal, spaceRoot)
+	if err != nil {
+		t.Fatalf("SubmitBytes: %v", err)
+	}
+
+	// Amended version adds proposed_writes.
+	amended := []byte(`---
+mdpp: "0.1"
+id: spore.2026-06-10.amend-test.bb01
+type: spore
+space: hypha://m31labs/research
+status: unreviewed
+created: 2026-06-10T11:00:00Z
+
+agent:
+  id: agent://cloud/test
+  kind: ephemeral
+
+confidence: high
+
+source_refs:
+  - hypha://m31labs/research/concept.hyphae
+
+proposed_writes:
+  - kind: create_file
+    target: hypha://m31labs/research
+    path: notes/amend.md
+    body: "# amended"
+---
+
+# Amend test body (updated confidence)
+`)
+
+	// Sign the amended content before amending.
+	signedAmended, err := spore.Sign(amended, priv, id.ID)
+	if err != nil {
+		t.Fatalf("Sign amended: %v", err)
+	}
+
+	newPath, _, err := spore.Amend(signedAmended, spaceRoot)
+	if err != nil {
+		t.Fatalf("Amend: %v", err)
+	}
+	if newPath != filePath {
+		t.Errorf("Amend path = %q, want %q", newPath, filePath)
+	}
+
+	// Read back and verify.
+	ondisk, err := os.ReadFile(newPath)
+	if err != nil {
+		t.Fatalf("read amended file: %v", err)
+	}
+	if err := spore.Verify(ondisk, resolver); err != nil {
+		t.Fatalf("Verify on amended file: %v", err)
+	}
+}
+
+// TestAmendRefusesNonUnreviewed verifies that Amend returns ErrNotUnreviewed
+// when the existing inbox spore has already left the unreviewed state.
+func TestAmendRefusesNonUnreviewed(t *testing.T) {
+	id, priv := makeTestIdentity(t)
+
+	original := []byte(`---
+mdpp: "0.1"
+id: spore.2026-06-10.amend-test.cc01
+type: spore
+space: hypha://m31labs/research
+status: unreviewed
+created: 2026-06-10T12:00:00Z
+
+agent:
+  id: agent://cloud/test
+  kind: ephemeral
+
+confidence: medium
+
+source_refs:
+  - hypha://m31labs/research/concept.hyphae
+---
+
+# Non-unreviewed amend test
+`)
+
+	signed, err := spore.Sign(original, priv, id.ID)
+	if err != nil {
+		t.Fatalf("Sign: %v", err)
+	}
+
+	spaceRoot := t.TempDir()
+	filePath, _, err := spore.SubmitBytes(signed, spaceRoot)
+	if err != nil {
+		t.Fatalf("SubmitBytes: %v", err)
+	}
+
+	// Manually flip status to accepted (simulates review flow).
+	accepted := bytes.ReplaceAll(signed,
+		[]byte("status: unreviewed\n"),
+		[]byte("status: accepted\n"),
+	)
+	if err := os.WriteFile(filePath, accepted, 0o644); err != nil {
+		t.Fatalf("write accepted: %v", err)
+	}
+
+	// Now attempt amend — should be refused.
+	_, _, err = spore.Amend(signed, spaceRoot)
+	if err == nil {
+		t.Fatal("Amend should fail for accepted spore, got nil")
+	}
+	if !errors.Is(err, spore.ErrNotUnreviewed) {
+		t.Errorf("expected ErrNotUnreviewed, got: %v", err)
 	}
 }
 

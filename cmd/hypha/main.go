@@ -58,9 +58,9 @@ import (
 	mdppfmt "m31labs.dev/mdpp/fmt"
 )
 
-const hyphaeVersion = "0.1.10"
+const hyphaeVersion = "0.1.11"
 
-const usage = `hypha — Hyphae v0.1.10 CLI
+const usage = `hypha — Hyphae v0.1.11 CLI
 
 Usage:
   hypha index    rebuild [--root <path>]
@@ -68,6 +68,7 @@ Usage:
   hypha show     <id-or-hypha-uri> [--path] [--json] [--frontmatter] [--body]
   hypha spaces   list [--format text|json|jsonline|compact]
   hypha spore    submit <file> [--sign --as <identity-uri>] [--format text|json|jsonline|compact]
+  hypha spore    amend  <file> [--sign --as <identity-uri>] [--format text|json|jsonline|compact]
   hypha spore    list   [--space <uri>] [--status <state>] [--since 24h] [--limit N] [--format text|json|jsonline|compact]
   hypha spore    accept <spore-id> --as <identity> [--reason "..."] [--space <uri>] [--format text|json|jsonline|compact]
   hypha spore    reject <spore-id> --as <identity> [--reason "..."] [--space <uri>] [--format text|json|jsonline|compact]
@@ -1536,11 +1537,13 @@ func cmdRecall(args []string) error {
 
 func cmdSpore(args []string) error {
 	if len(args) == 0 {
-		return errors.New("usage: hypha spore submit|list|accept|reject [...]")
+		return errors.New("usage: hypha spore submit|amend|list|accept|reject [...]")
 	}
 	switch args[0] {
 	case "submit":
 		return cmdSporeSubmit(args[1:])
+	case "amend":
+		return cmdSporeAmend(args[1:])
 	case "list":
 		return cmdSporeList(args[1:])
 	case "accept":
@@ -1548,7 +1551,7 @@ func cmdSpore(args []string) error {
 	case "reject":
 		return cmdSporeReview(args[1:], "rejected")
 	default:
-		return fmt.Errorf("unknown spore subcommand %q (try `submit`, `list`, `accept`, `reject`)", args[0])
+		return fmt.Errorf("unknown spore subcommand %q (try `submit`, `amend`, `list`, `accept`, `reject`)", args[0])
 	}
 }
 
@@ -1844,6 +1847,101 @@ func cmdSporeSubmit(rest []string) error {
 		fmt.Fprintf(w, "Submitted: %s\n", filePath)
 		fmt.Fprintf(w, "  Signed:   %t\n", *sign)
 		fmt.Fprintf(w, "  Receipt:  %s\n", receipt.ID)
+		return nil
+	})
+}
+
+// cmdSporeAmend replaces an existing unreviewed inbox spore with amended source
+// bytes. It is the legitimate fix path for a submitted-but-not-yet-grafted
+// spore — it avoids hand-editing the inbox file which would leave a stale
+// signature that Verify now correctly rejects.
+//
+// Usage: hypha spore amend <file> [--sign --as <identity-uri>]
+//
+// If --sign is given the amended bytes are signed before being written,
+// producing a fresh signature over the new content.
+func cmdSporeAmend(rest []string) error {
+	fs := flag.NewFlagSet("spore amend", flag.ContinueOnError)
+	sign := fs.Bool("sign", false, "Ed25519-sign the amended spore before writing")
+	signer := fs.String("as", "", "signer identity URI (required with --sign)")
+	format := formatFlag(fs)
+	if err := fs.Parse(reorderFlagsFirst(rest)); err != nil {
+		return err
+	}
+	if fs.NArg() == 0 {
+		return errors.New("usage: hypha spore amend <file> [--sign --as <identity-uri>]")
+	}
+	path := fs.Arg(0)
+
+	source, err := os.ReadFile(path)
+	if err != nil {
+		return fmt.Errorf("read %s: %w", path, err)
+	}
+
+	// Parse for validation before signing.
+	sp, verrs := spore.Parse(source)
+	if len(verrs) > 0 {
+		for _, e := range verrs {
+			fmt.Fprintln(os.Stderr, "  ", e.Error())
+		}
+		return fmt.Errorf("spore %s failed validation (%d errors)", path, len(verrs))
+	}
+
+	root, err := resolveRoot("")
+	if err != nil {
+		return err
+	}
+	spaceRoot, err := spaceURIToPath(root, sp.SpaceID)
+	if err != nil {
+		return err
+	}
+
+	toWrite := source
+
+	if *sign {
+		if *signer == "" {
+			return errors.New("--sign requires --as <identity-uri>")
+		}
+		identDir := filepath.Join(root, ".catalog", "identities")
+		signerName := identityNameFromURI(*signer)
+		if signerName == "" {
+			return fmt.Errorf("--as %q must be a full identity:// URI", *signer)
+		}
+		priv, lpErr := identity.LoadPrivate(identDir, signerName)
+		if lpErr != nil {
+			return fmt.Errorf("load signer key: %w", lpErr)
+		}
+		signed, sErr := spore.Sign(source, priv, *signer)
+		if sErr != nil {
+			return fmt.Errorf("sign: %w", sErr)
+		}
+		toWrite = signed
+	}
+
+	filePath, receipt, err := spore.Amend(toWrite, spaceRoot)
+	if err != nil {
+		return fmt.Errorf("amend: %w", err)
+	}
+
+	// Persist the receipt to the audit log.
+	if conn, dbErr := openIndex(root); dbErr == nil {
+		defer conn.Close()
+		if wErr := receipts.Write(conn, receipt); wErr != nil && !errors.Is(wErr, receipts.ErrAlreadyExists) {
+			fmt.Fprintf(os.Stderr, "warn: failed to persist receipt: %v\n", wErr)
+		}
+	} else {
+		fmt.Fprintf(os.Stderr, "warn: receipt not persisted (index unavailable: %v)\n", dbErr)
+	}
+
+	payload := map[string]any{
+		"receipt":   receipt,
+		"file_path": filePath,
+		"signed":    *sign,
+	}
+	return emit("spore amend", payload, *format, func(w io.Writer, _ any) error {
+		fmt.Fprintf(w, "Amended: %s\n", filePath)
+		fmt.Fprintf(w, "  Signed:  %t\n", *sign)
+		fmt.Fprintf(w, "  Receipt: %s\n", receipt.ID)
 		return nil
 	})
 }
