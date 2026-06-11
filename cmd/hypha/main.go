@@ -58,9 +58,9 @@ import (
 	mdppfmt "m31labs.dev/mdpp/fmt"
 )
 
-const hyphaeVersion = "0.1.9"
+const hyphaeVersion = "0.1.10"
 
-const usage = `hypha — Hyphae v0.1.9 CLI
+const usage = `hypha — Hyphae v0.1.10 CLI
 
 Usage:
   hypha index    rebuild [--root <path>]
@@ -1407,6 +1407,14 @@ func persistObjectsAnchorsEdges(conn *sql.DB, spacePath string, objects []types.
 				tagsJSON = string(b)
 			}
 		}
+		metadataJSON := "{}"
+		if len(o.Frontmtr) > 0 {
+			b, jerr := json.Marshal(o.Frontmtr)
+			if jerr != nil {
+				return fmt.Errorf("marshal object metadata %q: %w", o.ID, jerr)
+			}
+			metadataJSON = string(b)
+		}
 		// file_id: use the path relative to space root as a stable synthetic id.
 		fileID, _ := filepath.Rel(spacePath, o.FilePath)
 		if fileID == "" {
@@ -1417,8 +1425,8 @@ func persistObjectsAnchorsEdges(conn *sql.DB, spacePath string, objects []types.
 			updated = o.UpdatedAt.UTC().Format(time.RFC3339)
 		}
 		if _, err := tx.Exec(`
-			INSERT INTO objects (id, type, space_id, file_id, status, title, tags_json, summary, updated_at)
-			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+			INSERT INTO objects (id, type, space_id, file_id, status, title, tags_json, summary, metadata_json, updated_at)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 			ON CONFLICT(id) DO UPDATE SET
 				type = excluded.type,
 				space_id = excluded.space_id,
@@ -1427,8 +1435,9 @@ func persistObjectsAnchorsEdges(conn *sql.DB, spacePath string, objects []types.
 				title = excluded.title,
 				tags_json = excluded.tags_json,
 				summary = excluded.summary,
+				metadata_json = excluded.metadata_json,
 				updated_at = excluded.updated_at`,
-			o.ID, string(o.Type), o.SpaceID, fileID, o.Status, o.Title, tagsJSON, o.Summary, updated); err != nil {
+			o.ID, string(o.Type), o.SpaceID, fileID, o.Status, o.Title, tagsJSON, o.Summary, metadataJSON, updated); err != nil {
 			return fmt.Errorf("upsert object %q: %w", o.ID, err)
 		}
 	}

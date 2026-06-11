@@ -90,10 +90,23 @@ var unsupportedWriteKinds = map[string]bool{}
 // applyContext threads dry-run + rollback + delta tracking through every
 // write a handler makes. Replace handler os.WriteFile sites with
 // ctx.writeFile(path, newBytes) so they participate in dry-run uniformly.
+//
+// pending holds the latest in-memory bytes for each modified file so that
+// subsequent writes within the same graft (including dry-run) see the
+// already-modified content when they call ctx.readFile. This ensures
+// multi-write spores compute ranges against the live post-prior-write state
+// rather than a stale snapshot.
+//
+// writtenRanges tracks the byte ranges that prior writes claimed in each file
+// (using the pre-write byte coordinates). When a new write's target range
+// overlaps a prior one, the engine detects the conflict and skips the second
+// write loudly rather than silently corrupting the document.
 type applyContext struct {
-	dryRun   bool
-	rollback map[string][]byte // path → original bytes (nil for new files)
-	deltas   []FileDelta
+	dryRun        bool
+	rollback      map[string][]byte      // path → original bytes (nil for new files)
+	pending       map[string][]byte      // path → latest in-memory bytes after prior writes
+	writtenRanges map[string][]mdpp.Range // path → ranges claimed by prior writes
+	deltas        []FileDelta
 }
 
 func (c *applyContext) seedRollback(path string, origBytes []byte) {
@@ -102,10 +115,22 @@ func (c *applyContext) seedRollback(path string, origBytes []byte) {
 	}
 }
 
+// readFile returns the latest in-memory bytes for path if a prior write in
+// this graft has already modified it; otherwise it reads from disk.
+// Handlers must use ctx.readFile instead of os.ReadFile so that multi-write
+// spores see the current state of the file throughout the graft.
+func (c *applyContext) readFile(path string) ([]byte, error) {
+	if buf, modified := c.pending[path]; modified {
+		return append([]byte{}, buf...), nil
+	}
+	return os.ReadFile(path)
+}
+
 // writeFile records a delta and, when not in dry-run mode, persists the
-// new bytes atomically. oldBytes is taken from the rollback map (set by
-// the handler's pre-mutation read) or derived from disk; pass nil to
-// indicate a brand-new file.
+// new bytes atomically. It also updates the in-memory pending buffer so
+// subsequent writes within the same graft see the current state.
+// oldBytes is taken from the rollback map (set by the handler's pre-mutation
+// read) or derived from disk; pass nil to indicate a brand-new file.
 func (c *applyContext) writeFile(path string, newBytes []byte) error {
 	old, isMod := c.rollback[path]
 	if !isMod {
@@ -113,10 +138,30 @@ func (c *applyContext) writeFile(path string, newBytes []byte) error {
 		old = nil
 	}
 	c.deltas = append(c.deltas, FileDelta{Path: path, OldBytes: old, NewBytes: append([]byte{}, newBytes...)})
+	// Keep in-memory buffer current so subsequent writes see the new state.
+	c.pending[path] = append([]byte{}, newBytes...)
 	if c.dryRun {
 		return nil
 	}
 	return atomicfs.WriteFile(path, newBytes, 0o644)
+}
+
+// claimRange records that a write has claimed [start, end) in path.
+// Returns a non-nil SkippedWrite if [start, end) overlaps any previously
+// claimed range in the same file — the caller must skip rather than apply.
+// This prevents silent document corruption when multiple writes in one spore
+// target the same section.
+func (c *applyContext) claimRange(path string, kind string, start, end int) *SkippedWrite {
+	for _, prior := range c.writtenRanges[path] {
+		if start < prior.EndByte && end > prior.StartByte {
+			return &SkippedWrite{
+				Kind:   kind,
+				Reason: fmt.Sprintf("overlapping write: byte range [%d,%d) conflicts with already-applied range [%d,%d) in the same file — resubmit writes as separate spores", start, end, prior.StartByte, prior.EndByte),
+			}
+		}
+	}
+	c.writtenRanges[path] = append(c.writtenRanges[path], mdpp.Range{StartByte: start, EndByte: end})
+	return nil
 }
 
 // rollbackTouched reverts every modified file to its pre-graft bytes. No-op
@@ -173,8 +218,10 @@ func ApplyWithOpts(conn *sql.DB, installRoot, spaceRoot, sporeID, grafter string
 	now := time.Now().UTC()
 
 	ctx := &applyContext{
-		dryRun:   opts.DryRun,
-		rollback: map[string][]byte{},
+		dryRun:        opts.DryRun,
+		rollback:      map[string][]byte{},
+		pending:       map[string][]byte{},
+		writtenRanges: map[string][]mdpp.Range{},
 	}
 	// Ensure rollback on unrecoverable error.
 	needRollback := true
@@ -369,7 +416,9 @@ func applyInsertWrite(
 		return skip("target file not found")
 	}
 
-	origBytes, readErr := os.ReadFile(targetFile)
+	// Use ctx.readFile so that if a prior write in this graft already modified
+	// this file, we compute ranges against the current (post-prior-write) bytes.
+	origBytes, readErr := ctx.readFile(targetFile)
 	if readErr != nil {
 		return skip(fmt.Sprintf("read target file: %v", readErr))
 	}
@@ -398,6 +447,16 @@ func applyInsertWrite(
 	}
 	if locErr != nil {
 		return skip(fmt.Sprintf("locate insertion point: %v", locErr))
+	}
+
+	// For insert-style writes, the "claimed range" is the single insertion point.
+	// Insertions at the same point don't clobber each other (they stack), so we
+	// only check for exact-point collisions if both writes claim the exact same
+	// offset range. In practice, two append_section writes to the same section
+	// in one spore would produce a point-range collision here.
+	if sw := ctx.claimRange(targetFile, pw.Kind, insertOffset, insertOffset+len(insertText)); sw != nil {
+		sw.TargetURI = pw.Target
+		return nil, sw, "", nil
 	}
 
 	newBytes := spliceBytes(origBytes, insertOffset, insertText)
@@ -583,7 +642,9 @@ func applyReplaceBlock(
 		return skip("target file not found")
 	}
 
-	origBytes, readErr := os.ReadFile(targetFile)
+	// Use ctx.readFile so that if a prior write in this graft already modified
+	// this file, we compute section ranges against the current bytes.
+	origBytes, readErr := ctx.readFile(targetFile)
 	if readErr != nil {
 		return skip(fmt.Sprintf("read target file: %v", readErr))
 	}
@@ -622,6 +683,14 @@ func applyReplaceBlock(
 			sectionEnd = headings[i].Range.StartByte
 			break
 		}
+	}
+
+	// Detect overlap: a prior replace_block in this graft may have already
+	// claimed this byte range. If so, skip loudly rather than silently
+	// clobbering the prior write's output.
+	if sw := ctx.claimRange(targetFile, pw.Kind, sectionStart, sectionEnd); sw != nil {
+		sw.TargetURI = pw.Target
+		return nil, sw, "", nil
 	}
 
 	// Extract the heading line verbatim (preserve level and title).
@@ -679,7 +748,8 @@ func applyAddTag(
 		return skip("target file not found")
 	}
 
-	origBytes, readErr := os.ReadFile(targetFile)
+	// Use ctx.readFile so that prior writes in this graft are visible.
+	origBytes, readErr := ctx.readFile(targetFile)
 	if readErr != nil {
 		return skip(fmt.Sprintf("read target file: %v", readErr))
 	}
