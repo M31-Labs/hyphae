@@ -37,6 +37,15 @@ type IdentityResolver func(uri string) (identity.Identity, error)
 // just before the closing `---`. signedKey is the public identity URI (e.g.
 // "identity://m31labs/odvcencio"). If the input already has a signature block
 // it is replaced.
+//
+// Canonicalization invariant: the substance hash is computed over the
+// NORMALIZED frontmatter representation — the same representation that Verify
+// will reconstruct when it reads the on-disk file. The normalization is the
+// yaml.Node round-trip performed by removeSignatureBlock (which re-serialises
+// the frontmatter YAML, changing indentation and scalar styles). Computing the
+// hash over the pre-normalisation fm would produce a different hash than Verify
+// sees, causing spurious mismatches for untampered spores (bug: production
+// graft --verify failure on legitimately-signed spores).
 func Sign(source []byte, priv identity.PrivateKey, signedKey string) ([]byte, error) {
 	doc, err := mdpp.Parse(source)
 	if err != nil {
@@ -48,7 +57,9 @@ func Sign(source []byte, priv identity.PrivateKey, signedKey string) ([]byte, er
 		return nil, fmt.Errorf("spore: sign: no frontmatter block found")
 	}
 
-	// Extract required fields for the canonical payload.
+	// Extract required fields for the canonical payload using the original fm.
+	// These scalar fields (id, agent.id, created) are not affected by the
+	// yaml.Node normalisation, so the original fm is fine for them.
 	agentID := stringField(fm, "agent.id")
 	if agentBlock, ok := fm["agent"].(map[string]any); ok {
 		agentID = stringField(agentBlock, "id")
@@ -77,8 +88,14 @@ func Sign(source []byte, priv identity.PrivateKey, signedKey string) ([]byte, er
 	bodyHashHex := fmt.Sprintf("%x", bodyHash[:])
 	contentHash := "sha256:" + bodyHashHex
 
-	// Compute frontmatter substance hash (all fields except status + signature).
-	fmSubstanceHashHex := computeFmSubstanceHash(fm)
+	// Compute the frontmatter substance hash over the CANONICAL (normalised)
+	// frontmatter — the representation Verify will see after parsing the
+	// on-disk file. The normalisation step is the yaml.Node round-trip in
+	// removeSignatureBlock: it re-indents nested structures and can change how
+	// block-scalar strings (e.g. proposed_writes[i].body with body: | ) are
+	// later parsed back by mdpp. By hashing the post-normalisation fm here, Sign
+	// and Verify agree on the same substance hash for any untampered spore.
+	fmSubstanceHashHex := computeCanonicalFmSubstanceHash(source)
 
 	// Build canonical payload.
 	payload := buildCanonicalPayload(agentID, sporeID, createdAt, bodyHashHex, fmSubstanceHashHex)
@@ -220,6 +237,93 @@ func buildCanonicalPayload(agentID, sporeID string, createdAt time.Time, bodyHas
 	sb.WriteString(fmSubstanceHashHex)
 	sb.WriteByte('\n')
 	return []byte(sb.String())
+}
+
+// computeCanonicalFmSubstanceHash computes the frontmatter substance hash over
+// the NORMALISED frontmatter representation — i.e., the same representation
+// that Verify will see after it parses the on-disk signed file.
+//
+// The normalisation is the yaml.Node round-trip performed by removeSignatureBlock:
+// it re-indents nested YAML structures and can change the parsed Go values for
+// fields that contain block scalars (e.g. proposed_writes[i].body with a "|"
+// literal style). If Sign hashes the pre-normalisation fm and Verify hashes the
+// post-normalisation fm, untampered spores fail verification.
+//
+// A subtlety: mdpp.Parse's YAML block-scalar handling is sensitive to whether
+// there is content AFTER the block scalar in the same YAML document. The
+// signature block that injectSignature appends immediately after proposed_writes
+// changes the parse result for body: | values within proposed_writes. To ensure
+// Sign hashes the same representation Verify will see, we must build a synthetic
+// document that includes a placeholder signature block — preserving the same
+// structural context that the real signed file will have, without hard-coding
+// the actual signature value (which computeFmSubstanceHash excludes anyway).
+//
+// Algorithm:
+//  1. Extract the raw frontmatter bytes from source.
+//  2. Apply removeSignatureBlock (yaml.Node round-trip normalisation).
+//  3. Append a placeholder signature block so the YAML structure matches the
+//     signed file that Verify will read.
+//  4. Wrap in "---\n…---\n" and parse via mdpp.Parse to get the canonical
+//     map[string]any — exactly what Verify's doc.Frontmatter() returns.
+//  5. Call computeFmSubstanceHash on that canonical map.
+//
+// Falls back to computeFmSubstanceHash on the original source fm if any step
+// fails (defensive).
+func computeCanonicalFmSubstanceHash(source []byte) string {
+	closingIdx := findFrontmatterClose(source)
+	if closingIdx < 0 || len(source) < 4 {
+		return "error"
+	}
+
+	// Raw frontmatter content between the opening "---\n" and the closing "---".
+	rawFM := source[4:closingIdx]
+
+	// Apply the same normalisation removeSignatureBlock performs (yaml.Node
+	// unmarshal + marshal round-trip). This strips any existing signature key
+	// and re-indents nested structures.
+	normFM := removeSignatureBlock(rawFM)
+
+	// Append a structurally-representative placeholder signature block. This
+	// ensures that when mdpp.Parse processes the synthetic document, the YAML
+	// context after proposed_writes (and any other block-scalar fields) is
+	// identical to the real signed file — preserving the parser's behaviour for
+	// trailing-newline handling in block scalars. The placeholder value doesn't
+	// affect the substance hash because computeFmSubstanceHash excludes
+	// "signature".
+	const placeholderSig = "signature:\n  alg: ed25519\n  key: placeholder\n  content_hash: sha256:0000000000000000000000000000000000000000000000000000000000000000\n  signed_at: 2000-01-01T00:00:00Z\n  value: ed25519:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\n"
+
+	synth := append([]byte("---\n"), normFM...)
+	synth = append(synth, []byte(placeholderSig)...)
+	synth = append(synth, []byte("---\n")...)
+
+	synthDoc, err := mdpp.Parse(synth)
+	if err != nil || synthDoc == nil {
+		// Fallback: use original fm.
+		doc, perr := mdpp.Parse(source)
+		if perr != nil || doc == nil {
+			return "error"
+		}
+		fm := doc.Frontmatter()
+		if fm == nil {
+			return "error"
+		}
+		return computeFmSubstanceHash(fm)
+	}
+
+	canonFM := synthDoc.Frontmatter()
+	if canonFM == nil {
+		doc, perr := mdpp.Parse(source)
+		if perr != nil || doc == nil {
+			return "error"
+		}
+		fm := doc.Frontmatter()
+		if fm == nil {
+			return "error"
+		}
+		return computeFmSubstanceHash(fm)
+	}
+
+	return computeFmSubstanceHash(canonFM)
 }
 
 // computeFmSubstanceHash extracts all frontmatter fields from fm except
