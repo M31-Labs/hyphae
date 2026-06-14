@@ -8,6 +8,8 @@ package read
 //  2. Calls internal/trace.List(root, ListFilter{ActiveOnly:true}) for each.
 //  3. Merges and returns the results as plain Trace DTOs.
 //
+// Spaces with an empty RootPath are skipped; a non-empty RootPath requires the
+// on-disk space directory to exist (Spaces() verifies this via os.Stat).
 // This avoids shelling out (more portable, testable, no PATH dependency) while
 // staying purely read-only. Returning an empty slice with no error is the
 // correct behaviour when no active traces are found.

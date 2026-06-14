@@ -55,6 +55,19 @@ func Open(path string) (*sql.DB, error) {
 	return conn, nil
 }
 
+// OpenReadOnly opens the SQLite DB at path in read-only mode and returns the
+// connection WITHOUT running Migrate. Intended for external readers (e.g.
+// overstory) that must not write to the index. WAL readers work correctly in
+// mode=ro when the writer is a same-user process.
+func OpenReadOnly(path string) (*sql.DB, error) {
+	dsn := fmt.Sprintf("file:%s?mode=ro&_pragma=foreign_keys(1)", path)
+	conn, err := sql.Open("sqlite", dsn)
+	if err != nil {
+		return nil, fmt.Errorf("hyphae/db: open sqlite read-only: %w", err)
+	}
+	return conn, nil
+}
+
 // OpenRaw opens the SQLite DB at path (creating parent dirs as needed)
 // without applying the canonical Hyphae index schema. Used by packages
 // (e.g. crdtdb) that own their own schema and just want a connection.

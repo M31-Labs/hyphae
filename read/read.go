@@ -3,6 +3,8 @@ package read
 import (
 	"database/sql"
 	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -24,18 +26,27 @@ func DefaultIndexPath() (string, error) {
 // Reader is a read-only view over the Hyphae SQLite index.
 // Obtain one with OpenIndex. Call Close when done.
 type Reader struct {
-	conn *sql.DB
+	conn     *sql.DB
+	hyphaeRoot string // absolute path to the hyphae install root (e.g. ~/.hyphae)
 }
 
-// OpenIndex opens the Hyphae index at path in read-only WAL mode and runs the
-// embedded schema migration (idempotent CREATE IF NOT EXISTS statements).
+// OpenIndex opens the Hyphae index at path in read-only mode.
+// The schema is NOT migrated; this function never performs DDL writes.
+// WAL readers work correctly in mode=ro for same-user processes.
 // Returns a Reader ready for queries.
 func OpenIndex(path string) (*Reader, error) {
-	conn, err := db.Open(path)
+	conn, err := db.OpenReadOnly(path)
 	if err != nil {
 		return nil, fmt.Errorf("read: open index: %w", err)
 	}
-	return &Reader{conn: conn}, nil
+	// Derive the hyphae install root by stripping "/.index/hyphae.db" suffix.
+	// Falls back to an empty string; callers that need it (Spaces, ActiveTraces)
+	// will simply leave RootPath empty if the root cannot be determined.
+	root := strings.TrimSuffix(filepath.ToSlash(path), "/.index/hyphae.db")
+	if root == filepath.ToSlash(path) {
+		root = "" // path did not have the expected suffix
+	}
+	return &Reader{conn: conn, hyphaeRoot: filepath.FromSlash(root)}, nil
 }
 
 // Close releases the underlying database connection.
@@ -50,9 +61,12 @@ func (r *Reader) Close() error {
 // table (populated by federation / capability flows). If that table is empty
 // — which is the case for installations that only run `hypha index rebuild`
 // without federation — it falls back to synthesising minimal Space entries
-// from the distinct space_id values in the objects table, using the files
-// table to recover root_path where available. The fallback entries will have
-// empty URI/Authority/Scope/Visibility/TrustDefault fields.
+// from the distinct space_id values in the objects table. The fallback entries
+// will have empty URI/Authority/Scope/Visibility/TrustDefault fields.
+//
+// RootPath is derived from the hyphae install root for every space whose
+// on-disk directory exists (hyphaeRoot/spaces/<authority>-<name>). Spaces
+// whose directory does not exist will have an empty RootPath.
 func (r *Reader) Spaces() ([]Space, error) {
 	rows, err := r.conn.Query(`
 		SELECT id, uri, authority, scope, visibility, root_path, trust_default,
@@ -76,6 +90,11 @@ func (r *Reader) Spaces() ([]Space, error) {
 		if t, err := time.Parse(time.RFC3339, createdAt); err == nil {
 			s.CreatedAt = t
 		}
+		// If the spaces table did not populate root_path, derive it from the
+		// hyphae install root so that ActiveTraces can find on-disk trace dirs.
+		if s.RootPath == "" {
+			s.RootPath = r.spaceRootPath(s.ID)
+		}
 		out = append(out, s)
 	}
 	if err := rows.Err(); err != nil {
@@ -85,8 +104,6 @@ func (r *Reader) Spaces() ([]Space, error) {
 	// Fallback: if the spaces table is empty (local-only installations that
 	// never run the federation handshake), synthesise minimal Space entries
 	// from distinct space_id values found in the objects table.
-	// We recover root_path by stripping the file's relative path from the
-	// first matching files row — this is best-effort and may be empty.
 	if len(out) == 0 {
 		out, err = r.spacesFromObjects()
 		if err != nil {
@@ -98,8 +115,8 @@ func (r *Reader) Spaces() ([]Space, error) {
 }
 
 // spacesFromObjects synthesises Space entries from distinct space_id values
-// in the objects table. root_path is recovered from the files table when
-// possible by inspecting the path column of an associated file.
+// in the objects table. RootPath is derived from the hyphae install root
+// (hyphaeRoot/spaces/<authority>-<name>) when that directory exists.
 func (r *Reader) spacesFromObjects() ([]Space, error) {
 	rows, err := r.conn.Query(`SELECT DISTINCT space_id FROM objects ORDER BY space_id`)
 	if err != nil {
@@ -107,37 +124,34 @@ func (r *Reader) spacesFromObjects() ([]Space, error) {
 	}
 	defer rows.Close()
 
-	var ids []string
+	var out []Space
 	for rows.Next() {
 		var id string
 		if err := rows.Scan(&id); err != nil {
 			return nil, fmt.Errorf("read: spaces fallback scan: %w", err)
 		}
-		ids = append(ids, id)
+		out = append(out, Space{
+			ID:       id,
+			RootPath: r.spaceRootPath(id),
+		})
 	}
-	if err := rows.Err(); err != nil {
-		return nil, err
-	}
+	return out, rows.Err()
+}
 
-	out := make([]Space, 0, len(ids))
-	for _, id := range ids {
-		s := Space{ID: id}
-		// Best-effort: find the root_path by taking the path of one file in
-		// this space and walking up to the segment before the space component.
-		// The files table stores paths relative to the space root, so the
-		// root itself is stored in a separate config — we just leave RootPath
-		// empty here; callers that need it should use the files table directly.
-		_ = r.conn.QueryRow(
-			`SELECT COALESCE(f.path,'') FROM files f
-			 JOIN objects o ON o.file_id = f.id
-			 WHERE o.space_id = ? LIMIT 1`, id,
-		).Scan(&s.RootPath)
-		// RootPath from files is a relative path within the space, not the
-		// absolute root — clear it to avoid misleading callers.
-		s.RootPath = ""
-		out = append(out, s)
+// spaceRootPath returns the absolute on-disk root for a space given its id
+// (e.g. "m31labs/arbiter"). The convention is hyphaeRoot/spaces/<authority>-<name>.
+// Returns an empty string if hyphaeRoot is unknown or the directory does not exist.
+func (r *Reader) spaceRootPath(spaceID string) string {
+	if r.hyphaeRoot == "" {
+		return ""
 	}
-	return out, nil
+	// Convert "authority/name" → "authority-name" to match the on-disk layout.
+	dirName := strings.ReplaceAll(spaceID, "/", "-")
+	candidate := filepath.Join(r.hyphaeRoot, "spaces", dirName)
+	if _, err := os.Stat(candidate); err != nil {
+		return ""
+	}
+	return candidate
 }
 
 // Objects returns objects matching filter. An empty filter returns all objects
@@ -300,13 +314,14 @@ func (r *Reader) Receipts(filter ReceiptFilter) ([]Receipt, error) {
 }
 
 // Edges returns all edges where src_id OR dst_id matches srcOrDst.
-// Results are capped at defaultEdgeLimit rows.
+// Results are ordered by created_at DESC and capped at defaultEdgeLimit rows,
+// so truncation is deterministic (newest edges are kept).
 func (r *Reader) Edges(srcOrDst string) ([]Edge, error) {
 	q := `SELECT id, kind, src_id, dst_id, COALESCE(confidence,0),
 	             COALESCE(derivation,''), COALESCE(agent_source,''),
 	             COALESCE(created_by,''), created_at, COALESCE(metadata_json,'')
 	      FROM edges WHERE src_id = ? OR dst_id = ?
-	      LIMIT ?`
+	      ORDER BY created_at DESC LIMIT ?`
 
 	rows, err := r.conn.Query(q, srcOrDst, srcOrDst, defaultEdgeLimit)
 	if err != nil {
@@ -336,7 +351,8 @@ func (r *Reader) Edges(srcOrDst string) ([]Edge, error) {
 // Pulse returns the pulse for the given window label (e.g. "30d"). It first
 // checks the pulse_cache table for a valid (non-expired) entry. On a cache
 // miss it runs the live aggregation query via internal/pulse.Compute and
-// caches the result for 1 hour.
+// returns the result directly. The result is NOT written to pulse_cache —
+// this package is strictly read-only and must not write to the index.
 //
 // Pulse is returned as a plain DTO with no internal types on the surface.
 func (r *Reader) Pulse(window string) (Pulse, error) {
@@ -358,9 +374,7 @@ func (r *Reader) Pulse(window string) (Pulse, error) {
 		return Pulse{}, fmt.Errorf("read: pulse compute: %w", err)
 	}
 
-	// Store for next caller (best-effort; ignore errors).
-	_ = internalpulse.Store(r.conn, live, time.Hour)
-
+	// Do NOT call internalpulse.Store — this package is read-only.
 	return convertPulse(live), nil
 }
 
