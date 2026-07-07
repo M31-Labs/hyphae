@@ -8,7 +8,7 @@ require (
 	github.com/mattn/go-isatty v0.0.20
 	golang.org/x/sys v0.42.0
 	gopkg.in/yaml.v3 v3.0.1
-	m31labs.dev/gosx v0.29.2
+	m31labs.dev/gosx v0.29.4
 	m31labs.dev/mdpp v0.4.5
 	modernc.org/sqlite v1.34.5
 )
