@@ -288,6 +288,48 @@ func TestChange_InactiveInitiativesExcluded(t *testing.T) {
 	}
 }
 
+func TestChange_SpaceFilterNormalizesHyphaScheme(t *testing.T) {
+	conn := openDB(t)
+
+	// Mirrors how the real indexer stores space_id: indexer.normalizeSpaceID
+	// strips the "hypha://" scheme before the object ever reaches
+	// recall.Index (see internal/indexer/indexer.go). Insert the bare form
+	// directly here to reproduce that on-disk shape without depending on the
+	// indexer package.
+	seedInitiative(t, conn,
+		"initiative.feralsurge.aaa-demo",
+		"m31labs/feralsurge",
+		"Primal Shift as the GoSX flagship (AAA demo)",
+		"Round intro choreography, KO freeze, VS splash, arcade ladder for the presentation push.",
+		"active",
+	)
+
+	// Callers (the `--space` CLI flag, the HTTP API) document and pass the
+	// scheme-qualified form, e.g. "hypha://m31labs/feralsurge". The query
+	// must normalize both sides the same way pulse.Compute already does
+	// (internal/pulse/pulse.go), or a scheme-qualified filter silently
+	// excludes every bare-stored row and every initiative in the space goes
+	// unmatched (score 0.00 / neutral / review_required).
+	req := assess.ChangeRequest{
+		Task:  "Round intro choreography, KO freeze, VS splash, arcade ladder for the AAA demo.",
+		Space: "hypha://m31labs/feralsurge",
+	}
+
+	got, err := assess.Change(conn, req)
+	if err != nil {
+		t.Fatalf("Change: %v", err)
+	}
+	if len(got.MatchedInitiatives) == 0 {
+		t.Fatal("MatchedInitiatives empty; hypha:// Space filter did not match bare-stored space_id")
+	}
+	if got.MatchedInitiatives[0].ID != "initiative.feralsurge.aaa-demo" {
+		t.Errorf("top match = %q, want initiative.feralsurge.aaa-demo", got.MatchedInitiatives[0].ID)
+	}
+	if got.Alignment == assess.AlignNeutral {
+		t.Errorf("Alignment = neutral, want a real match (score %v)", got.Score)
+	}
+}
+
 // --- smoke -------------------------------------------------------------------
 
 func TestChange_BuildQueryDoesNotPanicOnWeirdPaths(t *testing.T) {

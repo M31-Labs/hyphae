@@ -371,7 +371,7 @@ JOIN objects o ON o.id = f.id
 WHERE objects_fts MATCH ?
   AND f.type = 'initiative'
   AND (o.status = 'active' OR o.status = '' OR o.status IS NULL)
-  AND (? = '' OR f.space_id = ?)
+  AND (? = '' OR replace(f.space_id, 'hypha://', '') = replace(?, 'hypha://', ''))
 ORDER BY bm25(objects_fts, 3.0, 2.0, 2.0, 1.0)
 LIMIT 5`
 
