@@ -988,7 +988,12 @@ func resolveTarget(installRoot, targetURI string) (filePath, anchorSlug, canonic
 	}
 	authority := parts[0]
 	name := parts[1]
-	filePart := parts[2] // e.g. "concepts/spore"
+	// Tolerate a trailing ".md" in filePart: some spore authors write the
+	// target URI with the extension already present (matching how
+	// source_refs URIs are conventionally written), e.g.
+	// "hypha://m31labs/buckley/concepts/cli.md". Strip it so both forms
+	// resolve to the same on-disk file.
+	filePart := strings.TrimSuffix(parts[2], ".md") // e.g. "concepts/spore"
 
 	spaceDir := fmt.Sprintf("%s-%s", authority, name) // e.g. "m31labs-hyphae"
 	absFile := filepath.Join(installRoot, "spaces", spaceDir, filePart+".md")
