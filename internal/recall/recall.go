@@ -13,12 +13,15 @@ import (
 )
 
 // Hit is one ranked recall result. Snippets are short excerpts from the
-// matched document with anchor + line citations.
+// matched document with anchor + line citations. Via is set on hits the
+// typed-edge expansion added (move G-B): "<edge-kind> from <seed-id>", so
+// a graph-sourced hit is always distinguishable from a BM25 match.
 type Hit struct {
 	URI        string    `json:"uri"`
 	Title      string    `json:"title"`
 	TokensFull int       `json:"tokens_full"` // estimated tokens in full doc
 	Score      float64   `json:"score"`       // BM25 rank score (lower = better per FTS5)
+	Via        string    `json:"via,omitempty"`
 	Snippets   []Snippet `json:"snippets,omitempty"`
 }
 
@@ -188,11 +191,39 @@ func RankIDs(conn *sql.DB, spaceID, query string, k int) ([]ScoredID, error) {
 	return out, rows.Err()
 }
 
+// ftsRow is one candidate document: a BM25 seed from the FTS5 query, or a
+// neighbor the typed-edge expansion added (via non-empty).
+type ftsRow struct {
+	id      string
+	typ     string
+	spaceID string
+	title   string
+	summary string
+	body    string
+	bodyLen int64
+	rank    float64
+	via     string
+}
+
+// Options tunes one Recall call. The zero value is the production
+// behavior: BM25 seeding plus lazy graph expansion (G-B).
+type Options struct {
+	// DisableGraph turns off the typed-edge expansion, leaving pure BM25
+	// results. Used by retrieval evals that measure the seeder alone and
+	// by callers that need seed-only output.
+	DisableGraph bool
+}
+
 // Recall runs an FTS5 query and returns a budgeted Response.
 // If budget.Shape is empty, defaults to summary+anchors.
 // If budget.MaxResponseTokens is 0, defaults to 800.
 // limit is the max hit count to consider before token budgeting.
 func Recall(conn *sql.DB, query string, limit int, budget types.Budget) (Response, error) {
+	return RecallWithOptions(conn, query, limit, budget, Options{})
+}
+
+// RecallWithOptions is Recall with explicit Options.
+func RecallWithOptions(conn *sql.DB, query string, limit int, budget types.Budget, opts Options) (Response, error) {
 	// Apply defaults.
 	if budget.Shape == "" {
 		budget.Shape = types.ShapeSummaryAnchors
@@ -253,20 +284,9 @@ LIMIT ?`
 	}
 	defer rows.Close()
 
-	type row struct {
-		id      string
-		typ     string
-		spaceID string
-		title   string
-		summary string
-		body    string
-		bodyLen int64
-		rank    float64
-	}
-
-	var results []row
+	var results []ftsRow
 	for rows.Next() {
-		var r row
+		var r ftsRow
 		if err := rows.Scan(&r.id, &r.typ, &r.spaceID, &r.title, &r.summary, &r.body, &r.bodyLen, &r.rank); err != nil {
 			return Response{}, fmt.Errorf("recall: scan row: %w", err)
 		}
@@ -274,6 +294,19 @@ LIMIT ?`
 	}
 	if err := rows.Err(); err != nil {
 		return Response{}, fmt.Errorf("recall: rows error: %w", err)
+	}
+
+	// Lazy graph expansion (G-B): walk typed edges out from the BM25
+	// seeds and merge the neighbors in before ranking and budgeting.
+	// Count-only responses skip it — the count reports direct matches.
+	expandedCount := 0
+	if !opts.DisableGraph && len(results) > 0 && budget.Shape != types.ShapeCountOnly {
+		expanded := expandRows(conn, results)
+		if len(expanded) > 0 {
+			expandedCount = len(expanded)
+			results = append(results, expanded...)
+			sort.SliceStable(results, func(i, j int) bool { return results[i].rank < results[j].rank })
+		}
 	}
 
 	terms := strings.Fields(sanitized)
@@ -296,6 +329,7 @@ LIMIT ?`
 			Title:      r.title,
 			TokensFull: int(r.bodyLen) / 4,
 			Score:      r.rank,
+			Via:        r.via,
 		}
 		if maxSnippetsPerHit > 0 {
 			h.Snippets = extractSnippets(r.body, terms, h.URI, maxSnippetsPerHit)
@@ -303,7 +337,9 @@ LIMIT ?`
 		hits = append(hits, h)
 	}
 
-	// Build summary text.
+	// Build summary text. The match count reports direct BM25 matches;
+	// graph-expanded neighbors are called out separately so the summary
+	// never inflates the match count.
 	var summary string
 	if len(results) == 0 {
 		summary = fmt.Sprintf("No matches found for: %s", query)
@@ -318,8 +354,12 @@ LIMIT ?`
 			titles[i] = results[i].title
 		}
 		spaceID := results[0].spaceID
-		summary = fmt.Sprintf("Found %d matches in %s. Top: %s.",
-			len(results), spaceID, strings.Join(titles, "; "))
+		linked := ""
+		if expandedCount > 0 {
+			linked = fmt.Sprintf(" (+%d linked)", expandedCount)
+		}
+		summary = fmt.Sprintf("Found %d matches%s in %s. Top: %s.",
+			len(results)-expandedCount, linked, spaceID, strings.Join(titles, "; "))
 	}
 
 	// Shape-specific hit caps.

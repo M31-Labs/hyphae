@@ -1488,6 +1488,7 @@ func cmdRecall(args []string) error {
 	limit := fs.Int("limit", 12, "max anchor candidates before budgeting")
 	maxTokens := fs.Int("max-tokens", 800, "response token cap")
 	shape := fs.String("shape", "summary+anchors", "headline | summary+anchors | count_only")
+	graph := fs.Bool("graph", true, "expand results one to two hops over typed edges (wikilink, derived_from, supports)")
 	format := formatFlag(fs)
 	if err := fs.Parse(reorderFlagsFirst(args)); err != nil {
 		return err
@@ -1507,10 +1508,10 @@ func cmdRecall(args []string) error {
 	}
 	defer conn.Close()
 
-	resp, err := recall.Recall(conn, query, *limit, types.Budget{
+	resp, err := recall.RecallWithOptions(conn, query, *limit, types.Budget{
 		MaxResponseTokens: *maxTokens,
 		Shape:             types.ResponseShape(*shape),
-	})
+	}, recall.Options{DisableGraph: !*graph})
 	if err != nil {
 		return err
 	}
@@ -1522,7 +1523,11 @@ func cmdRecall(args []string) error {
 		}
 		fmt.Fprintln(w, r.Summary)
 		for _, h := range r.Hits {
-			fmt.Fprintf(w, "\n  %s  %s\n", h.URI, h.Title)
+			via := ""
+			if h.Via != "" {
+				via = "  [" + h.Via + "]"
+			}
+			fmt.Fprintf(w, "\n  %s  %s%s\n", h.URI, h.Title, via)
 			for _, sn := range h.Snippets {
 				fmt.Fprintf(w, "      %s\n", sn.Text)
 				fmt.Fprintf(w, "        ↳ %s  (L%d-%d)\n", sn.Citation.Anchor, sn.Citation.Line, sn.Citation.EndLine)
