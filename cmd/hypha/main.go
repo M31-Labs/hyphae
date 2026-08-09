@@ -1558,8 +1558,10 @@ func cmdSpore(args []string) error {
 		return cmdSporeReview(args[1:], "rejected")
 	case "reopen":
 		return cmdSporeReview(args[1:], "unreviewed")
+	case "lint":
+		return cmdSporeLint(args[1:])
 	default:
-		return fmt.Errorf("unknown spore subcommand %q (try `submit`, `amend`, `list`, `accept`, `reject`, `reopen`)", args[0])
+		return fmt.Errorf("unknown spore subcommand %q (try `submit`, `amend`, `list`, `accept`, `reject`, `reopen`, `lint`)", args[0])
 	}
 }
 
@@ -1772,6 +1774,73 @@ func shortHash(sum []byte) string {
 		out = append(out, hexdigits[b>>4], hexdigits[b&0x0f])
 	}
 	return string(out[:7])
+}
+
+// cmdSporeLint validates a spore file before submission: frontmatter
+// through the same parser submit uses, then every proposed write
+// dry-resolved with the real graft handlers. Exit is non-zero when the
+// spore would not fully apply, so agents catch skips before the inbox.
+func cmdSporeLint(rest []string) error {
+	fs := flag.NewFlagSet("spore lint", flag.ContinueOnError)
+	format := formatFlag(fs)
+	if err := fs.Parse(reorderFlagsFirst(rest)); err != nil {
+		return err
+	}
+	if fs.NArg() == 0 {
+		return errors.New("usage: hypha spore lint <file> [--format text|json|jsonline|compact]")
+	}
+	path := fs.Arg(0)
+	source, err := os.ReadFile(path)
+	if err != nil {
+		return fmt.Errorf("read %s: %w", path, err)
+	}
+
+	sp, verrs := spore.Parse(source)
+	if len(verrs) > 0 {
+		for _, e := range verrs {
+			fmt.Fprintln(os.Stderr, "  ", e.Error())
+		}
+		return fmt.Errorf("spore lint: %s has %d validation error(s)", path, len(verrs))
+	}
+
+	root, err := resolveRoot("")
+	if err != nil {
+		return err
+	}
+	findings := graft.LintWrites(root, sp.SpaceID, sp.ProposedWrites)
+	wouldSkip := 0
+	for _, f := range findings {
+		if !f.Applies {
+			wouldSkip++
+		}
+	}
+
+	payload := map[string]any{
+		"spore_id":   sp.ID,
+		"space":      sp.SpaceID,
+		"writes":     len(findings),
+		"would_skip": wouldSkip,
+		"findings":   findings,
+	}
+	if err := emit("spore lint", payload, *format, func(w io.Writer, _ any) error {
+		fmt.Fprintf(w, "Lint %s: %d write(s), %d would skip\n", sp.ID, len(findings), wouldSkip)
+		for _, f := range findings {
+			mark := "ok"
+			detail := ""
+			if !f.Applies {
+				mark = "SKIP"
+				detail = " — " + f.Reason
+			}
+			fmt.Fprintf(w, "  [%s] %d %s %s%s\n", mark, f.Index, f.Kind, f.TargetURI, detail)
+		}
+		return nil
+	}); err != nil {
+		return err
+	}
+	if wouldSkip > 0 {
+		return fmt.Errorf("spore lint: %d of %d write(s) would skip", wouldSkip, len(findings))
+	}
+	return nil
 }
 
 func cmdSporeSubmit(rest []string) error {
@@ -2871,6 +2940,35 @@ func resolveSpaceForTrace(root, spaceFlag string) (spaceRoot, spaceURI string, e
 	return spaces[0].Path, "hypha://" + spaces[0].URI, nil
 }
 
+// resolveSpaceForTraceID resolves the space that holds an existing trace.
+// Trace IDs are unique in practice, so commands that already carry one
+// (tick, done) probe every installed space instead of demanding --space;
+// only zero or ambiguous hits error.
+func resolveSpaceForTraceID(root, spaceFlag, traceID string) (spaceRoot, spaceURI string, err error) {
+	if spaceFlag != "" {
+		return resolveSpaceForTrace(root, spaceFlag)
+	}
+	spaces, lerr := listSpaces(root)
+	if lerr != nil {
+		return "", "", lerr
+	}
+	var hits []int
+	for i, s := range spaces {
+		if _, perr := trace.LoadByID(s.Path, traceID); perr == nil {
+			hits = append(hits, i)
+		}
+	}
+	switch len(hits) {
+	case 1:
+		s := spaces[hits[0]]
+		return s.Path, "hypha://" + s.URI, nil
+	case 0:
+		return "", "", fmt.Errorf("trace %q not found in any installed space", traceID)
+	default:
+		return "", "", fmt.Errorf("trace %q exists in %d spaces; pass --space <uri>", traceID, len(hits))
+	}
+}
+
 func cmdTraceStart(args []string) error {
 	fs := flag.NewFlagSet("trace start", flag.ContinueOnError)
 	spaceFlag := fs.String("space", "", "space URI (required when multiple spaces are installed)")
@@ -2938,7 +3036,7 @@ func cmdTraceTick(args []string) error {
 	if err != nil {
 		return err
 	}
-	spaceRoot, spaceURI, err := resolveSpaceForTrace(root, *spaceFlag)
+	spaceRoot, spaceURI, err := resolveSpaceForTraceID(root, *spaceFlag, traceID)
 	if err != nil {
 		return err
 	}
@@ -2974,7 +3072,7 @@ func cmdTraceDone(args []string) error {
 	if err != nil {
 		return err
 	}
-	spaceRoot, _, err := resolveSpaceForTrace(root, *spaceFlag)
+	spaceRoot, _, err := resolveSpaceForTraceID(root, *spaceFlag, traceID)
 	if err != nil {
 		return err
 	}

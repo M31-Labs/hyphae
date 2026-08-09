@@ -519,6 +519,13 @@ func doGraft(conn *sql.DB, installRoot, sporeID, grafter, spaceURI string, apply
 			return nil, fmt.Errorf("promote grafted canonical files into index: %w", perr)
 		}
 
+		// The audit log must record MCP grafts exactly as CLI grafts;
+		// this path was mirroring the receipt into the CRDT shadow while
+		// never persisting it to the receipts table.
+		if wErr := receipts.Write(conn, res.Receipt); wErr != nil && !errors.Is(wErr, receipts.ErrAlreadyExists) {
+			return nil, fmt.Errorf("persist graft receipt: %w", wErr)
+		}
+
 		crdtshadow.MirrorReceipt(installRoot, res.Receipt)
 		crdtshadow.MirrorCanonical(installRoot, res.Receipt.SpaceID, res.TouchedFiles)
 		for _, e := range res.AppliedEdges {
