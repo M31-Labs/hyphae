@@ -2532,10 +2532,23 @@ func formatMdppFile(path string) (bool, error) {
 	if bytes.Equal(src, out) {
 		return false, nil
 	}
+	// A format pass reflows text; it never adds material content. Refuse
+	// a result that balloons the file — a 2026-08-09 formatter defect
+	// multiplied a table on every graft until the canonical file reached
+	// 17 MB and every later graft appeared to hang parsing it.
+	if len(out) > maxFormatGrowth(len(src)) {
+		return false, fmt.Errorf("format grew %s from %d to %d bytes; refusing to persist", filepath.Base(path), len(src), len(out))
+	}
 	if err := atomicfs.WriteFile(path, out, 0o644); err != nil {
 		return false, err
 	}
 	return true, nil
+}
+
+// maxFormatGrowth bounds how much larger a formatted file may be than
+// its source: double plus slack for small files.
+func maxFormatGrowth(srcLen int) int {
+	return srcLen*2 + 4_096
 }
 
 // findSporeSpaceRoot scans every space's inbox/agents/ for a spore whose
