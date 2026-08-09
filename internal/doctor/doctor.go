@@ -2,11 +2,13 @@
 package doctor
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"net/url"
 	"os"
 	"os/exec"
@@ -161,6 +163,8 @@ func Run(ctx context.Context, opts Options) (Report, error) {
 	if opts.CheckCanopy {
 		r.Tools = append(r.Tools, inspectCanopy(ctx, opts.ToolTimeout))
 	}
+
+	inspectOperationalHazards(&r, root)
 
 	r.finalize()
 	return r, nil
@@ -389,6 +393,60 @@ func rel(root, path string) string {
 		return out
 	}
 	return path
+}
+
+// inspectOperationalHazards covers the failure modes heavy agent use
+// surfaced on 2026-08-09: canonical files grown past the parser cap (a
+// formatter defect once ballooned one to 17 MB, which made every later
+// graft appear to hang) and partial spores stranded in inboxes.
+func inspectOperationalHazards(r *Report, root string) {
+	spacesDir := filepath.Join(root, "spaces")
+	var oversized []string
+	partialSpores := 0
+	entries, err := os.ReadDir(spacesDir)
+	if err != nil {
+		return
+	}
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			continue
+		}
+		spaceRoot := filepath.Join(spacesDir, entry.Name())
+		_ = filepath.WalkDir(spaceRoot, func(path string, d fs.DirEntry, err error) error {
+			if err != nil || d.IsDir() || !strings.HasSuffix(path, ".md") {
+				return nil
+			}
+			info, ierr := d.Info()
+			if ierr != nil {
+				return nil
+			}
+			if info.Size() > parser.DefaultMaxFileBytes {
+				rel, _ := filepath.Rel(spacesDir, path)
+				oversized = append(oversized, fmt.Sprintf("%s (%d bytes)", rel, info.Size()))
+			}
+			if strings.Contains(path, string(filepath.Separator)+"inbox"+string(filepath.Separator)) {
+				if data, rerr := os.ReadFile(path); rerr == nil && bytes.Contains(data, []byte("\nstatus: partial")) {
+					partialSpores++
+				}
+			}
+			return nil
+		})
+	}
+
+	if len(oversized) > 0 {
+		r.addCheck("canonical-file-size", StatusWarning,
+			fmt.Sprintf("%d canonical file(s) exceed the %d-byte parser cap: %s", len(oversized), parser.DefaultMaxFileBytes, strings.Join(oversized, ", ")),
+			"a file this large usually signals formatter corruption; inspect it and restore from history")
+	} else {
+		r.addCheck("canonical-file-size", StatusOK, "no canonical files exceed the parser cap", "")
+	}
+	if partialSpores > 0 {
+		r.addCheck("partial-spores", StatusWarning,
+			fmt.Sprintf("%d spore(s) stranded in status partial", partialSpores),
+			"inspect their skipped writes, fix the spore, then `hypha spore reopen <id>` and re-graft")
+	} else {
+		r.addCheck("partial-spores", StatusOK, "no partial spores in inboxes", "")
+	}
 }
 
 func (r *Report) addCheck(name, status, message, hint string) {
