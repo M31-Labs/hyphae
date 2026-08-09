@@ -535,6 +535,15 @@ func doGraft(conn *sql.DB, installRoot, sporeID, grafter, spaceURI string, apply
 		"touched":    res.TouchedFiles,
 		"dry_run":    res.DryRun,
 	}
+	// A partial graft is undebuggable without the reasons; agents were
+	// left guessing why writes silently skipped.
+	if len(res.SkippedWrites) > 0 {
+		skips := make([]map[string]string, 0, len(res.SkippedWrites))
+		for _, s := range res.SkippedWrites {
+			skips = append(skips, map[string]string{"kind": s.Kind, "target": s.TargetURI, "reason": s.Reason})
+		}
+		payload["skipped_writes"] = skips
+	}
 	if !res.DryRun {
 		payload["receipt"] = res.Receipt
 	}

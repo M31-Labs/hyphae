@@ -2506,6 +2506,12 @@ func cmdGraft(args []string) error {
 				fmt.Fprintf(w, "    - %s\n", p)
 			}
 		}
+		if len(r.SkippedWrites) > 0 {
+			fmt.Fprintln(w, "  Skipped:")
+			for _, s := range r.SkippedWrites {
+				fmt.Fprintf(w, "    - %s %s: %s\n", s.Kind, s.TargetURI, s.Reason)
+			}
+		}
 		if *showDiff {
 			fmt.Fprintln(w)
 			for _, d := range r.Deltas {

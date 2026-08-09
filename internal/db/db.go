@@ -60,7 +60,7 @@ func Open(path string) (*sql.DB, error) {
 // overstory) that must not write to the index. WAL readers work correctly in
 // mode=ro when the writer is a same-user process.
 func OpenReadOnly(path string) (*sql.DB, error) {
-	dsn := fmt.Sprintf("file:%s?mode=ro&_pragma=foreign_keys(1)", path)
+	dsn := fmt.Sprintf("file:%s?mode=ro&_pragma=foreign_keys(1)&_pragma=busy_timeout(5000)", path)
 	conn, err := sql.Open("sqlite", dsn)
 	if err != nil {
 		return nil, fmt.Errorf("hyphae/db: open sqlite read-only: %w", err)
@@ -75,7 +75,9 @@ func OpenRaw(path string) (*sql.DB, error) {
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return nil, fmt.Errorf("hyphae/db: mkdir dir: %w", err)
 	}
-	dsn := fmt.Sprintf("file:%s?_pragma=foreign_keys(1)&_pragma=journal_mode(WAL)", path)
+	// busy_timeout keeps concurrent agents queueing briefly instead of
+	// failing (or appearing to hang) on a locked index.
+	dsn := fmt.Sprintf("file:%s?_pragma=foreign_keys(1)&_pragma=journal_mode(WAL)&_pragma=busy_timeout(5000)", path)
 	conn, err := sql.Open("sqlite", dsn)
 	if err != nil {
 		return nil, fmt.Errorf("hyphae/db: open sqlite: %w", err)
