@@ -42,11 +42,14 @@ type ApplyOpts struct {
 // FileDelta captures one canonical-file change that a graft proposed.
 // OldBytes is nil when the delta represents a new file (create_file).
 // In a real apply, NewBytes is what was written; in a dry-run, NewBytes is
-// what *would have been* written.
+// what *would have been* written. The byte fields never serialize: JSON
+// envelopes were shipping every touched file twice, base64-encoded — the
+// single largest token cost on the graft path. RenderDelta reads them
+// in-process for --diff.
 type FileDelta struct {
 	Path     string
-	OldBytes []byte
-	NewBytes []byte
+	OldBytes []byte `json:"-"`
+	NewBytes []byte `json:"-"`
 }
 
 // tagsFlowRe matches an inline flow-style tags line: tags: [a, b, c]
@@ -430,9 +433,11 @@ func applyInsertWrite(
 	}
 
 	// The anchor heading may come from the URI fragment or, per the spore
-	// authoring contract, from a "heading" payload field.
+	// authoring contract, from a "heading" payload field. Authors often
+	// paste the markdown heading verbatim; leading hashes are noise, and
+	// keeping them corrupted the created-section fallback into "## ###".
 	heading, _ := pw.Payload["heading"].(string)
-	heading = strings.TrimSpace(heading)
+	heading = strings.TrimSpace(strings.TrimLeft(strings.TrimSpace(heading), "#"))
 	if anchorSlug == "" && heading != "" {
 		anchorSlug = slugify(heading)
 	}
@@ -493,7 +498,7 @@ func applyCreateFile(
 	if relPath == "" {
 		return skip("create_file payload missing 'path'")
 	}
-	body, _ := pw.Payload["body"].(string)
+	body := bodyPayload(pw)
 	if body == "" {
 		return skip("create_file payload missing 'body'")
 	}
@@ -623,7 +628,7 @@ func applyReplaceBlock(
 		return nil, &SkippedWrite{Kind: pw.Kind, TargetURI: pw.Target, Reason: reason}, "", nil
 	}
 
-	body, _ := pw.Payload["body"].(string)
+	body := bodyPayload(pw)
 	if body == "" {
 		return skip("replace_block payload missing 'body'")
 	}
@@ -973,10 +978,12 @@ func resolveTarget(installRoot, targetURI string) (filePath, anchorSlug, canonic
 	}
 	rest := strings.TrimPrefix(targetURI, "hypha://")
 
-	// Split anchor.
+	// Split anchor. Fragments arrive in whatever form the author wrote
+	// (heading text, spaced, cased); slugify so they match the same way
+	// payload headings do.
 	anchor := ""
 	if idx := strings.LastIndex(rest, "#"); idx >= 0 {
-		anchor = rest[idx+1:]
+		anchor = slugify(strings.TrimSpace(rest[idx+1:]))
 		rest = rest[:idx]
 	}
 
@@ -988,7 +995,12 @@ func resolveTarget(installRoot, targetURI string) (filePath, anchorSlug, canonic
 	}
 	authority := parts[0]
 	name := parts[1]
-	filePart := parts[2] // e.g. "concepts/spore"
+	// Tolerate a trailing ".md" in filePart: some spore authors write the
+	// target URI with the extension already present (matching how
+	// source_refs URIs are conventionally written), e.g.
+	// "hypha://m31labs/buckley/concepts/cli.md". Strip it so both forms
+	// resolve to the same on-disk file.
+	filePart := strings.TrimSuffix(parts[2], ".md") // e.g. "concepts/spore"
 
 	spaceDir := fmt.Sprintf("%s-%s", authority, name) // e.g. "m31labs-hyphae"
 	absFile := filepath.Join(installRoot, "spaces", spaceDir, filePart+".md")
@@ -1319,6 +1331,16 @@ func addTagToFrontmatter(fmSlice []byte, tag string) ([]byte, error) {
 
 // slugify converts a heading text to a URL-safe slug matching parser.slugify.
 // Lowercase; runs of non-alphanumeric → single "-"; trim edges.
+// bodyPayload reads a write's body, accepting the "content" synonym the
+// insert kinds already tolerate — spore authors mix the two constantly.
+func bodyPayload(pw types.ProposedWrite) string {
+	if body, _ := pw.Payload["body"].(string); body != "" {
+		return body
+	}
+	content, _ := pw.Payload["content"].(string)
+	return content
+}
+
 func slugify(s string) string {
 	s = strings.ToLower(s)
 	var b strings.Builder

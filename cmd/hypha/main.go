@@ -25,6 +25,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strings"
 	"time"
@@ -1555,8 +1556,10 @@ func cmdSpore(args []string) error {
 		return cmdSporeReview(args[1:], "accepted")
 	case "reject":
 		return cmdSporeReview(args[1:], "rejected")
+	case "reopen":
+		return cmdSporeReview(args[1:], "unreviewed")
 	default:
-		return fmt.Errorf("unknown spore subcommand %q (try `submit`, `amend`, `list`, `accept`, `reject`)", args[0])
+		return fmt.Errorf("unknown spore subcommand %q (try `submit`, `amend`, `list`, `accept`, `reject`, `reopen`)", args[0])
 	}
 }
 
@@ -1618,8 +1621,16 @@ func cmdSporeReview(args []string, newStatus string) error {
 	if !ok {
 		return fmt.Errorf("spore review: %s has no status field", sporeID)
 	}
-	if cur != "unreviewed" {
-		return fmt.Errorf("spore review: status is %q (only unreviewed spores can be reviewed); for already-graphed spores use `hypha graft`", cur)
+	// accept/reject review unreviewed spores; reopen rescues a partial
+	// or rejected spore back to unreviewed so it can be fixed and
+	// re-grafted instead of cloned under a new ID.
+	allowedFrom := map[string][]string{
+		"accepted":   {"unreviewed"},
+		"rejected":   {"unreviewed"},
+		"unreviewed": {"partial", "rejected"},
+	}
+	if !slices.Contains(allowedFrom[newStatus], cur) {
+		return fmt.Errorf("spore review: cannot flip status %q to %q (accept/reject need unreviewed; reopen needs partial or rejected)", cur, newStatus)
 	}
 	updated := writeFrontmatterField(data, "status", newStatus)
 	if err := atomicfs.WriteFile(sporePath, updated, 0o644); err != nil {
@@ -1628,6 +1639,9 @@ func cmdSporeReview(args []string, newStatus string) error {
 
 	// Persist a receipt.
 	action := "spore:" + newStatus // "spore:accepted" or "spore:rejected"
+	if newStatus == "unreviewed" {
+		action = "spore:reopened"
+	}
 	metadata := ""
 	if strings.TrimSpace(*reason) != "" {
 		if b, err := json.Marshal(map[string]string{"reason": *reason}); err == nil {
@@ -2511,6 +2525,12 @@ func cmdGraft(args []string) error {
 				fmt.Fprintf(w, "    - %s\n", p)
 			}
 		}
+		if len(r.SkippedWrites) > 0 {
+			fmt.Fprintln(w, "  Skipped:")
+			for _, s := range r.SkippedWrites {
+				fmt.Fprintf(w, "    - %s %s: %s\n", s.Kind, s.TargetURI, s.Reason)
+			}
+		}
 		if *showDiff {
 			fmt.Fprintln(w)
 			for _, d := range r.Deltas {
@@ -2537,10 +2557,23 @@ func formatMdppFile(path string) (bool, error) {
 	if bytes.Equal(src, out) {
 		return false, nil
 	}
+	// A format pass reflows text; it never adds material content. Refuse
+	// a result that balloons the file — a 2026-08-09 formatter defect
+	// multiplied a table on every graft until the canonical file reached
+	// 17 MB and every later graft appeared to hang parsing it.
+	if len(out) > maxFormatGrowth(len(src)) {
+		return false, fmt.Errorf("format grew %s from %d to %d bytes; refusing to persist", filepath.Base(path), len(src), len(out))
+	}
 	if err := atomicfs.WriteFile(path, out, 0o644); err != nil {
 		return false, err
 	}
 	return true, nil
+}
+
+// maxFormatGrowth bounds how much larger a formatted file may be than
+// its source: double plus slack for small files.
+func maxFormatGrowth(srcLen int) int {
+	return srcLen*2 + 4_096
 }
 
 // findSporeSpaceRoot scans every space's inbox/agents/ for a spore whose
