@@ -7,6 +7,16 @@ surface can break between minors).
 
 ## Unreleased
 
+### Fixed
+
+- **Spore signing YAML preservation** — signing now preserves all unsigned
+  frontmatter bytes, replaces only an exactly canonical existing signature in
+  place, and rejects ambiguous or noncanonical signature mappings before
+  emitting signed bytes. The supported input is one YAML stream document with
+  an optional single root-column `...` end marker; root keys must be ordinary
+  scalar strings (root aliases, merge keys, complex keys, and custom-tagged
+  keys are rejected), while ordinary value anchors and aliases are retained.
+
 ## [0.1.9] — 2026-06-01
 
 The "measure, don't guess" release: a retrieval-quality eval harness, a major

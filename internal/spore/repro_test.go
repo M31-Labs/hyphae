@@ -13,17 +13,15 @@ import (
 // same code path as the CLI (Sign → SubmitBytes), then read back from the inbox
 // and Verified with --verify.
 //
-// Root cause: Sign computed the frontmatter substance hash from the ORIGINAL
-// (pre-normalisation) parsed frontmatter, while Verify computed it from the
-// POST-normalisation parsed frontmatter. The normalisation is the yaml.Node
-// round-trip in removeSignatureBlock (called by injectSignature). For spores
-// containing proposed_writes with body: | block scalars, the re-indented YAML
-// caused mdpp.Parse to produce different string values (with vs without trailing
-// newline), leading to a substance hash mismatch on untampered files.
+// Root cause: injectSignature used yaml.Node marshaling to remove an existing
+// signature. YAML reserialization emitted `body: |4` for a leading-blank block
+// scalar while retaining its original content indentation, producing invalid
+// YAML. The fix removes only the signature mapping's raw lines and preserves
+// every authored frontmatter byte.
 //
-// Fix: computeCanonicalFmSubstanceHash builds a synthetic signed document
-// (normalised fm + placeholder signature block) and hashes its mdpp-parsed
-// frontmatter — matching exactly the context Verify sees.
+// Fix: computeCanonicalFmSubstanceHash builds a synthetic signed document from
+// the preserved frontmatter plus a placeholder signature block. This matches
+// the structural context Verify parses without rewriting scalar styles.
 func TestReproSubmitThenVerify_WithProposedWrites(t *testing.T) {
 	id, priv, err := identity.Generate("m31labs", "testbot", "hypha://m31labs/research")
 	if err != nil {
@@ -37,7 +35,7 @@ func TestReproSubmitThenVerify_WithProposedWrites(t *testing.T) {
 	})
 
 	// Spore with proposed_writes containing a body: | block scalar — the exact
-	// shape that triggers the normalisation divergence.
+	// shape that triggers unsafe YAML reserialization in the old signer.
 	source := []byte(`---
 mdpp: "0.1"
 id: spore.2026-06-10.repro.pw01
@@ -60,6 +58,7 @@ proposed_writes:
     target: hypha://m31labs/research/concept.hyphae
     heading: "New Section"
     body: |
+
       Some content to append here.
 ---
 

@@ -13,7 +13,6 @@ import (
 
 	"m31labs.dev/hyphae/internal/identity"
 	"m31labs.dev/mdpp"
-	"gopkg.in/yaml.v3"
 )
 
 // Signature is the structured form of the spore's signature block.
@@ -34,19 +33,18 @@ type IdentityResolver func(uri string) (identity.Identity, error)
 
 // Sign produces a signed copy of the spore bytes. It computes the canonical
 // payload, signs it with priv, and inserts a frontmatter `signature:` block
-// just before the closing `---`. signedKey is the public identity URI (e.g.
-// "identity://m31labs/odvcencio"). If the input already has a signature block
-// it is replaced.
+// before the closing `---` (or replaces an existing canonical block in place).
+// signedKey is the public identity URI (e.g. "identity://m31labs/odvcencio").
 //
-// Canonicalization invariant: the substance hash is computed over the
-// NORMALIZED frontmatter representation — the same representation that Verify
-// will reconstruct when it reads the on-disk file. The normalization is the
-// yaml.Node round-trip performed by removeSignatureBlock (which re-serialises
-// the frontmatter YAML, changing indentation and scalar styles). Computing the
-// hash over the pre-normalisation fm would produce a different hash than Verify
-// sees, causing spurious mismatches for untampered spores (bug: production
-// graft --verify failure on legitimately-signed spores).
+// Canonicalization invariant: the substance hash is computed over the parsed
+// frontmatter in the same structural context as the signed bytes. Signing
+// preserves the source YAML while inserting only the signature mapping, so a
+// leading newline in a block scalar (and all other scalar formatting) remains
+// part of the signed document rather than being rewritten by a serializer.
 func Sign(source []byte, priv identity.PrivateKey, signedKey string) ([]byte, error) {
+	if err := validateSignInput(source); err != nil {
+		return nil, fmt.Errorf("spore: sign: frontmatter: %w", err)
+	}
 	doc, err := mdpp.Parse(source)
 	if err != nil {
 		return nil, fmt.Errorf("spore: sign: parse: %w", err)
@@ -58,8 +56,8 @@ func Sign(source []byte, priv identity.PrivateKey, signedKey string) ([]byte, er
 	}
 
 	// Extract required fields for the canonical payload using the original fm.
-	// These scalar fields (id, agent.id, created) are not affected by the
-	// yaml.Node normalisation, so the original fm is fine for them.
+	// These scalar fields (id, agent.id, created) come from the source representation,
+	// which signing preserves byte-for-byte.
 	agentID := stringField(fm, "agent.id")
 	if agentBlock, ok := fm["agent"].(map[string]any); ok {
 		agentID = stringField(agentBlock, "id")
@@ -88,14 +86,12 @@ func Sign(source []byte, priv identity.PrivateKey, signedKey string) ([]byte, er
 	bodyHashHex := fmt.Sprintf("%x", bodyHash[:])
 	contentHash := "sha256:" + bodyHashHex
 
-	// Compute the frontmatter substance hash over the CANONICAL (normalised)
-	// frontmatter — the representation Verify will see after parsing the
-	// on-disk file. The normalisation step is the yaml.Node round-trip in
-	// removeSignatureBlock: it re-indents nested structures and can change how
-	// block-scalar strings (e.g. proposed_writes[i].body with body: | ) are
-	// later parsed back by mdpp. By hashing the post-normalisation fm here, Sign
-	// and Verify agree on the same substance hash for any untampered spore.
-	fmSubstanceHashHex := computeCanonicalFmSubstanceHash(source)
+	// Compute the frontmatter substance hash in the same structural context that
+	// Verify will parse after the signature mapping is inserted.
+	fmSubstanceHashHex, err := computeCanonicalFmSubstanceHash(source)
+	if err != nil {
+		return nil, fmt.Errorf("spore: sign: canonical frontmatter: %w", err)
+	}
 
 	// Build canonical payload.
 	payload := buildCanonicalPayload(agentID, sporeID, createdAt, bodyHashHex, fmSubstanceHashHex)
@@ -112,14 +108,43 @@ func Sign(source []byte, priv identity.PrivateKey, signedKey string) ([]byte, er
 		Value:       sigValue,
 	}
 
-	// Rewrite the source with the signature block inserted.
-	return injectSignature(source, sig)
+	// Rewrite the source with the signature block inserted, then reparse and
+	// validate the exact bytes before returning them to the caller.
+	signed, err := injectSignature(source, sig)
+	if err != nil {
+		return nil, err
+	}
+	if err := validateSignedOutput(signed, sig, fmSubstanceHashHex); err != nil {
+		return nil, fmt.Errorf("spore: sign: signed output validation: %w", err)
+	}
+	return signed, nil
 }
 
 // Verify checks the signature block in source against the canonical payload.
 // Returns nil if the signature is valid. Returns ErrUnsigned if there is no
 // signature block. Other failures return descriptive errors.
 func Verify(source []byte, resolve IdentityResolver) error {
+	bounds, rawFM, parsedFM, preflightErr := preflightFrontmatter(source)
+	if preflightErr != nil && !errors.Is(preflightErr, errFrontmatterNotFound) {
+		return fmt.Errorf("spore: verify: frontmatter: %w", preflightErr)
+	}
+
+	var sig Signature
+	var hasSig bool
+	if preflightErr == nil {
+		entry, err := parsedFM.singleSignature()
+		if err != nil {
+			return fmt.Errorf("spore: verify: frontmatter: %w", err)
+		}
+		if entry != nil {
+			var rangeErr error
+			sig, _, _, rangeErr = canonicalSignatureRange(rawFM, bounds.lineEnding, parsedFM)
+			if rangeErr != nil {
+				return fmt.Errorf("spore: verify: frontmatter: %w", rangeErr)
+			}
+			hasSig = true
+		}
+	}
 	doc, err := mdpp.Parse(source)
 	if err != nil {
 		return fmt.Errorf("spore: verify: parse: %w", err)
@@ -129,16 +154,8 @@ func Verify(source []byte, resolve IdentityResolver) error {
 	if fm == nil {
 		return fmt.Errorf("spore: verify: no frontmatter block found")
 	}
-
-	// Check for signature block.
-	sigRaw, hasSig := fm["signature"]
-	if !hasSig || sigRaw == nil {
+	if !hasSig {
 		return ErrUnsigned
-	}
-
-	sig, err := parseSignatureBlock(sigRaw)
-	if err != nil {
-		return fmt.Errorf("spore: verify: parse signature block: %w", err)
 	}
 
 	// Validate alg.
@@ -154,7 +171,6 @@ func Verify(source []byte, resolve IdentityResolver) error {
 
 	// Extract body bytes (excluding any tool-appended work-log section).
 	body := signableBody(extractBodyBytes(doc))
-
 	// Verify content hash.
 	bodyHash := sha256.Sum256(body)
 	bodyHashHex := fmt.Sprintf("%x", bodyHash[:])
@@ -165,7 +181,10 @@ func Verify(source []byte, resolve IdentityResolver) error {
 
 	// Verify frontmatter substance hasn't changed since signing.
 	// This catches mutations like adding proposed_writes after signing.
-	currentFmSubstanceHashHex := computeFmSubstanceHash(fm)
+	currentFmSubstanceHashHex, err := computeFmSubstanceHash(fm)
+	if err != nil {
+		return fmt.Errorf("spore: verify: canonical frontmatter: %w", err)
+	}
 
 	// Extract spore fields for canonical payload.
 	agentID := ""
@@ -239,90 +258,56 @@ func buildCanonicalPayload(agentID, sporeID string, createdAt time.Time, bodyHas
 	return []byte(sb.String())
 }
 
-// computeCanonicalFmSubstanceHash computes the frontmatter substance hash over
-// the NORMALISED frontmatter representation — i.e., the same representation
-// that Verify will see after it parses the on-disk signed file.
-//
-// The normalisation is the yaml.Node round-trip performed by removeSignatureBlock:
-// it re-indents nested YAML structures and can change the parsed Go values for
-// fields that contain block scalars (e.g. proposed_writes[i].body with a "|"
-// literal style). If Sign hashes the pre-normalisation fm and Verify hashes the
-// post-normalisation fm, untampered spores fail verification.
-//
-// A subtlety: mdpp.Parse's YAML block-scalar handling is sensitive to whether
-// there is content AFTER the block scalar in the same YAML document. The
-// signature block that injectSignature appends immediately after proposed_writes
-// changes the parse result for body: | values within proposed_writes. To ensure
-// Sign hashes the same representation Verify will see, we must build a synthetic
-// document that includes a placeholder signature block — preserving the same
-// structural context that the real signed file will have, without hard-coding
-// the actual signature value (which computeFmSubstanceHash excludes anyway).
-//
-// Algorithm:
-//  1. Extract the raw frontmatter bytes from source.
-//  2. Apply removeSignatureBlock (yaml.Node round-trip normalisation).
-//  3. Append a placeholder signature block so the YAML structure matches the
-//     signed file that Verify will read.
-//  4. Wrap in "---\n…---\n" and parse via mdpp.Parse to get the canonical
-//     map[string]any — exactly what Verify's doc.Frontmatter() returns.
-//  5. Call computeFmSubstanceHash on that canonical map.
-//
-// Falls back to computeFmSubstanceHash on the original source fm if any step
-// fails (defensive).
-func computeCanonicalFmSubstanceHash(source []byte) string {
-	closingIdx := findFrontmatterClose(source)
-	if closingIdx < 0 || len(source) < 4 {
-		return "error"
+// computeCanonicalFmSubstanceHash computes the frontmatter substance hash in the
+// same structural context that Verify sees after signing. It returns an error
+// for every bounds, YAML, canonical-signature, parse, or hashing failure; no
+// literal hash sentinel is ever used.
+func computeCanonicalFmSubstanceHash(source []byte) (string, error) {
+	bounds, ok := frontmatterBounds(source)
+	if !ok {
+		return "", fmt.Errorf("frontmatter delimiters not found")
+	}
+	rawFM := source[bounds.openEnd:bounds.closeStart]
+	cleanFM, insertionOffset, err := cleanFrontmatter(rawFM, bounds.lineEnding)
+	if err != nil {
+		return "", fmt.Errorf("clean frontmatter: %w", err)
 	}
 
-	// Raw frontmatter content between the opening "---\n" and the closing "---".
-	rawFM := source[4:closingIdx]
-
-	// Apply the same normalisation removeSignatureBlock performs (yaml.Node
-	// unmarshal + marshal round-trip). This strips any existing signature key
-	// and re-indents nested structures.
-	normFM := removeSignatureBlock(rawFM)
-
-	// Append a structurally-representative placeholder signature block. This
-	// ensures that when mdpp.Parse processes the synthetic document, the YAML
-	// context after proposed_writes (and any other block-scalar fields) is
-	// identical to the real signed file — preserving the parser's behaviour for
-	// trailing-newline handling in block scalars. The placeholder value doesn't
-	// affect the substance hash because computeFmSubstanceHash excludes
-	// "signature".
-	const placeholderSig = "signature:\n  alg: ed25519\n  key: placeholder\n  content_hash: sha256:0000000000000000000000000000000000000000000000000000000000000000\n  signed_at: 2000-01-01T00:00:00Z\n  value: ed25519:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\n"
-
-	synth := append([]byte("---\n"), normFM...)
-	synth = append(synth, []byte(placeholderSig)...)
-	synth = append(synth, []byte("---\n")...)
+	// mdpp.Parse's block-scalar handling depends on content after the scalar.
+	// Parse a synthetic document with a canonical placeholder signature so Sign
+	// hashes the same structural representation that Verify will parse.
+	placeholder := Signature{
+		Alg:         "ed25519",
+		Key:         "placeholder",
+		ContentHash: "sha256:" + strings.Repeat("0", 64),
+		SignedAt:    time.Date(2000, time.January, 1, 0, 0, 0, 0, time.UTC),
+		Value:       "ed25519:" + strings.Repeat("A", 88),
+	}
+	placeholderYAML, err := canonicalSignatureYAML(placeholder, bounds.lineEnding)
+	if err != nil {
+		return "", fmt.Errorf("render placeholder signature: %w", err)
+	}
+	if insertionOffset < 0 || insertionOffset > len(cleanFM) {
+		return "", fmt.Errorf("clean frontmatter insertion offset %d is outside %d bytes", insertionOffset, len(cleanFM))
+	}
+	delimiter := []byte("---" + bounds.lineEnding)
+	synth := append([]byte(nil), delimiter...)
+	synth = append(synth, cleanFM[:insertionOffset]...)
+	synth = append(synth, placeholderYAML...)
+	synth = append(synth, cleanFM[insertionOffset:]...)
+	synth = append(synth, delimiter...)
 
 	synthDoc, err := mdpp.Parse(synth)
 	if err != nil || synthDoc == nil {
-		// Fallback: use original fm.
-		doc, perr := mdpp.Parse(source)
-		if perr != nil || doc == nil {
-			return "error"
+		if err == nil {
+			err = fmt.Errorf("parser returned nil document")
 		}
-		fm := doc.Frontmatter()
-		if fm == nil {
-			return "error"
-		}
-		return computeFmSubstanceHash(fm)
+		return "", fmt.Errorf("parse synthetic signed frontmatter: %w", err)
 	}
-
 	canonFM := synthDoc.Frontmatter()
 	if canonFM == nil {
-		doc, perr := mdpp.Parse(source)
-		if perr != nil || doc == nil {
-			return "error"
-		}
-		fm := doc.Frontmatter()
-		if fm == nil {
-			return "error"
-		}
-		return computeFmSubstanceHash(fm)
+		return "", fmt.Errorf("synthetic signed document has no frontmatter")
 	}
-
 	return computeFmSubstanceHash(canonFM)
 }
 
@@ -337,7 +322,7 @@ func computeCanonicalFmSubstanceHash(source []byte) string {
 //     []any, map[string]any, time.Time are all JSON-serialisable). time.Time
 //     values are rendered as RFC3339 UTC strings to keep the digest stable
 //     across runs.
-func computeFmSubstanceHash(fm map[string]any) string {
+func computeFmSubstanceHash(fm map[string]any) (string, error) {
 	skipped := map[string]bool{"status": true, "signature": true}
 
 	keys := make([]string, 0, len(fm))
@@ -355,11 +340,10 @@ func computeFmSubstanceHash(fm map[string]any) string {
 
 	b, err := json.Marshal(orderedMap(keys, substance))
 	if err != nil {
-		// Extremely unlikely; fall back to empty hash marker.
-		return "error"
+		return "", fmt.Errorf("marshal canonical frontmatter substance: %w", err)
 	}
 	h := sha256.Sum256(b)
-	return fmt.Sprintf("%x", h[:])
+	return fmt.Sprintf("%x", h[:]), nil
 }
 
 // orderedMap builds a json.Marshaler-compatible []any that preserves key order.
@@ -436,110 +420,96 @@ func extractBodyBytes(doc *mdpp.Document) []byte {
 }
 
 // injectSignature rewrites source to include sig as the `signature:` block
-// just before the closing `---` of the frontmatter. Any pre-existing
-// `signature:` block is removed first.
+// immediately before an optional root-column `...` marker or the closing `---`
+// for unsigned input. A signed source replaces exactly the canonical signature
+// byte range in place.
 func injectSignature(source []byte, sig Signature) ([]byte, error) {
-	// Find the frontmatter boundaries in the raw bytes.
-	// The frontmatter is delimited by the first `---\n` at position 0 and the
-	// next `---\n` (or `---` at EOF).
-	if !strings.HasPrefix(string(source), "---") {
+	bounds, ok := frontmatterBounds(source)
+	if !ok {
 		return nil, fmt.Errorf("spore: sign: source does not start with frontmatter delimiter")
 	}
-
-	// Find the closing `---`.
-	closingIdx := findFrontmatterClose(source)
-	if closingIdx < 0 {
-		return nil, fmt.Errorf("spore: sign: could not locate closing --- of frontmatter")
+	rawFM := source[bounds.openEnd:bounds.closeStart]
+	parsed, err := parseFrontmatterYAML(rawFM)
+	if err != nil {
+		return nil, fmt.Errorf("spore: sign: existing signature: %w", nonCanonicalSignatureError(err.Error()))
 	}
-
-	// Split: everything from start up to (but not including) the closing `---`,
-	// the closing delimiter, and everything after.
-	fmContent := source[4:closingIdx] // skip the opening "---\n"
-	rest := source[closingIdx:]       // "---\n..." (body)
-
-	// Strip any existing `signature:` block from the frontmatter YAML.
-	fmContent = removeSignatureBlock(fmContent)
-
-	// Render the new signature block as YAML.
-	sigYAML, err := renderSignatureYAML(sig)
+	entry, err := parsed.singleSignature()
+	if err != nil {
+		return nil, fmt.Errorf("spore: sign: existing signature: %w", err)
+	}
+	sigYAML, err := canonicalSignatureYAML(sig, bounds.lineEnding)
 	if err != nil {
 		return nil, fmt.Errorf("spore: sign: render signature yaml: %w", err)
 	}
 
-	var out strings.Builder
-	out.WriteString("---\n")
-	out.Write(fmContent)
-	out.WriteString(sigYAML)
-	out.Write(rest)
-
-	return []byte(out.String()), nil
-}
-
-// findFrontmatterClose locates the byte offset of the closing `---` line in
-// source, searching after the opening `---\n`. Returns -1 if not found.
-func findFrontmatterClose(source []byte) int {
-	s := string(source)
-	// Skip the opening delimiter (first line must be "---\n").
-	start := 4
-	if len(s) < start {
-		return -1
-	}
-	// Look for `\n---\n` or `\n---` at end of file.
-	idx := strings.Index(s[start:], "\n---")
-	if idx < 0 {
-		return -1
-	}
-	// Return offset to just after the \n (i.e. the position of `---`).
-	return start + idx + 1
-}
-
-// removeSignatureBlock strips a `signature:` key (and its sub-keys) from raw
-// YAML frontmatter bytes. It works by unmarshaling, deleting the key, and
-// re-marshaling.
-func removeSignatureBlock(fmContent []byte) []byte {
-	var node yaml.Node
-	if err := yaml.Unmarshal(fmContent, &node); err != nil {
-		// Cannot parse; return unchanged.
-		return fmContent
-	}
-	if node.Kind == yaml.DocumentNode && len(node.Content) > 0 {
-		node.Content[0] = deleteYAMLKey(node.Content[0], "signature")
-	}
-	out, err := yaml.Marshal(&node)
-	if err != nil {
-		return fmContent
-	}
-	// yaml.Marshal adds a "---\n" document header; strip it.
-	out = stripYAMLDocHeader(out)
-	return out
-}
-
-// deleteYAMLKey removes a key from a YAML mapping node in-place and returns
-// the modified node.
-func deleteYAMLKey(n *yaml.Node, key string) *yaml.Node {
-	if n == nil || n.Kind != yaml.MappingNode {
-		return n
-	}
-	newContent := make([]*yaml.Node, 0, len(n.Content))
-	for i := 0; i+1 < len(n.Content); i += 2 {
-		k := n.Content[i]
-		if k.Value == key {
-			continue // skip this key and its value
+	if entry == nil {
+		insertAt := bounds.closeStart
+		if bounds.documentEndStart >= 0 {
+			insertAt = bounds.documentEndStart
 		}
-		newContent = append(newContent, n.Content[i], n.Content[i+1])
+		out := make([]byte, 0, len(source)+len(sigYAML))
+		out = append(out, source[:insertAt]...)
+		out = append(out, sigYAML...)
+		out = append(out, source[insertAt:]...)
+		return out, nil
 	}
-	n.Content = newContent
-	return n
+	_, start, end, err := canonicalSignatureRange(rawFM, bounds.lineEnding, parsed)
+	if err != nil {
+		return nil, fmt.Errorf("spore: sign: existing signature: %w", err)
+	}
+	absoluteStart := bounds.openEnd + start
+	absoluteEnd := bounds.openEnd + end
+	out := make([]byte, 0, len(source)-absoluteEnd+absoluteStart+len(sigYAML))
+	out = append(out, source[:absoluteStart]...)
+	out = append(out, sigYAML...)
+	out = append(out, source[absoluteEnd:]...)
+	return out, nil
 }
 
-// stripYAMLDocHeader removes a leading "---\n" document header that
-// yaml.Marshal emits.
-func stripYAMLDocHeader(b []byte) []byte {
-	s := string(b)
-	if strings.HasPrefix(s, "---\n") {
-		return []byte(s[4:])
+// validateSignedOutput reparses the exact bytes returned by Sign. It verifies
+// the canonical semantic signature and the non-signature substance hash before
+// Sign can return nil error.
+func validateSignedOutput(source []byte, expected Signature, expectedFmHash string) error {
+	doc, err := mdpp.Parse(source)
+	if err != nil {
+		return fmt.Errorf("parse signed output: %w", err)
 	}
-	return b
+	fm := doc.Frontmatter()
+	if fm == nil {
+		return fmt.Errorf("signed output has no frontmatter")
+	}
+	bounds, ok := frontmatterBounds(source)
+	if !ok {
+		return fmt.Errorf("signed output has invalid frontmatter delimiters")
+	}
+	rawFM := source[bounds.openEnd:bounds.closeStart]
+	parsed, err := parseFrontmatterYAML(rawFM)
+	if err != nil {
+		return fmt.Errorf("parse signed output frontmatter: %w", err)
+	}
+	sig, _, _, err := canonicalSignatureRange(rawFM, bounds.lineEnding, parsed)
+	if err != nil {
+		return fmt.Errorf("signed output signature: %w", err)
+	}
+	if !sameSignatureFields(sig, expected) {
+		return fmt.Errorf("signed output signature fields differ from payload")
+	}
+	actualFmHash, err := computeFmSubstanceHash(fm)
+	if err != nil {
+		return fmt.Errorf("hash signed output frontmatter: %w", err)
+	}
+	if actualFmHash != expectedFmHash {
+		return fmt.Errorf("signed output frontmatter hash differs from payload")
+	}
+	return nil
+}
+
+func sameSignatureFields(a, b Signature) bool {
+	return a.Alg == b.Alg &&
+		a.Key == b.Key &&
+		a.ContentHash == b.ContentHash &&
+		a.Value == b.Value &&
+		a.SignedAt.UTC().Equal(b.SignedAt.UTC())
 }
 
 // renderSignatureYAML renders a Signature as a YAML `signature:` block
