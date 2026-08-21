@@ -56,7 +56,6 @@ import (
 	"m31labs.dev/hyphae/internal/syncbundle"
 	"m31labs.dev/hyphae/internal/trace"
 	"m31labs.dev/hyphae/internal/types"
-	mdppfmt "m31labs.dev/mdpp/fmt"
 )
 
 const hyphaeVersion = "0.1.12"
@@ -78,7 +77,7 @@ Usage:
   hypha cap      list   [--space <uri>] [--include-revoked] [--format text|json|jsonline|compact]
   hypha identity init --name <name> --authority <auth> --space <uri> [--expires 1y] [--format text|json|jsonline|compact]
   hypha identity list [--format text|json|jsonline|compact]
-  hypha graft    <spore-id> --as <identity-uri> [--space <hypha-uri>] [--verify] [--no-fmt] [--dry-run] [--diff] [--apply] [--format text|json|jsonline|compact]
+  hypha graft    <spore-id> --as <identity-uri> [--space <hypha-uri>] [--verify] [--dry-run] [--diff] [--apply] [--format text|json|jsonline|compact]
   hypha graph    backlinks <object-id> [--kind k1,k2] [--limit N] [--format text|json|jsonline|compact]
   hypha graph    related   <object-id> [--kind k1,k2] [--limit N] [--format text|json|jsonline|compact]
   hypha graph    trace     <object-id> [--kind derived_from,cites] [--max-depth 4] [--format text|json|jsonline|compact]
@@ -2471,7 +2470,6 @@ func cmdGraft(args []string) error {
 	grafter := fs.String("as", "", "grafter identity URI (recorded in the receipt)")
 	spaceURI := fs.String("space", "", "space URI override (auto-detected from inbox if omitted)")
 	verify := fs.Bool("verify", false, "verify Ed25519 signature on the spore before applying")
-	noFmt := fs.Bool("no-fmt", false, "skip the mdpp.fmt pass on touched canonical files (formatting on by default)")
 	dryRun := fs.Bool("dry-run", false, "plan the graft without persisting any file, spore-status, or edge changes")
 	showDiff := fs.Bool("diff", false, "render a unified diff per touched file (implies --dry-run unless --apply also set)")
 	apply := fs.Bool("apply", false, "with --diff: persist the graft after printing the diff (default is preview-only)")
@@ -2537,19 +2535,6 @@ func cmdGraft(args []string) error {
 		return fmt.Errorf("graft: %w", err)
 	}
 
-	// mdpp.fmt pass on touched files: normalize canonical state so the
-	// post-graft tree stays canonical. Best-effort — failures are logged
-	// but don't unwind the graft (the apply already persisted). Skip in dry-run.
-	if !*noFmt && !effectiveDryRun {
-		for _, p := range result.TouchedFiles {
-			if changed, ferr := formatMdppFile(p); ferr != nil {
-				fmt.Fprintf(os.Stderr, "warn: mdpp.fmt %s: %v\n", p, ferr)
-			} else if changed {
-				fmt.Fprintf(os.Stderr, "fmt: %s\n", p)
-			}
-		}
-	}
-
 	// Persist the graft receipt to the audit log (skipped in dry-run).
 	if !effectiveDryRun {
 		objectsPromoted, anchorsPromoted, edgesPromoted, perr := indexer.PromoteFiles(conn, spaceRoot, result.Receipt.SpaceID, result.TouchedFiles)
@@ -2609,40 +2594,6 @@ func cmdGraft(args []string) error {
 		}
 		return nil
 	})
-}
-
-// formatMdppFile runs mdpp.fmt on a single file and rewrites it if the
-// output differs. Returns (changed, error). Safe to call on any .md file —
-// mdpp.fmt is idempotent and preserves protected fences.
-func formatMdppFile(path string) (bool, error) {
-	src, err := os.ReadFile(path)
-	if err != nil {
-		return false, err
-	}
-	out, err := mdppfmt.Format(src)
-	if err != nil {
-		return false, err
-	}
-	if bytes.Equal(src, out) {
-		return false, nil
-	}
-	// A format pass reflows text; it never adds material content. Refuse
-	// a result that balloons the file — a 2026-08-09 formatter defect
-	// multiplied a table on every graft until the canonical file reached
-	// 17 MB and every later graft appeared to hang parsing it.
-	if len(out) > maxFormatGrowth(len(src)) {
-		return false, fmt.Errorf("format grew %s from %d to %d bytes; refusing to persist", filepath.Base(path), len(src), len(out))
-	}
-	if err := atomicfs.WriteFile(path, out, 0o644); err != nil {
-		return false, err
-	}
-	return true, nil
-}
-
-// maxFormatGrowth bounds how much larger a formatted file may be than
-// its source: double plus slack for small files.
-func maxFormatGrowth(srcLen int) int {
-	return srcLen*2 + 4_096
 }
 
 // findSporeSpaceRoot scans every space's inbox/agents/ for a spore whose
