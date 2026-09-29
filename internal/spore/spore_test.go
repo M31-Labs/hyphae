@@ -16,7 +16,7 @@ import (
 )
 
 // validSporeDoc is a minimal valid spore document modelled on the example in
-// /home/draco/.hyphae/spaces/m31labs-hyphae/concepts/spore.md.
+// hypha://m31labs/hyphae/concepts/spore.
 var validSporeDoc = []byte(`---
 mdpp: "0.1"
 id: spore.2026-05-25.cloud-agent.7f3a

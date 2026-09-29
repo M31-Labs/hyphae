@@ -9,18 +9,29 @@ import (
 	"m31labs.dev/hyphae/internal/types"
 )
 
-const (
-	testSpaceRoot = "/home/draco/.hyphae/spaces/m31labs-hyphae"
-	testSpaceID   = "m31labs/hyphae"
-)
+const testSpaceID = "m31labs/hyphae"
+
+// testSpaceRoot returns the local checkout of the m31labs-hyphae space. Set
+// HYPHAE_TEST_SPACE_ROOT to override the default of
+// $HOME/.hyphae/spaces/m31labs-hyphae. Tests that need it skip when it is missing.
+func testSpaceRoot() string {
+	if root := os.Getenv("HYPHAE_TEST_SPACE_ROOT"); root != "" {
+		return root
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return ""
+	}
+	return home + "/.hyphae/spaces/m31labs-hyphae"
+}
 
 // TestWalkSpace verifies the happy-path walk of the m31labs-hyphae spec space.
 func TestWalkSpace(t *testing.T) {
-	if _, err := os.Stat(testSpaceRoot); os.IsNotExist(err) {
-		t.Skipf("test space not found at %s", testSpaceRoot)
+	if _, err := os.Stat(testSpaceRoot()); err != nil {
+		t.Skipf("test space not found at %q (set HYPHAE_TEST_SPACE_ROOT)", testSpaceRoot())
 	}
 
-	objects, anchors, edges, err := WalkSpace(testSpaceRoot, testSpaceID, false)
+	objects, anchors, edges, err := WalkSpace(testSpaceRoot(), testSpaceID, false)
 	if err != nil {
 		t.Fatalf("WalkSpace returned error: %v", err)
 	}
@@ -62,7 +73,7 @@ func TestWalkSpace(t *testing.T) {
 
 // TestParseFile verifies single-file parsing against the canonical hyphae concept.
 func TestParseFile(t *testing.T) {
-	path := testSpaceRoot + "/concepts/hyphae.md"
+	path := testSpaceRoot() + "/concepts/hyphae.md"
 	if _, err := os.Stat(path); os.IsNotExist(err) {
 		t.Skipf("test file not found: %s", path)
 	}
