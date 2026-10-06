@@ -78,10 +78,10 @@ var fullToCompact = map[string]string{
 	"started": "sd",
 
 	// Assess.
-	"alignment":          "al",
-	"recommendation":     "rc",
+	"alignment":           "al",
+	"recommendation":      "rc",
 	"matched_initiatives": "mi",
-	"reason":             "rn",
-	"risks":              "rk",
-	"hot_zone":           "hzn",
+	"reason":              "rn",
+	"risks":               "rk",
+	"hot_zone":            "hzn",
 }

@@ -11,7 +11,7 @@ import (
 	"m31labs.dev/hyphae/internal/types"
 )
 
-func mkdirAll(dir string) error             { return os.MkdirAll(dir, 0o755) }
+func mkdirAll(dir string) error               { return os.MkdirAll(dir, 0o755) }
 func writeAll(path string, data []byte) error { return os.WriteFile(path, data, 0o644) }
 
 const sample = `---

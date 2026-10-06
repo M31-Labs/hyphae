@@ -146,6 +146,10 @@ Today you can:
 - `hypha doctor [--strict]` — inspect an install root without mutating it:
   spaces, parser health, index counts, optional Canopy availability, and
   actionable recommendations such as `hypha index rebuild`.
+- `hypha spore new --space <uri> --kind decision|report|spec --out <file>` —
+  scaffold a valid spore with a proposed canonical document.
+- `hypha spore verify <file|spore-id> --format text|json` — read-only signature
+  verification with signer, version, coverage, hashes, and change diagnostics.
 - `hypha spore submit <file> [--sign --as <id>]` — validate, optionally
   Ed25519-sign, write to inbox **atomically**, emit + persist a
   content-hashed receipt.
@@ -187,6 +191,37 @@ For the browser visualization (separate binary, GoSX-based):
 - `hypha-viz [--addr 127.0.0.1:7777]` — local server with a force-directed
   knowledge graph, search bar, click-to-expand neighbors, object detail
   panel. Earth-tone palette, plain Go + GoSX, no JS build step.
+
+### Spore workflow and signing
+
+Create a proposal, edit its sources and content, then submit it for review:
+
+```bash
+hypha spore new --space hypha://example/knowledge --kind decision \
+  --title "Record the decision" --out proposal.md
+hypha spore submit proposal.md --sign --as identity://example/reviewer --format json
+hypha spore verify <submitted-spore-id> --format text
+hypha spore accept <submitted-spore-id> --as identity://example/reviewer
+hypha graft <submitted-spore-id> --as identity://example/reviewer --verify --dry-run --diff
+hypha graft <submitted-spore-id> --as identity://example/reviewer --verify --apply
+```
+
+`spore new` scaffolds a `create_file` proposal for a decision, report, or spec.
+Use an existing signer identity, edit the generated draft, and review the graft
+preview before applying it. `hypha spore --help` and each subcommand's `--help`
+list the supported options.
+
+New Ed25519 signatures use **v2**: `body_hash` covers the authored markdown body,
+`frontmatter_hash` covers frontmatter substance, and `content_hash` covers the
+full signed canonical payload. Proposals inside `proposed_writes` are covered
+even when the markdown body is empty. Submit and amend receipts use that same
+canonical content hash.
+
+Legacy **v1** signatures still verify. Their displayed `content_hash` covers
+only the body; the signature also verifies frontmatter through its payload.
+Both versions exclude review status, the signature block, and appended trace
+work logs. See [Spore signatures](docs/spore-signatures.md) for the exact encoding,
+legacy rules, and `VALID` / `INVALID` / `UNSIGNED` results.
 
 ### Output formats
 

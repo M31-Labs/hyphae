@@ -106,8 +106,8 @@ var unsupportedWriteKinds = map[string]bool{}
 // write loudly rather than silently corrupting the document.
 type applyContext struct {
 	dryRun        bool
-	rollback      map[string][]byte      // path → original bytes (nil for new files)
-	pending       map[string][]byte      // path → latest in-memory bytes after prior writes
+	rollback      map[string][]byte       // path → original bytes (nil for new files)
+	pending       map[string][]byte       // path → latest in-memory bytes after prior writes
 	writtenRanges map[string][]mdpp.Range // path → ranges claimed by prior writes
 	deltas        []FileDelta
 }

@@ -21,9 +21,9 @@ import (
 // caused mdpp.Parse to produce different string values (with vs without trailing
 // newline), leading to a substance hash mismatch on untampered files.
 //
-// Fix: computeCanonicalFmSubstanceHash builds a synthetic signed document
-// (normalised fm + placeholder signature block) and hashes its mdpp-parsed
-// frontmatter — matching exactly the context Verify sees.
+// V2 hashes YAML semantic values directly as canonical JSON, so signing and
+// verification no longer depend on mdpp's block-scalar normalization or a
+// placeholder signature block.
 func TestReproSubmitThenVerify_WithProposedWrites(t *testing.T) {
 	id, priv, err := identity.Generate("m31labs", "testbot", "hypha://m31labs/research")
 	if err != nil {

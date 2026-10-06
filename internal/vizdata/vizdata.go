@@ -37,10 +37,10 @@ type GraphResponse struct {
 
 // ObjectDetail is the /api/object/:id response payload.
 type ObjectDetail struct {
-	Object    *ObjectRow        `json:"object"`
-	Anchors   []AnchorRow       `json:"anchors"`
-	Backlinks []graph.Neighbor  `json:"backlinks"`
-	Forward   []graph.Neighbor  `json:"forward"`
+	Object    *ObjectRow       `json:"object"`
+	Anchors   []AnchorRow      `json:"anchors"`
+	Backlinks []graph.Neighbor `json:"backlinks"`
+	Forward   []graph.Neighbor `json:"forward"`
 }
 
 // ObjectRow holds the fields of a row from the objects table.

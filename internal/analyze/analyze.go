@@ -156,8 +156,8 @@ func CheckFreshness(a *types.Analysis, in FreshnessInputs) FreshnessResult {
 
 // impactJSON mirrors canopy graph impact --json output.
 type impactJSON struct {
-	Changed       []string `json:"changed"`
-	Affected      []struct {
+	Changed  []string `json:"changed"`
+	Affected []struct {
 		Name      string  `json:"name"`
 		File      string  `json:"file"`
 		Kind      string  `json:"kind"`

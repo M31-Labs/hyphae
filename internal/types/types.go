@@ -106,15 +106,15 @@ type Tick struct {
 
 // Object is the indexed form of a Hyphae artifact.
 type Object struct {
-	ID        string                 // frontmatter `id:`
-	Type      ObjectType             // frontmatter `type:`
-	SpaceID   string                 // owning space (e.g. "m31labs/hyphae")
-	FilePath  string                 // absolute on-disk path
-	Status    string                 // frontmatter `status:`
-	Title     string                 // first H1 in body
-	Summary   string                 // indexer-derived one-sentence summary
-	Tags      []string               // frontmatter `tags:`
-	Body      string                 // mdpp body text
+	ID        string         // frontmatter `id:`
+	Type      ObjectType     // frontmatter `type:`
+	SpaceID   string         // owning space (e.g. "m31labs/hyphae")
+	FilePath  string         // absolute on-disk path
+	Status    string         // frontmatter `status:`
+	Title     string         // first H1 in body
+	Summary   string         // indexer-derived one-sentence summary
+	Tags      []string       // frontmatter `tags:`
+	Body      string         // mdpp body text
 	Frontmtr  map[string]any // raw parsed frontmatter
 	UpdatedAt time.Time
 }
@@ -204,24 +204,24 @@ type ProposedEdge struct {
 
 // Capability is a scoped, short-lived permission token.
 type Capability struct {
-	ID            string
-	Subject       string // identity:// or agent:// URI
-	SpaceID       string
-	Permissions   []string
-	Limits        Limits
-	IssuedBy      string
-	IssuedAt      time.Time
-	ExpiresAt     time.Time
-	RevokedAt     *time.Time
+	ID          string
+	Subject     string // identity:// or agent:// URI
+	SpaceID     string
+	Permissions []string
+	Limits      Limits
+	IssuedBy    string
+	IssuedAt    time.Time
+	ExpiresAt   time.Time
+	RevokedAt   *time.Time
 }
 
 // Limits are per-token caps enforced on every operation.
 type Limits struct {
-	MaxSpores         int    `json:"max_spores,omitempty"`
-	MaxBytes          int    `json:"max_bytes,omitempty"`
-	MaxRecallResults  int    `json:"max_recall_results,omitempty"`
-	MaxResponseTokens int    `json:"max_response_tokens,omitempty"`
-	MaxResponseShape  string `json:"max_response_shape,omitempty"`
+	MaxSpores         int      `json:"max_spores,omitempty"`
+	MaxBytes          int      `json:"max_bytes,omitempty"`
+	MaxRecallResults  int      `json:"max_recall_results,omitempty"`
+	MaxResponseTokens int      `json:"max_response_tokens,omitempty"`
+	MaxResponseShape  string   `json:"max_response_shape,omitempty"`
 	AllowedPaths      []string `json:"allowed_paths,omitempty"`
 	DeniedPaths       []string `json:"denied_paths,omitempty"`
 }

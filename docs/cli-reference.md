@@ -83,16 +83,19 @@ Fetch one object by id or `hypha://` URI. Closes the recall→read loop
 without manual URI→path translation.
 
 ```bash
-hypha show <id-or-uri> [--path | --json | --frontmatter | --body]
+hypha show <id-or-uri> [--format json|text] [--path | --json | --frontmatter | --body]
 ```
 
 | Flag | Meaning |
 | --- | --- |
 | `--path` | Print the resolved absolute file path only |
-| `--json` | Print object metadata as JSON (id, type, space, path, title, status, tags, summary, updated_at) |
+| `--format json` / `--json` | Print object metadata as JSON (id, type, space, path, title, status, tags, summary, updated_at) |
 | `--frontmatter` | Print just the YAML frontmatter block |
 | `--body` | Print just the markdown body |
-| (none) | Print the full file |
+| `--format text` / (none) | Print the full file |
+
+`--json` always selects full-key JSON regardless of the output environment.
+JSON metadata cannot be combined with `--path`, `--frontmatter`, or `--body`.
 
 ## `hypha spaces list`
 
@@ -123,6 +126,50 @@ The response includes a top-level `status` (`ok`, `warning`, `error`),
 per-space counts, parse errors, index table counts, optional tool checks,
 and recommendations such as running `hypha index rebuild`.
 
+## `hypha spore new`
+
+Scaffold a valid mdpp spore proposing a new decision, report, or spec. Edit the
+source references and proposed document before submitting. The destination
+space does not need to be installed to create the draft.
+
+```bash
+hypha spore new --space hypha://example/knowledge --kind report \
+  --title "Example report" --out proposal.md
+```
+
+| Flag | Meaning |
+| --- | --- |
+| `--space <uri>` | Destination `hypha://` URI (required) |
+| `--kind decision\|report\|spec` | Type of canonical document to propose (required) |
+| `--title <text>` | Document title (default: `New <kind>`) |
+| `--out <file>` | Draft file (default: generated spore id plus `.md`); refuses overwrites |
+| `--as <uri>` | Author agent or identity URI (default: `agent://hypha/draft`) |
+| `--source <uri>` | Source reference (default: destination space) |
+| `--path <relative-path>` | Proposed canonical path (default: the kind's directory plus generated document id) |
+| `--format <format>` | Standard output format for the creation result |
+
+## `hypha spore verify`
+
+Verify a file or installed spore id without changing any documents or the index.
+
+```bash
+hypha spore verify proposal.md --format text
+hypha spore verify <spore-id> --space hypha://example/knowledge --format json
+```
+
+Shows the signer identity, signature version, covered and excluded fields,
+recomputed body/frontmatter/content hashes, and `VALID`, `INVALID`, or `UNSIGNED`.
+JSON includes recorded signature values and change diagnostics in `data`; `ok`
+is true only for `VALID`. Valid signatures exit 0; invalid and unsigned documents
+exit 1. Id lookup searches inboxes and accepted documents. Pass a file path or
+`--space` when an id is ambiguous.
+
+V2's `content_hash` covers the full canonical payload. V1 remains supported and
+reports `v1: content_hash covers body only; frontmatter verified via payload`.
+See [Spore signatures](spore-signatures.md) for exact coverage and canonicalization.
+`hypha spore --help` lists commands; `hypha spore <command> --help` prints usage
+and actual flags.
+
 ## `hypha spore submit`
 
 Validate a spore file and write it to the matching space's inbox.
@@ -138,8 +185,14 @@ hypha spore submit <file> [--sign --as <identity-uri>] [--format ...]
 | `--as <uri>` | Signer identity URI |
 
 Validation errors come back as `field "<path>": <message>` on stderr.
+Proposal errors include the expected mapping shape and a short `kind`/`path`/`body`
+example. Write-specific fields belong alongside `kind`, rather than in a
+`payload` wrapper.
 On success, the response carries the receipt id, on-disk path, and
-content hash.
+content hash. Submit and amend receipts use the v2 canonical payload digest,
+with a `sha256:` prefix; a v2 signed submission's receipt hash matches the
+signature's `content_hash`. Existing receipts keep their historical file hashes.
+Pre-signed files retain their signatures when submitted without `--sign`.
 
 ## `hypha spore list`
 

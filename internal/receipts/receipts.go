@@ -208,11 +208,11 @@ type scanner interface {
 
 func scanReceipt(s scanner) (types.Receipt, error) {
 	var (
-		r                        types.Receipt
-		contentHash, identityID  sql.NullString
-		createdAt                string
-		expiresAt                sql.NullString
-		metaJSON                 sql.NullString
+		r                       types.Receipt
+		contentHash, identityID sql.NullString
+		createdAt               string
+		expiresAt               sql.NullString
+		metaJSON                sql.NullString
 	)
 	if err := s.Scan(
 		&r.ID, &r.SpaceID, &r.SubjectID, &r.SubjectKind, &r.Action, &r.Status,

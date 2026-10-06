@@ -30,12 +30,12 @@ import (
 
 // Identity is the public-facing record. Matches the .md frontmatter shape.
 type Identity struct {
-	ID        string     // "identity://<authority>/<name>" or "agent://..." etc.
-	Kind      string     // "human" | "agent" | "ci" | "service"
-	Space     string     // owning space, e.g. "hypha://m31labs/hyphae"
-	Status    string     // "active" | "rotated" | "revoked"
-	KeyAlg    string     // "ed25519"
-	PublicKey string     // "ed25519:base64:<32 bytes base64-std>"
+	ID        string // "identity://<authority>/<name>" or "agent://..." etc.
+	Kind      string // "human" | "agent" | "ci" | "service"
+	Space     string // owning space, e.g. "hypha://m31labs/hyphae"
+	Status    string // "active" | "rotated" | "revoked"
+	KeyAlg    string // "ed25519"
+	PublicKey string // "ed25519:base64:<32 bytes base64-std>"
 	CreatedAt time.Time
 	ExpiresAt *time.Time
 	Succeeds  string // optional: previous identity id this rotates
@@ -286,7 +286,7 @@ func authorityFromID(id string) string {
 // The "id" field in frontmatter is the slug form "identity.<name>"; we
 // reconstruct the full URI using the "authority" field also written by Save.
 func identityFromFrontmatter(fm map[string]any, filePath string) (Identity, error) {
-	slug, _ := fm["id"].(string)   // e.g. "identity.odvcencio"
+	slug, _ := fm["id"].(string) // e.g. "identity.example"
 	authority, _ := fm["authority"].(string)
 
 	// Reconstruct the full URI from slug + authority.
@@ -379,4 +379,3 @@ func decodePublicKey(encoded string) (ed25519.PublicKey, error) {
 	}
 	return ed25519.PublicKey(keyBytes), nil
 }
-

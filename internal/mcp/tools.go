@@ -56,9 +56,9 @@ func readTools(s *Server) []toolSpec {
 			Description:      "FTS5 search across spaces; ranked hits + body snippets + per-snippet citations.",
 			DefaultMaxTokens: 800,
 			InputSchema: schema(merge(map[string]any{
-				"query":      stringProp("query terms"),
-				"limit":      numberProp("max hits to consider (default 12)"),
-				"shape":      enumProp([]string{"headline", "summary+anchors", "count_only"}, "recall response shape"),
+				"query": stringProp("query terms"),
+				"limit": numberProp("max hits to consider (default 12)"),
+				"shape": enumProp([]string{"headline", "summary+anchors", "count_only"}, "recall response shape"),
 			}, budgetProps), []string{"query"}),
 			Handler: func(args map[string]any) (any, error) {
 				q, _ := args["query"].(string)

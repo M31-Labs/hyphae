@@ -399,7 +399,6 @@ updateStatus();
 })();
 `
 
-
 func toolbarNode() gosx.Node {
 	return gosx.El("div", gosx.Attrs(gosx.Attr("id", "toolbar")),
 		gosx.El("h1", gosx.Text("Hyphae")),

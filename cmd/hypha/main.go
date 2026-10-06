@@ -65,8 +65,10 @@ const usage = `hypha — Hyphae v0.1.12 CLI
 Usage:
   hypha index    rebuild [--root <path>]
   hypha recall   <query> [--limit N] [--max-tokens N] [--shape headline|summary+anchors] [--format text|json|jsonline|compact]
-  hypha show     <id-or-hypha-uri> [--path] [--json] [--frontmatter] [--body]
+  hypha show     <id-or-hypha-uri> [--format json|text] [--path] [--json] [--frontmatter] [--body]
   hypha spaces   list [--format text|json|jsonline|compact]
+  hypha spore    new    --space <uri> --kind decision|report|spec [--title <title>] [--out <file>]
+  hypha spore    verify <file|spore-id> [--space <uri>] [--format text|json]
   hypha spore    submit <file> [--sign --as <identity-uri>] [--format text|json|jsonline|compact]
   hypha spore    amend  <file> [--sign --as <identity-uri>] [--format text|json|jsonline|compact]
   hypha spore    list   [--space <uri>] [--status <state>] [--since 24h] [--limit N] [--format text|json|jsonline|compact]
@@ -1541,27 +1543,37 @@ func cmdRecall(args []string) error {
 // --- spore submit -----------------------------------------------------------
 
 func cmdSpore(args []string) error {
-	if len(args) == 0 {
-		return errors.New("usage: hypha spore submit|amend|list|accept|reject [...]")
+	if len(args) == 0 || args[0] == "--help" || args[0] == "-h" || args[0] == "help" {
+		fmt.Print(sporeUsage)
+		return nil
 	}
+	var err error
 	switch args[0] {
+	case "new":
+		err = cmdSporeNew(args[1:])
+	case "verify":
+		err = cmdSporeVerify(args[1:])
 	case "submit":
-		return cmdSporeSubmit(args[1:])
+		err = cmdSporeSubmit(args[1:])
 	case "amend":
-		return cmdSporeAmend(args[1:])
+		err = cmdSporeAmend(args[1:])
 	case "list":
-		return cmdSporeList(args[1:])
+		err = cmdSporeList(args[1:])
 	case "accept":
-		return cmdSporeReview(args[1:], "accepted")
+		err = cmdSporeReview(args[1:], "accepted")
 	case "reject":
-		return cmdSporeReview(args[1:], "rejected")
+		err = cmdSporeReview(args[1:], "rejected")
 	case "reopen":
-		return cmdSporeReview(args[1:], "unreviewed")
+		err = cmdSporeReview(args[1:], "unreviewed")
 	case "lint":
-		return cmdSporeLint(args[1:])
+		err = cmdSporeLint(args[1:])
 	default:
-		return fmt.Errorf("unknown spore subcommand %q (try `submit`, `amend`, `list`, `accept`, `reject`, `reopen`, `lint`)", args[0])
+		return fmt.Errorf("unknown spore subcommand %q (try `hypha spore --help`)", args[0])
 	}
+	if errors.Is(err, flag.ErrHelp) {
+		return nil
+	}
+	return err
 }
 
 // cmdSporeReview flips an unreviewed spore to `accepted` or `rejected`,
@@ -1569,12 +1581,12 @@ func cmdSpore(args []string) error {
 // that's still `hypha graft`'s job. Useful for queuing spores for later
 // graft, or formally rejecting a contribution without applying it.
 func cmdSporeReview(args []string, newStatus string) error {
-	fs := flag.NewFlagSet("spore review", flag.ContinueOnError)
+	fs := sporeFlagSet(map[string]string{"accepted": "accept", "rejected": "reject", "unreviewed": "reopen"}[newStatus])
 	spaceFlag := fs.String("space", "", "space URI containing the spore")
 	asURI := fs.String("as", "", "reviewer identity URI (recorded in the receipt)")
 	reason := fs.String("reason", "", "optional human-readable reason (recorded in metadata)")
 	format := formatFlag(fs)
-	if err := fs.Parse(reorderFlagsFirst(args)); err != nil {
+	if err := parseCommandFlags(fs, args); err != nil {
 		return err
 	}
 	if fs.NArg() == 0 {
@@ -1780,9 +1792,9 @@ func shortHash(sum []byte) string {
 // dry-resolved with the real graft handlers. Exit is non-zero when the
 // spore would not fully apply, so agents catch skips before the inbox.
 func cmdSporeLint(rest []string) error {
-	fs := flag.NewFlagSet("spore lint", flag.ContinueOnError)
+	fs := sporeFlagSet("lint")
 	format := formatFlag(fs)
-	if err := fs.Parse(reorderFlagsFirst(rest)); err != nil {
+	if err := parseCommandFlags(fs, rest); err != nil {
 		return err
 	}
 	if fs.NArg() == 0 {
@@ -1843,11 +1855,11 @@ func cmdSporeLint(rest []string) error {
 }
 
 func cmdSporeSubmit(rest []string) error {
-	fs := flag.NewFlagSet("spore submit", flag.ContinueOnError)
+	fs := sporeFlagSet("submit")
 	sign := fs.Bool("sign", false, "Ed25519-sign the spore before submission")
 	signer := fs.String("as", "", "signer identity URI (required with --sign)")
 	format := formatFlag(fs)
-	if err := fs.Parse(reorderFlagsFirst(rest)); err != nil {
+	if err := parseCommandFlags(fs, rest); err != nil {
 		return err
 	}
 	if fs.NArg() == 0 {
@@ -1903,7 +1915,7 @@ func cmdSporeSubmit(rest []string) error {
 			return fmt.Errorf("submit signed: %w", err)
 		}
 	} else {
-		filePath, receipt, err = spore.Submit(sp, spaceRoot)
+		filePath, receipt, err = spore.SubmitBytes(source, spaceRoot)
 		if err != nil {
 			return fmt.Errorf("submit: %w", err)
 		}
@@ -1925,14 +1937,16 @@ func cmdSporeSubmit(rest []string) error {
 	crdtshadow.MirrorSpore(root, sp)
 	crdtshadow.MirrorReceipt(root, receipt)
 
+	signedReport, _ := spore.VerifyDetailed(source, identityResolver(root))
+	isSigned := *sign || signedReport.Recorded != nil
 	payload := map[string]any{
 		"receipt":   receipt,
 		"file_path": filePath,
-		"signed":    *sign,
+		"signed":    isSigned,
 	}
 	return emit("spore submit", payload, *format, func(w io.Writer, _ any) error {
 		fmt.Fprintf(w, "Submitted: %s\n", filePath)
-		fmt.Fprintf(w, "  Signed:   %t\n", *sign)
+		fmt.Fprintf(w, "  Signed:   %t\n", isSigned)
 		fmt.Fprintf(w, "  Receipt:  %s\n", receipt.ID)
 		return nil
 	})
@@ -1948,11 +1962,11 @@ func cmdSporeSubmit(rest []string) error {
 // If --sign is given the amended bytes are signed before being written,
 // producing a fresh signature over the new content.
 func cmdSporeAmend(rest []string) error {
-	fs := flag.NewFlagSet("spore amend", flag.ContinueOnError)
+	fs := sporeFlagSet("amend")
 	sign := fs.Bool("sign", false, "Ed25519-sign the amended spore before writing")
 	signer := fs.String("as", "", "signer identity URI (required with --sign)")
 	format := formatFlag(fs)
-	if err := fs.Parse(reorderFlagsFirst(rest)); err != nil {
+	if err := parseCommandFlags(fs, rest); err != nil {
 		return err
 	}
 	if fs.NArg() == 0 {
@@ -2063,13 +2077,13 @@ func identityResolver(root string) spore.IdentityResolver {
 // --- spore list -------------------------------------------------------------
 
 func cmdSporeList(args []string) error {
-	fs := flag.NewFlagSet("spore list", flag.ContinueOnError)
+	fs := sporeFlagSet("list")
 	spaceFilter := fs.String("space", "", "filter by space URI (default: all installed spaces)")
 	statusFilter := fs.String("status", "", "filter by status (unreviewed, accepted, partial, rejected, ...)")
 	sinceStr := fs.String("since", "", "only spores submitted within this duration (e.g. 24h, 7d)")
 	limit := fs.Int("limit", 50, "max results")
 	format := formatFlag(fs)
-	if err := fs.Parse(reorderFlagsFirst(args)); err != nil {
+	if err := parseCommandFlags(fs, args); err != nil {
 		return err
 	}
 
@@ -2660,18 +2674,29 @@ func findSporeFilePath(spaceRoot, sporeID string) (string, error) {
 
 func cmdShow(args []string) error {
 	if len(args) == 0 {
-		return errors.New("usage: hypha show <id-or-hypha-uri> [--path] [--json] [--frontmatter] [--body]")
+		return errors.New("usage: hypha show <id-or-hypha-uri> [--path] [--format json|text] [--json] [--frontmatter] [--body]")
 	}
 	fs := flag.NewFlagSet("show", flag.ContinueOnError)
+	format := fs.String("format", "", "json for metadata; text for file content")
 	pathOnly := fs.Bool("path", false, "print only the resolved absolute file path")
 	jsonOut := fs.Bool("json", false, "print object metadata as JSON (id, type, space, path, title, status, tags, updated_at)")
 	frontOnly := fs.Bool("frontmatter", false, "print only the YAML frontmatter block")
 	bodyOnly := fs.Bool("body", false, "print only the markdown body (everything after the frontmatter)")
-	if err := fs.Parse(reorderFlagsFirst(args)); err != nil {
+	if err := parseCommandFlags(fs, args); err != nil {
 		return err
 	}
 	if fs.NArg() == 0 {
-		return errors.New("usage: hypha show <id-or-hypha-uri> [--path] [--json] [--frontmatter] [--body]")
+		return errors.New("usage: hypha show <id-or-hypha-uri> [--path] [--format json|text] [--json] [--frontmatter] [--body]")
+	}
+	if *format != "" && *format != "text" && *format != "json" {
+		return fmt.Errorf("show: --format must be json or text")
+	}
+	if *jsonOut && *format == "text" {
+		return errors.New("show: --json conflicts with --format text")
+	}
+	metadata := *jsonOut || *format == "json"
+	if metadata && (*pathOnly || *frontOnly || *bodyOnly) {
+		return errors.New("show: JSON metadata cannot be combined with --path, --frontmatter, or --body")
 	}
 	id := normalizeShowID(fs.Arg(0))
 
@@ -2709,7 +2734,7 @@ func cmdShow(args []string) error {
 		return nil
 	}
 
-	if *jsonOut {
+	if metadata {
 		var tags []string
 		_ = json.Unmarshal([]byte(tagsJSON), &tags)
 		out := map[string]any{
@@ -2725,7 +2750,7 @@ func cmdShow(args []string) error {
 		}
 		// --json selects the metadata slice. The envelope wraps it so the
 		// shape matches the rest of the agent surface.
-		return emit("show", out, "", nil)
+		return emit("show", out, "json", nil)
 	}
 
 	content, err := os.ReadFile(absPath)
