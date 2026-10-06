@@ -23,6 +23,17 @@ import (
 // perm is applied to the temp file before rename; the post-rename file
 // inherits it (os.Rename preserves the source's perms on the destination).
 func WriteFile(path string, data []byte, perm os.FileMode) error {
+	return writeFile(path, data, perm, false, func(f *os.File, b []byte) error { _, err := f.Write(b); return err })
+}
+
+// CreateFile publishes a complete file atomically without overwriting an existing
+// destination. A hard link from the synced temporary file provides no-replace
+// semantics on the same filesystem. All failure paths remove the temporary file.
+func CreateFile(path string, data []byte, perm os.FileMode) error {
+	return writeFile(path, data, perm, true, func(f *os.File, b []byte) error { _, err := f.Write(b); return err })
+}
+
+func writeFile(path string, data []byte, perm os.FileMode, exclusive bool, write func(*os.File, []byte) error) error {
 	dir := filepath.Dir(path)
 	tmp, err := os.CreateTemp(dir, "."+filepath.Base(path)+".tmp.")
 	if err != nil {
@@ -34,7 +45,7 @@ func WriteFile(path string, data []byte, perm os.FileMode) error {
 		_ = os.Remove(tmpPath)
 	}
 
-	if _, err := tmp.Write(data); err != nil {
+	if err := write(tmp, data); err != nil {
 		_ = tmp.Close()
 		cleanup()
 		return fmt.Errorf("atomicfs: write %s: %w", tmpPath, err)
@@ -53,9 +64,14 @@ func WriteFile(path string, data []byte, perm os.FileMode) error {
 		cleanup()
 		return fmt.Errorf("atomicfs: close %s: %w", tmpPath, err)
 	}
-	if err := os.Rename(tmpPath, path); err != nil {
-		cleanup()
-		return fmt.Errorf("atomicfs: rename %s → %s: %w", tmpPath, path, err)
+	publish := os.Rename
+	if exclusive {
+		publish = os.Link
 	}
+	if err := publish(tmpPath, path); err != nil {
+		cleanup()
+		return fmt.Errorf("atomicfs: publish %s → %s: %w", tmpPath, path, err)
+	}
+	cleanup()
 	return nil
 }

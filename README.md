@@ -158,7 +158,7 @@ Today you can:
 - `hypha spore accept|reject <spore-id> --as <id> [--reason "..."]` —
   flip status + persist a review receipt.
 - `hypha graft <spore-id> --as <id> [--verify] [--dry-run] [--diff]
-  [--apply]` — apply a spore's `proposed_writes` (`append_section`,
+  [--apply] [--allow-legacy-proposals]` — apply a spore's `proposed_writes` (`append_section`,
   `insert_after`, `replace_block`, `create_file`, `add_tag`) via
   bounded mdpp edits, record `derived_from` edges, update spore status
   in-place, persist the receipt. `--dry-run` previews without writing;
@@ -201,15 +201,16 @@ hypha spore new --space hypha://example/knowledge --kind decision \
   --title "Record the decision" --out proposal.md
 hypha spore submit proposal.md --sign --as identity://example/reviewer --format json
 hypha spore verify <submitted-spore-id> --format text
-hypha spore accept <submitted-spore-id> --as identity://example/reviewer
+hypha spore audit --space hypha://example/knowledge --format text
 hypha graft <submitted-spore-id> --as identity://example/reviewer --verify --dry-run --diff
 hypha graft <submitted-spore-id> --as identity://example/reviewer --verify --apply
 ```
 
 `spore new` scaffolds a `create_file` proposal for a decision, report, or spec.
 Use an existing signer identity, edit the generated draft, and review the graft
-preview before applying it. `hypha spore --help` and each subcommand's `--help`
-list the supported options.
+preview before applying it. Graft applies unreviewed spores and records acceptance;
+`spore accept` records acceptance without applying proposals. `hypha spore --help`
+and each subcommand's `--help` list the supported options.
 
 New Ed25519 signatures use **v2**: `body_hash` covers the authored markdown body,
 `frontmatter_hash` covers frontmatter substance, and `content_hash` covers the
@@ -222,6 +223,12 @@ only the body; the signature also verifies frontmatter through its payload.
 Both versions exclude review status, the signature block, and appended trace
 work logs. See [Spore signatures](docs/spore-signatures.md) for the exact encoding,
 legacy rules, and `VALID` / `INVALID` / `UNSIGNED` results.
+
+Older **v0** signatures get `V0_LEGACY`: the authored body is authenticated, but
+frontmatter and proposals are unverified. Graft previews warn; applying their
+proposals requires `--allow-legacy-proposals` after review. `hypha spore audit`
+counts all formats and lists invalid files and proposal mismatches without
+changing any documents.
 
 ### Output formats
 

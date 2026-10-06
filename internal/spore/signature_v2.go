@@ -11,25 +11,25 @@ import (
 
 	"gopkg.in/yaml.v3"
 	"m31labs.dev/hyphae/internal/identity"
-	"m31labs.dev/mdpp"
 )
 
 // VerificationReport describes the signed scope and the verification result.
-// Hashes are recomputed from the document; Recorded contains the signature's
-// claims. Changed localizes differences against those claims, not their cause.
+// Hashes are recomputed from the document; Recorded contains signature hashes
+// and metadata. Changed localizes hash differences, not their cause.
 type VerificationReport struct {
-	Status          string     `json:"status"`
-	Signer          string     `json:"signer,omitempty"`
-	Version         int        `json:"version,omitempty"`
-	CoveredFields   []string   `json:"covered_fields,omitempty"`
-	ExcludedFields  []string   `json:"excluded_fields,omitempty"`
-	BodyHash        string     `json:"body_hash,omitempty"`
-	FrontmatterHash string     `json:"frontmatter_hash,omitempty"`
-	ContentHash     string     `json:"content_hash,omitempty"`
-	Recorded        *Signature `json:"recorded,omitempty"`
-	Changed         []string   `json:"changed,omitempty"`
-	Note            string     `json:"note,omitempty"`
-	Error           string     `json:"error,omitempty"`
+	Status           string     `json:"status"`
+	Signer           string     `json:"signer,omitempty"`
+	Version          int        `json:"version"`
+	CoveredFields    []string   `json:"covered_fields,omitempty"`
+	ExcludedFields   []string   `json:"excluded_fields,omitempty"`
+	BodyHash         string     `json:"body_hash,omitempty"`
+	FrontmatterHash  string     `json:"frontmatter_hash,omitempty"`
+	ContentHash      string     `json:"content_hash,omitempty"`
+	Recorded         *Signature `json:"recorded,omitempty"`
+	Changed          []string   `json:"changed,omitempty"`
+	ProposalMismatch []string   `json:"proposal_mismatch,omitempty"`
+	Note             string     `json:"note,omitempty"`
+	Error            string     `json:"error,omitempty"`
 }
 
 // parseSigningSource uses YAML's semantic values, independent of mdpp's scalar
@@ -213,7 +213,7 @@ func quoteBlankValues(value any) any {
 func VerifyDetailed(source []byte, resolve IdentityResolver) (report VerificationReport, err error) {
 	report.Status = "INVALID"
 	defer func() {
-		if err != nil && err != ErrUnsigned {
+		if err != nil && err != ErrUnsigned && err != ErrLegacyUnverified {
 			report.Error = err.Error()
 		}
 	}()
@@ -221,7 +221,7 @@ func VerifyDetailed(source []byte, resolve IdentityResolver) (report Verificatio
 	if err != nil {
 		return report, err
 	}
-	if fm["signature"] == nil {
+	if fm["signature"] == nil || isUnsignedMarker(fm["signature"]) {
 		report.Status = "UNSIGNED"
 		return report, ErrUnsigned
 	}
@@ -229,33 +229,29 @@ func VerifyDetailed(source []byte, resolve IdentityResolver) (report Verificatio
 	if err != nil {
 		return report, err
 	}
-	report.Signer, report.Version, report.Recorded = sig.Key, sig.Version, &sig
-	report.CoveredFields = []string{"agent.id", "id", "created", "authored body", "frontmatter substance (including proposed_writes and proposed_edges)"}
-	report.ExcludedFields = []string{"status", "signature block", "appended trace work log"}
-	if sig.Version == 1 {
-		report.Note = "v1: content_hash covers body only; frontmatter verified via payload"
-		// Preserve mdpp's historical scalar semantics and byte ranges exactly.
-		doc, parseErr := mdpp.Parse(source)
-		if parseErr != nil {
-			return report, parseErr
-		}
-		report.BodyHash = hashBytes(signableBody(extractBodyBytes(doc)))
-		report.FrontmatterHash = "sha256:" + computeFmSubstanceHash(doc.Frontmatter())
-		report.ContentHash = report.BodyHash
-		if sig.ContentHash != report.BodyHash {
-			report.Changed = []string{"body"}
-		}
-		err = verifyV1(source, resolve)
-		if err == nil {
-			report.Status = "VALID"
-		}
+	report.Version, report.Recorded = sig.Version, &sig
+	id, err := resolveSigner(resolve, sig.Key)
+	report.Signer = id.ID
+	if err != nil {
 		return report, err
-	}
-	if sig.Version != 2 {
-		return report, fmt.Errorf("spore: unsupported signature version %d", sig.Version)
 	}
 	if sig.Alg != "ed25519" {
 		return report, fmt.Errorf("spore: unsupported signature alg %q", sig.Alg)
+	}
+	if !strings.HasPrefix(sig.Value, "ed25519:") {
+		return report, fmt.Errorf("spore: signature value missing ed25519: prefix")
+	}
+	sigBytes, err := base64.StdEncoding.DecodeString(strings.TrimPrefix(sig.Value, "ed25519:"))
+	if err != nil {
+		return report, fmt.Errorf("spore: decode signature value: %w", err)
+	}
+	report.CoveredFields = []string{"agent.id", "id", "created", "authored body", "frontmatter substance (including proposed_writes and proposed_edges)"}
+	report.ExcludedFields = []string{"status", "signature block", "appended trace work log"}
+	if sig.Version == 0 || sig.Version == 1 {
+		return verifyLegacy(source, sig, id, sigBytes, report)
+	}
+	if sig.Version != 2 {
+		return report, fmt.Errorf("spore: unsupported signature version %d", sig.Version)
 	}
 	payload, bodyHash, fmHash, err := canonicalV2(fm, body)
 	if err != nil {
@@ -273,20 +269,6 @@ func VerifyDetailed(source []byte, resolve IdentityResolver) (report Verificatio
 	}
 	if sig.ContentHash != report.ContentHash {
 		return report, fmt.Errorf("spore: content_hash does not match canonical payload")
-	}
-	if resolve == nil {
-		return report, fmt.Errorf("spore: identity resolver required")
-	}
-	id, err := resolve(sig.Key)
-	if err != nil {
-		return report, fmt.Errorf("spore: unknown signer %q: %w", sig.Key, err)
-	}
-	if !strings.HasPrefix(sig.Value, "ed25519:") {
-		return report, fmt.Errorf("spore: signature value missing ed25519: prefix")
-	}
-	sigBytes, err := base64.StdEncoding.DecodeString(strings.TrimPrefix(sig.Value, "ed25519:"))
-	if err != nil {
-		return report, fmt.Errorf("spore: decode signature value: %w", err)
 	}
 	if !identity.Verify(id, payload, sigBytes) {
 		return report, fmt.Errorf("spore: signature verification failed (signed content or signature changed)")

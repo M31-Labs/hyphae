@@ -62,7 +62,7 @@ func writeCLIFile(t *testing.T, path string, content []byte) {
 
 func TestSporeHelp(t *testing.T) {
 	root := t.TempDir()
-	for _, sub := range []string{"", "new", "verify", "submit", "amend", "list", "accept", "reject", "reopen", "lint"} {
+	for _, sub := range []string{"", "new", "verify", "audit", "submit", "amend", "list", "accept", "reject", "reopen", "lint"} {
 		t.Run(sub, func(t *testing.T) {
 			args := []string{"spore"}
 			if sub != "" {
@@ -324,5 +324,179 @@ func TestShowFormats(t *testing.T) {
 	}
 	if _, _, code := cli(t, root, "show", "report.example", "--format", "invalid"); code == 0 {
 		t.Fatal("invalid format accepted")
+	}
+}
+
+func TestPreservedYAMLSubmitAmendReview(t *testing.T) {
+	for _, status := range []string{"'unreviewed'", "\"unreviewed\" # pending", "unreviewed # pending"} {
+		t.Run(status, func(t *testing.T) {
+			root := t.TempDir()
+			path := filepath.Join(root, "proposal.md")
+			space := filepath.Join(root, "spaces", "example-knowledge")
+			if err := os.MkdirAll(space, 0755); err != nil {
+				t.Fatal(err)
+			}
+			if out, stderr, code := cli(t, root, "spore", "new", "--space", "hypha://example/knowledge", "--kind", "report", "--out", path); code != 0 {
+				t.Fatalf("%s %s", out, stderr)
+			}
+			data, _ := os.ReadFile(path)
+			parsed, _ := spore.Parse(data)
+			data = bytes.Replace(data, []byte("id: "+parsed.ID), []byte("id: '"+parsed.ID+"' # identifier"), 1)
+			data = bytes.Replace(data, []byte("status: unreviewed"), []byte("status: "+status), 1)
+			writeCLIFile(t, path, data)
+			if out, stderr, code := cli(t, root, "spore", "submit", path); code != 0 {
+				t.Fatalf("submit: %s %s", out, stderr)
+			}
+			data = bytes.Replace(data, []byte("Explain what should change"), []byte("Updated: explain what should change"), 1)
+			writeCLIFile(t, path, data)
+			if out, stderr, code := cli(t, root, "spore", "amend", path); code != 0 {
+				t.Fatalf("amend: %s %s", out, stderr)
+			}
+			if out, stderr, code := cli(t, root, "spore", "accept", parsed.ID, "--as", "identity://example/reviewer"); code != 0 {
+				t.Fatalf("review: %s %s", out, stderr)
+			}
+			installed, err := findSporeFilePath(space, parsed.ID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			result, _ := os.ReadFile(installed)
+			if got, _ := spore.FrontmatterString(result, "status"); got != "accepted" {
+				t.Fatalf("status: %q", got)
+			}
+			if !bytes.Contains(result, []byte("id: '"+parsed.ID+"' # identifier")) {
+				t.Fatal("id representation changed")
+			}
+			if strings.Contains(status, "# pending") && !bytes.Contains(result, []byte("# pending")) {
+				t.Fatal("status comment lost")
+			}
+		})
+	}
+}
+
+func TestDocumentedSporeWorkflow(t *testing.T) {
+	root := t.TempDir()
+	space := filepath.Join(root, "spaces", "example-knowledge")
+	path := filepath.Join(root, "proposal.md")
+	if err := os.MkdirAll(space, 0755); err != nil {
+		t.Fatal(err)
+	}
+	dir := filepath.Join(root, ".catalog", "identities")
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	id, priv, err := identity.Generate("example", "reviewer", "hypha://example/knowledge")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := identity.Save(dir, id, priv); err != nil {
+		t.Fatal(err)
+	}
+	for _, args := range [][]string{
+		{"spore", "new", "--space", "hypha://example/knowledge", "--kind", "decision", "--title", "Record the decision", "--out", path},
+		{"spore", "submit", path, "--sign", "--as", id.ID},
+	} {
+		if out, stderr, code := cli(t, root, args...); code != 0 {
+			t.Fatalf("%v: %s %s", args, out, stderr)
+		}
+	}
+	unsigned, _ := os.ReadFile(path)
+	parsed, _ := spore.Parse(unsigned)
+	installed, err := findSporeFilePath(space, parsed.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	before, _ := os.ReadFile(installed)
+	for _, args := range [][]string{
+		{"spore", "verify", parsed.ID, "--format", "text"},
+		{"graft", parsed.ID, "--as", id.ID, "--verify", "--dry-run", "--diff", "--format", "text"},
+	} {
+		if out, stderr, code := cli(t, root, args...); code != 0 {
+			t.Fatalf("%v: %s %s", args, out, stderr)
+		}
+	}
+	after, _ := os.ReadFile(installed)
+	if !bytes.Equal(before, after) {
+		t.Fatal("preview changed spore")
+	}
+	target := filepath.Join(space, parsed.ProposedWrites[0].Payload["path"].(string))
+	if _, err := os.Stat(target); !errors.Is(err, os.ErrNotExist) {
+		t.Fatal("preview created canonical document")
+	}
+	if out, stderr, code := cli(t, root, "graft", parsed.ID, "--as", id.ID, "--verify", "--apply", "--format", "text"); code != 0 {
+		t.Fatalf("apply: %s %s", out, stderr)
+	}
+	if _, err := os.Stat(target); err != nil {
+		t.Fatal(err)
+	}
+	if out, stderr, code := cli(t, root, "spore", "verify", parsed.ID, "--format", "text"); code != 0 {
+		t.Fatalf("signature after graft: %s %s", out, stderr)
+	}
+	stored, _ := os.ReadFile(installed)
+	if got, _ := spore.FrontmatterString(stored, "status"); got != "accepted" {
+		t.Fatal(got)
+	}
+}
+
+func TestLegacyV0VerifyAuditAndGraftCLI(t *testing.T) {
+	root := t.TempDir()
+	source, err := os.ReadFile("../../internal/spore/testdata/v0.md")
+	if err != nil {
+		t.Fatal(err)
+	}
+	public, err := os.ReadFile("../../internal/spore/testdata/v0-identity.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var record struct {
+		PublicKey string `json:"public_key"`
+	}
+	if err := json.Unmarshal(public, &record); err != nil {
+		t.Fatal(err)
+	}
+	identitySource := "---\nid: identity.reviewer\ntype: identity\nauthority: example\nkey_alg: ed25519\npublic_key: " + record.PublicKey + "\n---\n"
+	writeCLIFile(t, filepath.Join(root, ".catalog", "identities", "reviewer.md"), []byte(identitySource))
+	space := filepath.Join(root, "spaces", "example-knowledge")
+	path := filepath.Join(space, "inbox", "agents", "legacy.md")
+	writeCLIFile(t, path, source)
+	for _, format := range []string{"text", "json"} {
+		out, stderr, code := cli(t, root, "spore", "verify", path, "--format", format)
+		if code != 1 || !strings.Contains(out, "V0_LEGACY") || !strings.Contains(out, "proposals NOT covered") {
+			t.Fatalf("verify: %s %s (%d)", out, stderr, code)
+		}
+	}
+	forged := bytes.ReplaceAll(source, []byte("key: identity://example/reviewer"), []byte("key: identity://trusted/reviewer"))
+	writeCLIFile(t, filepath.Join(space, "inbox", "agents", "forged.md"), forged)
+	writeCLIFile(t, filepath.Join(space, "inbox", "agents", "unsigned.md"), bytes.Replace(source, []byte("signature:"), []byte("unsigned_signature:"), 1))
+	for _, args := range [][]string{{"spore", "audit", "--format", "json"}, {"spore", "audit", "--space", "hypha://example/knowledge", "--format", "json"}} {
+		out, stderr, code := cli(t, root, args...)
+		var env struct {
+			Data spore.AuditReport `json:"data"`
+		}
+		if err := json.Unmarshal([]byte(out), &env); err != nil {
+			t.Fatal(err)
+		}
+		if code != 0 || env.Data.Counts.V0Legacy != 1 || env.Data.Counts.Invalid != 1 || env.Data.Counts.Unsigned != 1 || len(env.Data.Cases) != 1 {
+			t.Fatalf("audit: %s %s (%d)", out, stderr, code)
+		}
+		if env.Data.Cases[0].Signer != "identity://example/reviewer" {
+			t.Fatal("reported forged signer")
+		}
+	}
+	if _, err := os.Stat(filepath.Join(root, ".index")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatal("verify or audit created index")
+	}
+	if err := os.Remove(filepath.Join(space, "inbox", "agents", "forged.md")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(filepath.Join(space, "inbox", "agents", "unsigned.md")); err != nil {
+		t.Fatal(err)
+	}
+	out, stderr, code := cli(t, root, "graft", "spore.2026-10-05.example.legacy", "--space", "hypha://example/knowledge", "--as", "identity://example/reviewer")
+	if code != 1 || !strings.Contains(stderr, "--allow-legacy-proposals") {
+		t.Fatalf("graft gate: %s %s (%d)", out, stderr, code)
+	}
+	out, stderr, code = cli(t, root, "graft", "--allow-legacy-proposals", "spore.2026-10-05.example.legacy", "--space", "hypha://example/knowledge", "--as", "identity://example/reviewer", "--verify")
+	if code != 0 || !strings.Contains(stderr, "proposals NOT covered") {
+		t.Fatalf("explicit graft: %s %s (%d)", out, stderr, code)
 	}
 }

@@ -158,9 +158,9 @@ hypha spore verify <spore-id> --space hypha://example/knowledge --format json
 ```
 
 Shows the signer identity, signature version, covered and excluded fields,
-recomputed body/frontmatter/content hashes, and `VALID`, `INVALID`, or `UNSIGNED`.
+recomputed body/frontmatter/content hashes, and `VALID`, `V0_LEGACY`, `INVALID`, or `UNSIGNED`.
 JSON includes recorded signature values and change diagnostics in `data`; `ok`
-is true only for `VALID`. Valid signatures exit 0; invalid and unsigned documents
+is true only for `VALID`. Valid signatures exit 0; legacy, invalid, and unsigned documents
 exit 1. Id lookup searches inboxes and accepted documents. Pass a file path or
 `--space` when an id is ambiguous.
 
@@ -169,6 +169,24 @@ reports `v1: content_hash covers body only; frontmatter verified via payload`.
 See [Spore signatures](spore-signatures.md) for exact coverage and canonicalization.
 `hypha spore --help` lists commands; `hypha spore <command> --help` prints usage
 and actual flags.
+
+## `hypha spore audit`
+
+Summarize signatures across installed spaces without opening the index or
+changing files. Counts are per file, including archives and accepted documents.
+`VALID` is the total of v1 and v2; `v0-legacy`, `INVALID`, and `UNSIGNED` are
+separate totals. The command lists INVALID files with diagnostics and identifies
+proposal mismatches when the signature matches with proposal fields omitted.
+Those current proposals are unverified; this evidence does not establish their
+edit history. `signature: none` is an unsigned placeholder.
+
+```bash
+hypha spore audit --format text
+hypha spore audit --space hypha://example/knowledge --format json
+```
+
+An audit that completes exits 0 even when it finds invalid spores. JSON uses
+the standard envelope with `data.counts` and `data.cases`. I/O failures exit 1.
 
 ## `hypha spore submit`
 
@@ -209,15 +227,16 @@ hypha spore list [--space <uri>] [--status <state>] [--since 24h] [--limit N] [-
 
 Flip an `unreviewed` spore to `accepted` / `rejected` without applying
 any canonical writes. Persists a receipt; useful for queueing or
-formal rejection.
+formal rejection without a graft.
 
 ```bash
 hypha spore accept <spore-id> --as <identity> [--reason "..."] [--space <uri>] [--format ...]
 hypha spore reject <spore-id> --as <identity> [--reason "..."] [--space <uri>] [--format ...]
 ```
 
-To actually apply proposed_writes from an accepted spore, use
-`hypha graft`.
+Graft requires `unreviewed` status. To apply a proposal, review the graft preview
+and run `hypha graft` directly; successful grafting records acceptance. Use
+`spore accept` only when recording acceptance without applying the proposals.
 
 ## `hypha graft`
 
@@ -240,11 +259,17 @@ hypha graft <spore-id> --as <identity-uri> [flags...]
 | --- | --- | --- |
 | `--as <uri>` | required | Grafter identity URI (recorded in the receipt) |
 | `--space <uri>` | auto-detect | Space URI override (otherwise inferred from inbox) |
-| `--verify` | `false` | Verify spore's Ed25519 signature first |
+| `--verify` | `false` | Require a signature; signed spores are always checked |
+| `--allow-legacy-proposals` | `false` | Apply reviewed v0 proposals despite their unsigned frontmatter; emits a warning |
 | `--no-fmt` | `false` | Skip the post-graft `mdpp.fmt` pass |
 | `--dry-run` | `false` | Plan only |
 | `--diff` | `false` | Render unified diffs (implies dry-run unless `--apply`) |
 | `--apply` | `false` | With `--diff`: persist after printing |
+
+V0 legacy signatures authenticate the body but leave proposals unverified.
+Previewing them emits a warning. Applying them requires `--allow-legacy-proposals`,
+even without `--verify`. INVALID signed spores are refused; the legacy opt-in
+does not bypass a failed signature check.
 
 Supported write kinds: `append_section`, `insert_after`, `replace_block`,
 `create_file`, `add_tag`.

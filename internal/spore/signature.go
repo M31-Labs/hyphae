@@ -3,7 +3,6 @@ package spore
 import (
 	"bytes"
 	"crypto/sha256"
-	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -30,6 +29,9 @@ type Signature struct {
 // ErrUnsigned is returned by Verify when the spore has no signature block.
 var ErrUnsigned = errors.New("spore: not signed")
 
+// ErrLegacyUnverified means the v0 body signature authenticates no proposals.
+var ErrLegacyUnverified = errors.New("spore: v0 legacy signature does not verify frontmatter or proposals")
+
 // IdentityResolver maps an identity URI to a loaded Identity record.
 // Return (zero, error) for unknown identities.
 type IdentityResolver func(uri string) (identity.Identity, error)
@@ -40,108 +42,51 @@ func Sign(source []byte, priv identity.PrivateKey, signedKey string) ([]byte, er
 	return signV2(source, priv, signedKey)
 }
 
-// Verify accepts v2 and legacy v1 signatures. Use VerifyDetailed for scope and
-// hash diagnostics. No source bytes or identity records are changed.
+// Verify accepts fully covered v1/v2 signatures; v0 returns ErrLegacyUnverified.
+// Use VerifyDetailed for scope and hashes. No files or identity records change.
 func Verify(source []byte, resolve IdentityResolver) error {
 	_, err := VerifyDetailed(source, resolve)
 	return err
 }
 
-// verifyV1 preserves the legacy mdpp parse, byte ranges, and pair-array hash.
-// It checks the signature block in source against the canonical payload.
-// Returns nil if the signature is valid. Returns ErrUnsigned if there is no
-// signature block. Other failures return descriptive errors.
-func verifyV1(source []byte, resolve IdentityResolver) error {
-	doc, err := mdpp.Parse(source)
-	if err != nil {
-		return fmt.Errorf("spore: verify: parse: %w", err)
-	}
-
-	fm := doc.Frontmatter()
-	if fm == nil {
-		return fmt.Errorf("spore: verify: no frontmatter block found")
-	}
-
-	// Check for signature block.
-	sigRaw, hasSig := fm["signature"]
-	if !hasSig || sigRaw == nil {
-		return ErrUnsigned
-	}
-
-	sig, err := parseSignatureBlock(sigRaw)
-	if err != nil {
-		return fmt.Errorf("spore: verify: parse signature block: %w", err)
-	}
-
-	// Validate alg.
-	if sig.Alg != "ed25519" {
-		return fmt.Errorf("spore: unsupported signature alg %q", sig.Alg)
-	}
-
-	// Resolve the signer identity.
-	if resolve == nil {
-		return fmt.Errorf("spore: identity resolver required")
-	}
-	id, err := resolve(sig.Key)
-	if err != nil {
-		return fmt.Errorf("spore: unknown signer %q: %w", sig.Key, err)
-	}
-
-	// Extract body bytes (excluding any tool-appended work-log section).
-	body := signableBody(extractBodyBytes(doc))
-
-	// Verify content hash.
-	bodyHash := sha256.Sum256(body)
-	bodyHashHex := fmt.Sprintf("%x", bodyHash[:])
-	expectedContentHash := "sha256:" + bodyHashHex
-	if sig.ContentHash != expectedContentHash {
-		return fmt.Errorf("spore: content hash does not match body")
-	}
-
-	// Verify frontmatter substance hasn't changed since signing.
-	// This catches mutations like adding proposed_writes after signing.
-	currentFmSubstanceHashHex := computeFmSubstanceHash(fm)
-
-	// Extract spore fields for canonical payload.
+// legacyPayload preserves the original mdpp scalar semantics and newline encoding.
+func legacyPayload(fm map[string]any, bodyHashHex, fmHashHex string) ([]byte, error) {
 	agentID := ""
-	if agentBlock, ok := fm["agent"].(map[string]any); ok {
-		agentID = stringField(agentBlock, "id")
+	if agent, ok := fm["agent"].(map[string]any); ok {
+		agentID = stringField(agent, "id")
 	}
-	sporeID := stringField(fm, "id")
-
-	var createdAt time.Time
+	var created time.Time
 	switch v := fm["created"].(type) {
 	case time.Time:
-		createdAt = v.UTC()
+		created = v.UTC()
 	case string:
-		t, parseErr := time.Parse(time.RFC3339, v)
-		if parseErr != nil {
-			return fmt.Errorf("spore: verify: parse created field: %w", parseErr)
+		var err error
+		created, err = time.Parse(time.RFC3339, v)
+		if err != nil {
+			return nil, fmt.Errorf("spore: parse created: %w", err)
 		}
-		createdAt = t.UTC()
 	default:
-		return fmt.Errorf("spore: verify: created field missing or invalid type %T", fm["created"])
+		return nil, fmt.Errorf("spore: created field missing or invalid")
 	}
+	payload := buildCanonicalPayload(agentID, stringField(fm, "id"), created, bodyHashHex, fmHashHex)
+	if fmHashHex == "" {
+		payload = payload[:len(payload)-1]
+	} // v0 has four fields, each ending in a newline.
+	return payload, nil
+}
 
-	// Build canonical payload.
-	payload := buildCanonicalPayload(agentID, sporeID, createdAt, bodyHashHex, currentFmSubstanceHashHex)
-
-	// Decode signature value.
-	const ed25519Prefix = "ed25519:"
-	if !strings.HasPrefix(sig.Value, ed25519Prefix) {
-		return fmt.Errorf("spore: signature value missing ed25519: prefix")
+func resolveSigner(resolve IdentityResolver, uri string) (identity.Identity, error) {
+	if resolve == nil {
+		return identity.Identity{}, fmt.Errorf("spore: identity resolver required")
 	}
-	sigBytes, err := base64.StdEncoding.DecodeString(sig.Value[len(ed25519Prefix):])
+	id, err := resolve(uri)
 	if err != nil {
-		return fmt.Errorf("spore: decode signature value: %w", err)
+		return id, fmt.Errorf("spore: unknown signer %q: %w", uri, err)
 	}
-
-	// Verify the signature.
-	if !identity.Verify(id, payload, sigBytes) {
-		return fmt.Errorf("spore: signature verification failed")
+	if id.ID != uri {
+		return id, fmt.Errorf("spore: signer URI mismatch: requested %q, resolved %q", uri, id.ID)
 	}
-
-	return nil
+	return id, nil
 }
 
 // buildCanonicalPayload assembles the deterministic byte payload over which the
@@ -293,6 +238,8 @@ func parseSignatureBlock(raw any) (Signature, error) {
 	version := 1 // An omitted version identifies a legacy signature.
 	if rawVersion, present := m["version"]; present {
 		switch fmt.Sprint(rawVersion) {
+		case "0":
+			version = 0
 		case "1":
 			version = 1
 		case "2":

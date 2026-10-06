@@ -20,6 +20,7 @@ import (
 	"encoding/base64"
 	"errors"
 	"fmt"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -153,6 +154,27 @@ func Load(dir, name string) (Identity, error) {
 	}
 
 	return identityFromFrontmatter(fm, mdPath)
+}
+
+// Resolve loads a public identity and binds the entire requested URI to its record.
+// It accepts exactly identity://authority/name, without extra path components.
+func Resolve(dir, uri string) (Identity, error) {
+	u, err := url.Parse(uri)
+	if err != nil || u.Scheme != "identity" || u.Host == "" || u.User != nil || u.RawQuery != "" || u.Fragment != "" || u.Opaque != "" {
+		return Identity{}, fmt.Errorf("identity: invalid identity URI %q", uri)
+	}
+	name := strings.TrimPrefix(u.Path, "/")
+	if name == "" || name == "." || name == ".." || strings.ContainsAny(name, "/\\") || u.RawPath != "" {
+		return Identity{}, fmt.Errorf("identity: invalid identity URI %q", uri)
+	}
+	id, err := Load(dir, name)
+	if err != nil {
+		return id, err
+	}
+	if id.ID != uri {
+		return id, fmt.Errorf("identity: URI mismatch: requested %q, resolved %q", uri, id.ID)
+	}
+	return id, nil
 }
 
 // LoadPrivate reads the private key sidecar for <name>. Refuses to load if

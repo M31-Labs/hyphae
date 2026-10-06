@@ -13,6 +13,7 @@ import (
 
 	"github.com/google/uuid"
 	"gopkg.in/yaml.v3"
+	"m31labs.dev/hyphae/internal/atomicfs"
 	"m31labs.dev/hyphae/internal/envelope"
 	"m31labs.dev/hyphae/internal/spore"
 )
@@ -23,8 +24,9 @@ const sporeUsage = `Usage: hypha spore <command> [options]
   submit   Validate and submit a file, optionally signing it
   amend    Replace an unreviewed spore, optionally signing it again
   verify   Check a file or installed spore's signature (read-only)
+  audit    Summarize signatures and list invalid proposals (read-only)
   list     List inbox spores with space, status, and time filters
-  accept   Mark an unreviewed spore accepted for grafting
+  accept   Record acceptance without applying proposals
   reject   Mark an unreviewed spore rejected
   reopen   Return a partial or rejected spore to unreviewed
   lint     Validate a file and preview whether its writes can apply
@@ -34,6 +36,7 @@ Use hypha spore <command> --help for usage and flags.
 
 var sporeCommandUsage = map[string]string{
 	"new":    "--space <uri> --kind decision|report|spec [--title <title>] [--out <file>]",
+	"audit":  "[--space <uri>] [--format text|json]",
 	"verify": "<file|spore-id> [--space <uri>] [--format text|json]",
 	"submit": "<file> [--sign --as <identity-uri>] [--format text|json|jsonline|compact]",
 	"amend":  "<file> [--sign --as <identity-uri>] [--format text|json|jsonline|compact]",
@@ -151,14 +154,8 @@ func cmdSporeNew(args []string) error {
 	if *out == "" {
 		*out = id + ".md"
 	}
-	f, err := os.OpenFile(*out, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o644)
-	if err != nil {
+	if err := atomicfs.CreateFile(*out, content, 0o644); err != nil {
 		return fmt.Errorf("spore new: create file: %w", err)
-	}
-	_, writeErr := f.Write(content)
-	closeErr := f.Close()
-	if err := errors.Join(writeErr, closeErr); err != nil {
-		return err
 	}
 	return emit("spore new", map[string]any{"spore_id": id, "file_path": *out, "kind": *kind}, *format, func(w io.Writer, _ any) error {
 		fmt.Fprintf(w, "Created: %s\nNext: edit the proposal, then hypha spore submit %s\n", *out, *out)
@@ -201,6 +198,9 @@ func cmdSporeVerify(args []string) error {
 		}
 		if len(report.Changed) > 0 {
 			fmt.Fprintf(w, "  Changed: %s (compared with recorded hashes)\n", strings.Join(report.Changed, ", "))
+		}
+		if len(report.ProposalMismatch) > 0 {
+			fmt.Fprintf(w, "  Proposal mismatch: %s (unverified)\n", strings.Join(report.ProposalMismatch, ", "))
 		}
 		if report.Note != "" {
 			fmt.Fprintf(w, "  %s\n", report.Note)
@@ -266,4 +266,45 @@ func resolveVerificationSpore(root, id, space string) (string, error) {
 		return "", fmt.Errorf("spore verify: found %d files for %q; pass a file path or --space to disambiguate", len(matches), id)
 	}
 	return matches[0], nil
+}
+
+func cmdSporeAudit(args []string) error {
+	fs := sporeFlagSet("audit")
+	space := fs.String("space", "", "space URI to audit (default: all installed spaces)")
+	format := formatFlag(fs)
+	if err := parseCommandFlags(fs, args); err != nil {
+		return err
+	}
+	if fs.NArg() != 0 {
+		return errors.New("usage: hypha spore audit [--space <uri>] [--format text|json]")
+	}
+	root, err := resolveRoot("")
+	if err != nil {
+		return err
+	}
+	dir := filepath.Join(root, "spaces")
+	if *space != "" {
+		dir, err = spaceURIToPath(root, *space)
+		if err != nil {
+			return err
+		}
+	}
+	report, err := spore.Audit(dir, identityResolver(root))
+	if err != nil {
+		return err
+	}
+	return emit("spore audit", report, *format, func(w io.Writer, _ any) error {
+		c := report.Counts
+		fmt.Fprintf(w, "Audited %d spores\nVALID: %d (v2: %d, v1: %d)\nv0-legacy: %d\nINVALID: %d\nUNSIGNED: %d\nProposal mismatch: %d (included in INVALID)\n", c.Total, c.Valid, c.V2, c.V1, c.V0Legacy, c.Invalid, c.Unsigned, c.ProposalMismatch)
+		for _, issue := range report.Cases {
+			fmt.Fprintf(w, "\nINVALID %s\n  %s\n", issue.File, issue.Error)
+			if len(issue.ProposalMismatch) > 0 {
+				fmt.Fprintf(w, "  Proposal mismatch: %s (unverified)\n", strings.Join(issue.ProposalMismatch, ", "))
+			}
+			if issue.Note != "" {
+				fmt.Fprintf(w, "  %s\n", issue.Note)
+			}
+		}
+		return nil
+	})
 }

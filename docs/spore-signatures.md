@@ -10,14 +10,16 @@ hypha spore verify proposal.md --format text
 hypha spore verify spore.2026-10-05.example.proposal --format json
 ```
 
-Verification reads the document and the signer's public identity record. It
-uses no private key and does not write to the space or index. An id lookup
+Verification reads the document and the signer's public identity record. The
+entire requested identity URI (authority and name) must match that record;
+`signer` reports the resolved record's canonical URI. Verification uses no private key and does not write to the space or index. An id lookup
 searches inboxes and accepted documents; use `--space` or a file path to resolve
 ambiguous ids. File verification also works for a spore outside an installed
 space.
 
-Text results begin with `VALID`, `INVALID`, or `UNSIGNED`. Valid signatures exit
-with code 0; invalid and unsigned documents exit with code 1. JSON uses the
+Text results begin with `VALID`, `V0_LEGACY`, `INVALID`, or `UNSIGNED`. Valid
+signatures exit with code 0; legacy, invalid, and unsigned documents exit with
+code 1. JSON uses the
 standard envelope: `ok` is true only for `VALID`, and `data` contains `status`,
 `signer`, `version`, `covered_fields`, `excluded_fields`, the recomputed hashes,
 and `recorded` signature metadata. `changed` compares body and frontmatter
@@ -27,7 +29,7 @@ signatures, and unsupported versions produce `INVALID` with a diagnostic.
 
 ## What is covered
 
-Both versions cover the author agent id, spore id, creation time, authored
+V1 and v2 cover the author agent id, spore id, creation time, authored
 markdown body, and all frontmatter substance, including proposals and source
 references. Only these parts are excluded:
 
@@ -118,3 +120,41 @@ V1 stores no separate frontmatter digest, so a signature failure with a matching
 body hash cannot distinguish a frontmatter change from a changed signature.
 Existing v1 spores need no migration. Signing a new proposal or explicitly
 re-signing an amended proposal writes v2.
+
+## Legacy v0
+
+Before frontmatter hashing was introduced, the payload had four newline-separated
+fields: agent id, spore id, UTC RFC3339 creation time, and body hash hex, followed
+by a final newline. These blocks usually have no version. The verifier identifies
+the format by checking the cryptographic payload, rather than trusting a date or
+version label. It reports a distinct result:
+
+```text
+V0_LEGACY
+  Signature version: 0
+  v0 legacy: covers body only; frontmatter and proposals NOT covered
+```
+
+This authenticates the authored body and those three identifying fields. It
+provides no evidence for proposals, source references, confidence, or other
+frontmatter. It never passes full `Verify`; callers receive `ErrLegacyUnverified`.
+The CLI exits 1 and JSON has `ok: false`, with the limited scope in `data`.
+
+Graft checks every signature-bearing spore. A v0 preview emits a warning; applying
+its proposals requires `--allow-legacy-proposals`, including when `--verify` is
+set. This flag allows reviewed v0 proposals only; INVALID signatures are refused.
+Unsigned spores remain graftable unless `--verify` requires a signature.
+
+```bash
+hypha graft <legacy-spore-id> --as identity://example/reviewer --dry-run --diff
+# Review the proposals before explicitly allowing their application:
+hypha graft <legacy-spore-id> --as identity://example/reviewer --allow-legacy-proposals
+```
+
+Use `hypha spore audit [--space <uri>] [--format text|json]` to count all formats
+and list invalid files and proposal mismatches. If a v1 signature matches only
+with `proposed_writes`, `proposed_edges`, or both omitted, the current file remains
+INVALID and those fields are reported as unverified. This identifies a matching
+preimage, not the time or cause of the change. The audit never re-signs or edits
+records. Preserve historical files; review their provenance before deciding
+whether to create a new, signed proposal.

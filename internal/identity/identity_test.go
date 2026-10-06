@@ -190,3 +190,23 @@ func TestList(t *testing.T) {
 		t.Fatalf("List: expected %d identities, got %d", len(names), len(ids))
 	}
 }
+
+func TestResolveRequiresFullURI(t *testing.T) {
+	dir := t.TempDir()
+	id, priv, err := identity.Generate("example", "reviewer", "hypha://example/knowledge")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := identity.Save(dir, id, priv); err != nil {
+		t.Fatal(err)
+	}
+	resolved, err := identity.Resolve(dir, id.ID)
+	if err != nil || resolved.ID != id.ID {
+		t.Fatalf("%+v %v", resolved, err)
+	}
+	for _, uri := range []string{"identity://trusted/reviewer", "identity:///reviewer", "identity://example/../reviewer", "identity://example/reviewer?key=other", "identity://example/reviewer#key", "identity://example/%72eviewer", "identity://example/reviewer/child"} {
+		if _, err := identity.Resolve(dir, uri); err == nil {
+			t.Fatalf("resolved invalid or mismatched URI: %s", uri)
+		}
+	}
+}

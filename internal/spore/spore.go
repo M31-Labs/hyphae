@@ -474,30 +474,9 @@ func Amend(source []byte, spaceRoot string) (filePath string, r types.Receipt, e
 	return filePath, r, nil
 }
 
-// extractFrontmatterField returns the value of a simple scalar top-level field
-// from a raw mdpp document's frontmatter. Returns "" on miss. Used internally
-// by Amend for lightweight status / id checks without a full parse round-trip.
 func extractFrontmatterField(data []byte, key string) string {
-	s := string(data)
-	start := strings.Index(s, "\n")
-	if start < 0 {
-		return ""
-	}
-	end := strings.Index(s[start+1:], "\n---")
-	if end < 0 {
-		return ""
-	}
-	block := s[start+1 : start+1+end]
-	prefix := key + ": "
-	for _, line := range strings.Split(block, "\n") {
-		if strings.HasPrefix(line, prefix) {
-			v := strings.TrimPrefix(line, prefix)
-			v = strings.TrimSpace(v)
-			v = strings.Trim(v, `"`)
-			return v
-		}
-	}
-	return ""
+	value, _ := FrontmatterString(data, key)
+	return value
 }
 
 // ─── helpers ──────────────────────────────────────────────────────────────────

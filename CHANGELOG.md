@@ -9,6 +9,11 @@ surface can break between minors).
 
 ### Added
 
+- `hypha spore audit [--space]` summarizes signature formats and lists invalid
+  files and unverified proposal mismatches without modifying records.
+- Four-field v0 signatures have a distinct `V0_LEGACY` result. Grafting their
+  proposals warns and requires `--allow-legacy-proposals` for application.
+
 - `hypha spore verify <file|spore-id>` reports signer, version, signed scope,
   hashes, and valid/invalid/unsigned results in text or JSON.
 - `hypha spore new --space <uri> --kind decision|report|spec` scaffolds a valid
@@ -26,6 +31,14 @@ surface can break between minors).
   and `sha256:` prefix. Historical receipts retain their original file hashes.
 
 ### Fixed
+
+- Signer resolution matches the full identity URI and reports the resolved
+  record's canonical URI, rejecting authority mismatches.
+- Spore lookup, amendment, and review read YAML scalars; status edits preserve
+  other frontmatter and body bytes.
+- The documented spore workflow grafts before recording acceptance.
+- Scaffold creation publishes a synced file atomically without overwriting an
+  existing destination or leaving partial files after a write failure.
 
 - `hypha show` accepts `--format json|text`; `--json` consistently emits JSON.
 - Spore group and subcommand help print usage and flags with successful exit codes.
