@@ -173,7 +173,12 @@ func TestPageHasSingleDoctype(t *testing.T) {
 // min is a local helper because the package targets Go where the builtin min
 // is available, but the receiver context for body slicing needs a guard
 // against short bodies.
-func min(a, b int) int { if a < b { return a }; return b }
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
+}
 
 // TestEngineSurfaceRuntimeServed verifies that the //gosx:engine surface
 // runtime assets are wired into the app, closing defect 1 from

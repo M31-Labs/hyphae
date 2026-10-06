@@ -20,6 +20,7 @@ import (
 	"encoding/base64"
 	"errors"
 	"fmt"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -30,12 +31,12 @@ import (
 
 // Identity is the public-facing record. Matches the .md frontmatter shape.
 type Identity struct {
-	ID        string     // "identity://<authority>/<name>" or "agent://..." etc.
-	Kind      string     // "human" | "agent" | "ci" | "service"
-	Space     string     // owning space, e.g. "hypha://m31labs/hyphae"
-	Status    string     // "active" | "rotated" | "revoked"
-	KeyAlg    string     // "ed25519"
-	PublicKey string     // "ed25519:base64:<32 bytes base64-std>"
+	ID        string // "identity://<authority>/<name>" or "agent://..." etc.
+	Kind      string // "human" | "agent" | "ci" | "service"
+	Space     string // owning space, e.g. "hypha://m31labs/hyphae"
+	Status    string // "active" | "rotated" | "revoked"
+	KeyAlg    string // "ed25519"
+	PublicKey string // "ed25519:base64:<32 bytes base64-std>"
 	CreatedAt time.Time
 	ExpiresAt *time.Time
 	Succeeds  string // optional: previous identity id this rotates
@@ -153,6 +154,27 @@ func Load(dir, name string) (Identity, error) {
 	}
 
 	return identityFromFrontmatter(fm, mdPath)
+}
+
+// Resolve loads a public identity and binds the entire requested URI to its record.
+// It accepts exactly identity://authority/name, without extra path components.
+func Resolve(dir, uri string) (Identity, error) {
+	u, err := url.Parse(uri)
+	if err != nil || u.Scheme != "identity" || u.Host == "" || u.User != nil || u.RawQuery != "" || u.Fragment != "" || u.Opaque != "" {
+		return Identity{}, fmt.Errorf("identity: invalid identity URI %q", uri)
+	}
+	name := strings.TrimPrefix(u.Path, "/")
+	if name == "" || name == "." || name == ".." || strings.ContainsAny(name, "/\\") || u.RawPath != "" {
+		return Identity{}, fmt.Errorf("identity: invalid identity URI %q", uri)
+	}
+	id, err := Load(dir, name)
+	if err != nil {
+		return id, err
+	}
+	if id.ID != uri {
+		return id, fmt.Errorf("identity: URI mismatch: requested %q, resolved %q", uri, id.ID)
+	}
+	return id, nil
 }
 
 // LoadPrivate reads the private key sidecar for <name>. Refuses to load if
@@ -286,7 +308,7 @@ func authorityFromID(id string) string {
 // The "id" field in frontmatter is the slug form "identity.<name>"; we
 // reconstruct the full URI using the "authority" field also written by Save.
 func identityFromFrontmatter(fm map[string]any, filePath string) (Identity, error) {
-	slug, _ := fm["id"].(string)   // e.g. "identity.odvcencio"
+	slug, _ := fm["id"].(string) // e.g. "identity.example"
 	authority, _ := fm["authority"].(string)
 
 	// Reconstruct the full URI from slug + authority.
@@ -379,4 +401,3 @@ func decodePublicKey(encoded string) (ed25519.PublicKey, error) {
 	}
 	return ed25519.PublicKey(keyBytes), nil
 }
-

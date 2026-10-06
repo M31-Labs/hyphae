@@ -365,6 +365,9 @@ func doSporeSubmit(installRoot, path string, sign bool, signer string) (any, err
 			return nil, errors.New("sign=true requires `as`")
 		}
 		identDir := filepath.Join(installRoot, ".catalog", "identities")
+		if _, err := identity.Resolve(identDir, signer); err != nil {
+			return nil, err
+		}
 		name := identityNameFromURI(signer)
 		if name == "" {
 			return nil, fmt.Errorf("not a valid identity URI: %q", signer)
@@ -433,7 +436,10 @@ func doSporeReview(installRoot, sporeID, reviewer, reason, spaceFlag, newStatus 
 	if cur != "unreviewed" {
 		return nil, fmt.Errorf("status is %q (only unreviewed spores can be reviewed)", cur)
 	}
-	updated := writeFrontmatterField(data, "status", newStatus)
+	updated, err := spore.SetFrontmatterString(data, "status", newStatus)
+	if err != nil {
+		return nil, err
+	}
 	if err := atomicfs.WriteFile(sporePath, updated, 0o644); err != nil {
 		return nil, fmt.Errorf("write %s: %w", sporePath, err)
 	}
@@ -486,22 +492,10 @@ func doGraft(conn *sql.DB, installRoot, sporeID, grafter, spaceURI string, apply
 			return nil, err
 		}
 	}
-	if verify {
-		sporePath, err := findSporeFilePath(spaceRoot, sporeID)
-		if err != nil {
-			return nil, err
-		}
-		bts, err := os.ReadFile(sporePath)
-		if err != nil {
-			return nil, err
-		}
-		if err := spore.Verify(bts, identityResolver(installRoot)); err != nil {
-			return nil, fmt.Errorf("verify failed: %w", err)
-		}
-	}
 
 	res, err := graft.ApplyWithOpts(conn, installRoot, spaceRoot, sporeID, grafter, graft.ApplyOpts{
-		DryRun: !apply,
+		DryRun:          !apply,
+		RequireVerified: verify,
 	})
 	if err != nil {
 		return nil, err
@@ -825,23 +819,11 @@ func identityNameFromURI(uri string) string {
 	return rest[slash+1:]
 }
 
-func identityResolver(installRoot string) spore.IdentityResolver {
-	dir := filepath.Join(installRoot, ".catalog", "identities")
-	return func(uri string) (identity.Identity, error) {
-		name := identityNameFromURI(uri)
-		if name == "" {
-			return identity.Identity{}, fmt.Errorf("not a recognized identity URI: %q", uri)
-		}
-		return identity.Load(dir, name)
-	}
-}
-
 func findSporeSpaceRoot(installRoot, sporeID string) (string, error) {
 	spaces, err := listSpaces(installRoot)
 	if err != nil {
 		return "", err
 	}
-	needle := []byte("id: " + sporeID)
 	for _, s := range spaces {
 		inbox := filepath.Join(s.Path, "inbox", "agents")
 		entries, _ := os.ReadDir(inbox)
@@ -850,7 +832,7 @@ func findSporeSpaceRoot(installRoot, sporeID string) (string, error) {
 				continue
 			}
 			data, _ := os.ReadFile(filepath.Join(inbox, e.Name()))
-			if bytesContains(data, needle) {
+			if id, ok := spore.FrontmatterString(data, "id"); ok && id == sporeID {
 				return s.Path, nil
 			}
 		}
@@ -864,72 +846,21 @@ func findSporeFilePath(spaceRoot, sporeID string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	needle := []byte("id: " + sporeID)
 	for _, e := range entries {
 		if e.IsDir() || !strings.HasSuffix(e.Name(), ".md") {
 			continue
 		}
 		p := filepath.Join(inbox, e.Name())
 		data, _ := os.ReadFile(p)
-		if bytesContains(data, needle) {
+		if id, ok := spore.FrontmatterString(data, "id"); ok && id == sporeID {
 			return p, nil
 		}
 	}
 	return "", fmt.Errorf("spore %q not found under %s", sporeID, inbox)
 }
 
-func bytesContains(haystack, needle []byte) bool {
-	return strings.Contains(string(haystack), string(needle))
-}
-
 func readFrontmatterField(data []byte, key string) (string, bool) {
-	s := string(data)
-	if !strings.HasPrefix(s, "---\n") {
-		return "", false
-	}
-	rest := s[4:]
-	end := strings.Index(rest, "\n---\n")
-	if end < 0 {
-		return "", false
-	}
-	fm := rest[:end]
-	prefix := key + ":"
-	for _, line := range strings.Split(fm, "\n") {
-		t := strings.TrimSpace(line)
-		if strings.HasPrefix(t, prefix) {
-			return strings.TrimSpace(strings.TrimPrefix(t, prefix)), true
-		}
-	}
-	return "", false
-}
-
-func writeFrontmatterField(data []byte, key, newValue string) []byte {
-	s := string(data)
-	if !strings.HasPrefix(s, "---\n") {
-		return data
-	}
-	rest := s[4:]
-	end := strings.Index(rest, "\n---\n")
-	if end < 0 {
-		return data
-	}
-	fm := rest[:end]
-	body := rest[end:]
-	prefix := key + ":"
-	lines := strings.Split(fm, "\n")
-	updated := false
-	for i, line := range lines {
-		t := strings.TrimSpace(line)
-		if strings.HasPrefix(t, prefix) {
-			lines[i] = key + ": " + newValue
-			updated = true
-			break
-		}
-	}
-	if !updated {
-		lines = append(lines, key+": "+newValue)
-	}
-	return []byte("---\n" + strings.Join(lines, "\n") + body)
+	return spore.FrontmatterString(data, key)
 }
 
 func shortHash(b []byte) string {

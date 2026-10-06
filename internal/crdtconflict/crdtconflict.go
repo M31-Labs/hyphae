@@ -40,8 +40,8 @@ type Entry struct {
 type Conflict struct {
 	ID      string  `json:"id"` // stable id = sha256-prefix of the key
 	Key     string  `json:"key"`
-	Prefix  string  `json:"prefix,omitempty"`  // parsed flat-key prefix when recognizable
-	Tail    string  `json:"tail,omitempty"`    // parsed rest of the key
+	Prefix  string  `json:"prefix,omitempty"` // parsed flat-key prefix when recognizable
+	Tail    string  `json:"tail,omitempty"`   // parsed rest of the key
 	Entries []Entry `json:"entries"`
 }
 

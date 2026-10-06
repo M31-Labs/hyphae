@@ -23,6 +23,8 @@ import (
 	"github.com/google/uuid"
 	"gopkg.in/yaml.v3"
 	"m31labs.dev/hyphae/internal/atomicfs"
+	"m31labs.dev/hyphae/internal/identity"
+	spores "m31labs.dev/hyphae/internal/spore"
 	"m31labs.dev/hyphae/internal/types"
 	"m31labs.dev/mdpp"
 )
@@ -36,7 +38,9 @@ var errAnchorNotFound = errors.New("anchor not found in target file")
 // execute (handlers run, byte-deltas are produced) but no canonical files,
 // spore status updates, or edges are persisted.
 type ApplyOpts struct {
-	DryRun bool
+	DryRun               bool
+	RequireVerified      bool
+	AllowLegacyProposals bool
 }
 
 // FileDelta captures one canonical-file change that a graft proposed.
@@ -70,6 +74,7 @@ type Result struct {
 	Deltas         []FileDelta // per-file before/after bytes (populated in both real and dry-run modes)
 	Receipt        types.Receipt
 	DryRun         bool
+	Warnings       []string `json:"warnings,omitempty"`
 }
 
 // AppliedWrite records where a proposed write landed.
@@ -106,8 +111,8 @@ var unsupportedWriteKinds = map[string]bool{}
 // write loudly rather than silently corrupting the document.
 type applyContext struct {
 	dryRun        bool
-	rollback      map[string][]byte      // path → original bytes (nil for new files)
-	pending       map[string][]byte      // path → latest in-memory bytes after prior writes
+	rollback      map[string][]byte       // path → original bytes (nil for new files)
+	pending       map[string][]byte       // path → latest in-memory bytes after prior writes
 	writtenRanges map[string][]mdpp.Range // path → ranges claimed by prior writes
 	deltas        []FileDelta
 }
@@ -216,6 +221,21 @@ func ApplyWithOpts(conn *sql.DB, installRoot, spaceRoot, sporeID, grafter string
 	}
 	if spore.Status != "unreviewed" {
 		return Result{}, fmt.Errorf("graft: spore %q has status %q; only 'unreviewed' spores can be grafted", sporeID, spore.Status)
+	}
+
+	var warnings []string
+	if spores.HasSignature(sporeBytes) || opts.RequireVerified {
+		report, verifyErr := spores.VerifyDetailed(sporeBytes, func(uri string) (identity.Identity, error) {
+			return identity.Resolve(filepath.Join(installRoot, ".catalog", "identities"), uri)
+		})
+		if errors.Is(verifyErr, spores.ErrLegacyUnverified) {
+			warnings = append(warnings, report.Note)
+			if (len(spore.ProposedWrites) > 0 || len(spore.ProposedEdges) > 0) && !opts.DryRun && !opts.AllowLegacyProposals {
+				return Result{}, fmt.Errorf("graft: %s; review proposals and use --allow-legacy-proposals to apply", report.Note)
+			}
+		} else if verifyErr != nil {
+			return Result{}, fmt.Errorf("graft: verify failed: %w", verifyErr)
+		}
 	}
 
 	now := time.Now().UTC()
@@ -386,6 +406,7 @@ func ApplyWithOpts(conn *sql.DB, installRoot, spaceRoot, sporeID, grafter string
 	return Result{
 		SporeID:        sporeID,
 		NewSporeStatus: newStatus,
+		Warnings:       warnings,
 		AppliedWrites:  appliedWrites,
 		SkippedWrites:  skippedWrites,
 		AppliedEdges:   appliedEdges,
@@ -1123,44 +1144,8 @@ func spliceBytes(src []byte, offset int, insertText string) []byte {
 	return result
 }
 
-// statusLineRe matches a status: line anywhere in frontmatter.
-// We constrain the replacement to within the frontmatter byte range.
-var statusLineRe = regexp.MustCompile(`(?m)^(status:\s*)\S+(\s*)$`)
-
-// updateSporeStatus rewrites the status: field in the spore's frontmatter.
-// It locates the NodeFrontmatter range, applies the regex only within that
-// slice, and splices it back.
 func updateSporeStatus(src []byte, newStatus string) ([]byte, error) {
-	doc, err := mdpp.Parse(src)
-	if err != nil {
-		return nil, fmt.Errorf("mdpp.Parse spore: %w", err)
-	}
-
-	// Find frontmatter byte range.
-	fmStart, fmEnd := 0, 0
-	for _, child := range doc.AST().Children {
-		if child.Type == mdpp.NodeFrontmatter {
-			fmStart = child.Range.StartByte
-			fmEnd = child.Range.EndByte
-			break
-		}
-	}
-	if fmEnd == 0 {
-		return nil, fmt.Errorf("no frontmatter node found in spore")
-	}
-
-	fmSlice := src[fmStart:fmEnd]
-	newFM := statusLineRe.ReplaceAll(fmSlice, []byte("${1}"+newStatus+"${2}"))
-	if string(newFM) == string(fmSlice) {
-		return nil, fmt.Errorf("status: line not found in frontmatter")
-	}
-
-	// Splice updated frontmatter back.
-	result := make([]byte, 0, len(src)+len(newFM)-len(fmSlice))
-	result = append(result, src[:fmStart]...)
-	result = append(result, newFM...)
-	result = append(result, src[fmEnd:]...)
-	return result, nil
+	return spores.SetFrontmatterString(src, "status", newStatus)
 }
 
 // computeStatus derives the new spore status from write counts.

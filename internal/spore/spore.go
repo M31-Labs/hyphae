@@ -2,12 +2,11 @@
 //
 // A spore is a portable, source-grounded knowledge contribution submitted by
 // an ephemeral agent. This package handles v0.1 parse, validate, and write;
-// signing (Ed25519) and graph-index integration are deferred to v0.1.1.
+// signing uses Ed25519 with versioned canonical payloads.
 package spore
 
 import (
 	"bytes"
-	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -44,7 +43,11 @@ type ValidationError struct {
 }
 
 func (e ValidationError) Error() string {
-	return fmt.Sprintf("spore validation error: field %q: %s", e.Field, e.Message)
+	message := fmt.Sprintf("spore validation error: field %q: %s", e.Field, e.Message)
+	if strings.HasPrefix(e.Field, "proposed_writes") {
+		message += "; expected a list of mappings with kind and sibling fields; example: proposed_writes: [{kind: create_file, path: reports/example.md, body: \"# Example\\n\"}]"
+	}
+	return message
 }
 
 // tokenCap is the hard limit on estimated body tokens.
@@ -310,14 +313,15 @@ func Submit(s types.Spore, spaceRoot string) (filePath string, r types.Receipt, 
 	// Reconstruct document bytes (frontmatter + body).
 	fileBytes := reconstructSource(s)
 
+	contentHash, hashErr := ContentHash(fileBytes)
+	if hashErr != nil {
+		return "", types.Receipt{}, hashErr
+	}
+
 	// Write file.
 	if writeErr := atomicfs.WriteFile(filePath, fileBytes, 0o644); writeErr != nil {
 		return "", types.Receipt{}, fmt.Errorf("failed to write spore file: %w", writeErr)
 	}
-
-	// Compute content hash.
-	hash := sha256.Sum256(fileBytes)
-	contentHash := fmt.Sprintf("%x", hash[:])
 
 	// Build receipt.
 	shortID := sporeShortID(s.ID)
@@ -369,12 +373,13 @@ func SubmitBytes(source []byte, spaceRoot string) (filePath string, r types.Rece
 	if _, statErr := os.Stat(filePath); statErr == nil {
 		return "", types.Receipt{}, fmt.Errorf("%w: %s", ErrDuplicate, filePath)
 	}
+	contentHash, hashErr := ContentHash(source)
+	if hashErr != nil {
+		return "", types.Receipt{}, hashErr
+	}
 	if writeErr := atomicfs.WriteFile(filePath, source, 0o644); writeErr != nil {
 		return "", types.Receipt{}, fmt.Errorf("failed to write spore file: %w", writeErr)
 	}
-
-	hash := sha256.Sum256(source)
-	contentHash := fmt.Sprintf("%x", hash[:])
 
 	shortID := sporeShortID(s.ID)
 	dateStr := s.SubmittedAt.Format("2006-01-02")
@@ -442,12 +447,13 @@ func Amend(source []byte, spaceRoot string) (filePath string, r types.Receipt, e
 		return "", types.Receipt{}, fmt.Errorf("spore amend: id mismatch: existing file has id %q, source has %q", existingID, s.ID)
 	}
 
+	contentHash, hashErr := ContentHash(source)
+	if hashErr != nil {
+		return "", types.Receipt{}, hashErr
+	}
 	if writeErr := atomicfs.WriteFile(filePath, source, 0o644); writeErr != nil {
 		return "", types.Receipt{}, fmt.Errorf("spore amend: write: %w", writeErr)
 	}
-
-	hash := sha256.Sum256(source)
-	contentHash := fmt.Sprintf("%x", hash[:])
 
 	shortID := sporeShortID(s.ID)
 	dateStr := s.SubmittedAt.Format("2006-01-02")
@@ -468,30 +474,9 @@ func Amend(source []byte, spaceRoot string) (filePath string, r types.Receipt, e
 	return filePath, r, nil
 }
 
-// extractFrontmatterField returns the value of a simple scalar top-level field
-// from a raw mdpp document's frontmatter. Returns "" on miss. Used internally
-// by Amend for lightweight status / id checks without a full parse round-trip.
 func extractFrontmatterField(data []byte, key string) string {
-	s := string(data)
-	start := strings.Index(s, "\n")
-	if start < 0 {
-		return ""
-	}
-	end := strings.Index(s[start+1:], "\n---")
-	if end < 0 {
-		return ""
-	}
-	block := s[start+1 : start+1+end]
-	prefix := key + ": "
-	for _, line := range strings.Split(block, "\n") {
-		if strings.HasPrefix(line, prefix) {
-			v := strings.TrimPrefix(line, prefix)
-			v = strings.TrimSpace(v)
-			v = strings.Trim(v, `"`)
-			return v
-		}
-	}
-	return ""
+	value, _ := FrontmatterString(data, key)
+	return value
 }
 
 // ─── helpers ──────────────────────────────────────────────────────────────────

@@ -26,7 +26,7 @@ func DefaultIndexPath() (string, error) {
 // Reader is a read-only view over the Hyphae SQLite index.
 // Obtain one with OpenIndex. Call Close when done.
 type Reader struct {
-	conn     *sql.DB
+	conn       *sql.DB
 	hyphaeRoot string // absolute path to the hyphae install root (e.g. ~/.hyphae)
 }
 

@@ -348,11 +348,11 @@ type ReapReport struct {
 // ReapedItem records one open trace that was force-closed because its
 // LastTick exceeded the staleness threshold.
 type ReapedItem struct {
-	ID           string    `json:"id"`
-	AgentID      string    `json:"agent"`
-	LastTick     time.Time `json:"last_tick"`
-	StaleFor     string    `json:"stale_for"` // human-readable duration since last tick
-	Path         string    `json:"path"`
+	ID       string    `json:"id"`
+	AgentID  string    `json:"agent"`
+	LastTick time.Time `json:"last_tick"`
+	StaleFor string    `json:"stale_for"` // human-readable duration since last tick
+	Path     string    `json:"path"`
 }
 
 // Reap walks spaceRoot/.trace and force-closes every open trace whose

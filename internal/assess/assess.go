@@ -46,9 +46,9 @@ const (
 type Recommendation string
 
 const (
-	RecProceed                  Recommendation = "proceed"
-	RecProceedWithExtraReview   Recommendation = "proceed_with_extra_review"
-	RecReviewRequired           Recommendation = "review_required"
+	RecProceed                Recommendation = "proceed"
+	RecProceedWithExtraReview Recommendation = "proceed_with_extra_review"
+	RecReviewRequired         Recommendation = "review_required"
 )
 
 // ChangeRequest is the input to a change:assess call. Mirrors the JSON shape
@@ -84,9 +84,9 @@ type MatchedInitiative struct {
 // HotZone reports recent activity in the directory tree the changed files
 // share, when one can be inferred.
 type HotZone struct {
-	Path        string `json:"path"`
-	Commits14d  int    `json:"commits_14d"`
-	Incidents14d int   `json:"incidents_14d"`
+	Path         string `json:"path"`
+	Commits14d   int    `json:"commits_14d"`
+	Incidents14d int    `json:"incidents_14d"`
 
 	// Optional canopy-derived enrichment. Populated when a fresh impact
 	// analysis is cached for any of req.ChangedFiles and req.SpaceRoot is
@@ -117,15 +117,15 @@ const defaultWindow = 30 * 24 * time.Hour
 // Change runs the MVP scorer against conn and returns a Result.
 //
 // The scoring composition:
-//   1. Build a query string from req.Task + req.DiffSummary + path tokens of
-//      req.ChangedFiles.
-//   2. Run a typed FTS5 query over active initiatives (objects_fts where
-//      type='initiative' and the object is in an active status). Take top 5.
-//   3. Normalize BM25 ranks to [0,1] scores (lower BM25 → higher score).
-//   4. Compute pulse over the window and surface RecentPressure anchors.
-//   5. Derive a path-prefix hot zone from req.ChangedFiles and count
-//      graft receipts within 14d that touched it.
-//   6. Rule-based alignment + recommendation from top match score.
+//  1. Build a query string from req.Task + req.DiffSummary + path tokens of
+//     req.ChangedFiles.
+//  2. Run a typed FTS5 query over active initiatives (objects_fts where
+//     type='initiative' and the object is in an active status). Take top 5.
+//  3. Normalize BM25 ranks to [0,1] scores (lower BM25 → higher score).
+//  4. Compute pulse over the window and surface RecentPressure anchors.
+//  5. Derive a path-prefix hot zone from req.ChangedFiles and count
+//     graft receipts within 14d that touched it.
+//  6. Rule-based alignment + recommendation from top match score.
 func Change(conn *sql.DB, req ChangeRequest) (Result, error) {
 	if strings.TrimSpace(req.Task) == "" &&
 		strings.TrimSpace(req.DiffSummary) == "" &&

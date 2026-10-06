@@ -26,7 +26,7 @@ const defaultWindow = 30 * 24 * time.Hour
 // Pulse is the v0.1.3 time-windowed signal aggregation result.
 type Pulse struct {
 	Space       string    `json:"space"`
-	Window      string    `json:"window"`        // human form, e.g. "30d"
+	Window      string    `json:"window"` // human form, e.g. "30d"
 	WindowStart time.Time `json:"window_start"`
 	ComputedAt  time.Time `json:"computed_at"`
 

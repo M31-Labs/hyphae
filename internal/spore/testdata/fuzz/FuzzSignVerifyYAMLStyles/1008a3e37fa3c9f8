@@ -1,0 +1,4 @@
+go test fuzz v1
+string("\n\n")
+byte('\u0083')
+byte('\x01')

@@ -76,10 +76,10 @@ func Verify(conn *sql.DB, token string) (*types.Capability, error) {
 		FROM capabilities WHERE id = ?`, token)
 
 	var (
-		c                                  types.Capability
-		permsJSON, limitsJSON              string
-		issuedAt, expiresAt                string
-		revokedAt                          sql.NullString
+		c                     types.Capability
+		permsJSON, limitsJSON string
+		issuedAt, expiresAt   string
+		revokedAt             sql.NullString
 	)
 	if err := row.Scan(&c.ID, &c.Subject, &c.SpaceID, &permsJSON, &limitsJSON,
 		&c.IssuedBy, &issuedAt, &expiresAt, &revokedAt); err != nil {

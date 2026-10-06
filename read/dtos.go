@@ -122,10 +122,10 @@ type Trace struct {
 
 // Pulse is a time-windowed signal aggregation for a space.
 type Pulse struct {
-	Space      string
-	Window     string
+	Space       string
+	Window      string
 	WindowStart time.Time
-	ComputedAt time.Time
+	ComputedAt  time.Time
 
 	TopInitiatives []PulseInitiative
 	HotZones       []PulseHotZone

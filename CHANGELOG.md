@@ -7,6 +7,45 @@ surface can break between minors).
 
 ## Unreleased
 
+### Added
+
+- `hypha spore audit [--space]` summarizes signature formats and lists invalid
+  files and unverified proposal mismatches without modifying records.
+- Four-field v0 signatures have a distinct `V0_LEGACY` result. Grafting their
+  proposals warns and requires `--allow-legacy-proposals` for application.
+
+- `hypha spore verify <file|spore-id>` reports signer, version, signed scope,
+  hashes, and valid/invalid/unsigned results in text or JSON.
+- `hypha spore new --space <uri> --kind decision|report|spec` scaffolds a valid
+  proposal with a canonical document draft and refuses file overwrites.
+- GitHub Actions checks formatting, `go vet ./...`, and `go test ./...` with
+  `GOWORK=off`.
+
+### Changed
+
+- New spore signatures use v2 for clearer coverage: separate body and frontmatter
+  substance hashes, plus one content hash for the entire signed canonical
+  payload. Deterministic semantic YAML-to-JSON encoding replaces signing-time
+  YAML normalization. Legacy v1 verification remains supported.
+- Submit and amend receipt content hashes use the v2 canonical payload digest
+  and `sha256:` prefix. Historical receipts retain their original file hashes.
+
+### Fixed
+
+- Signer resolution matches the full identity URI and reports the resolved
+  record's canonical URI, rejecting authority mismatches.
+- Spore lookup, amendment, and review read YAML scalars; status edits preserve
+  other frontmatter and body bytes.
+- The documented spore workflow grafts before recording acceptance.
+- Scaffold creation publishes a synced file atomically without overwriting an
+  existing destination or leaving partial files after a write failure.
+
+- `hypha show` accepts `--format json|text`; `--json` consistently emits JSON.
+- Spore group and subcommand help print usage and flags with successful exit codes.
+- Spore proposal validation errors explain the mapping shape with an example.
+- Pre-signed spore submissions preserve their source and signatures.
+- Boolean flags before spore files or show ids no longer consume those arguments.
+
 ## [0.1.9] — 2026-06-01
 
 The "measure, don't guess" release: a retrieval-quality eval harness, a major

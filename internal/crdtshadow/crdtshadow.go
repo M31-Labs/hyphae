@@ -355,4 +355,3 @@ func (s *Shadow) persistLocked(_ bool) error {
 	}
 	return nil
 }
-
