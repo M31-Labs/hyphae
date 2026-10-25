@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"errors"
 	"flag"
 	"fmt"
@@ -242,6 +243,7 @@ func resolveVerificationSpore(root, id, space string) (string, error) {
 		}
 	}
 	var matches []string
+	idBytes := []byte(id)
 	err := filepath.WalkDir(dir, func(path string, entry os.DirEntry, err error) error {
 		if err != nil {
 			return err
@@ -252,6 +254,10 @@ func resolveVerificationSpore(root, id, space string) (string, error) {
 		data, err := os.ReadFile(path)
 		if err != nil {
 			return err
+		}
+		// A file can declare the ID only if it contains it, so parse just those.
+		if !bytes.Contains(data, idBytes) {
+			return nil
 		}
 		parsed, _ := spore.Parse(data)
 		if parsed.ID == id {

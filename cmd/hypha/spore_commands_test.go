@@ -500,3 +500,20 @@ func TestLegacyV0VerifyAuditAndGraftCLI(t *testing.T) {
 		t.Fatalf("explicit graft: %s %s (%d)", out, stderr, code)
 	}
 }
+
+func TestResolveVerificationSporeMatchesFrontmatterID(t *testing.T) {
+	root := t.TempDir()
+	id := "spore.2026-10-24.test.resolve"
+	space := filepath.Join(root, "spaces", "example-knowledge")
+	want := filepath.Join(space, "inbox", "agents", "2026-10-24-resolve.md")
+	writeCLIFile(t, want, []byte("---\nid: "+id+"\ntype: spore\n---\n\n# Resolve\n"))
+	writeCLIFile(t, filepath.Join(space, "notes", "mentions.md"), []byte("---\nid: concept.mentions\n---\n\n# Mentions\n\nSee "+id+".\n"))
+	writeCLIFile(t, filepath.Join(space, "notes", "unrelated.md"), []byte("---\nid: concept.unrelated\n---\n\n# Unrelated\n"))
+	got, err := resolveVerificationSpore(root, id, "")
+	if err != nil || got != want {
+		t.Fatalf("resolve = %q, %v; want %q", got, err, want)
+	}
+	if _, err := resolveVerificationSpore(root, "spore.2026-10-24.test.missing", ""); err == nil {
+		t.Fatal("resolve found a spore that does not exist")
+	}
+}
