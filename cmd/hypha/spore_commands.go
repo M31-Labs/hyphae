@@ -243,7 +243,6 @@ func resolveVerificationSpore(root, id, space string) (string, error) {
 		}
 	}
 	var matches []string
-	idBytes := []byte(id)
 	err := filepath.WalkDir(dir, func(path string, entry os.DirEntry, err error) error {
 		if err != nil {
 			return err
@@ -255,8 +254,7 @@ func resolveVerificationSpore(root, id, space string) (string, error) {
 		if err != nil {
 			return err
 		}
-		// A file can declare the ID only if it contains it, so parse just those.
-		if !bytes.Contains(data, idBytes) {
+		if verificationSporeID(data) != id {
 			return nil
 		}
 		parsed, _ := spore.Parse(data)
@@ -272,6 +270,32 @@ func resolveVerificationSpore(root, id, space string) (string, error) {
 		return "", fmt.Errorf("spore verify: found %d files for %q; pass a file path or --space to disambiguate", len(matches), id)
 	}
 	return matches[0], nil
+}
+
+// verificationSporeID reads only the leading YAML, so walking the inbox does
+// not require a Markdown parse for documents with a different ID.
+func verificationSporeID(data []byte) string {
+	if bytes.IndexByte(data, '\r') >= 0 {
+		data = bytes.ReplaceAll(data, []byte("\r\n"), []byte("\n"))
+		data = bytes.ReplaceAll(data, []byte("\r"), []byte("\n"))
+	}
+	data, ok := bytes.CutPrefix(data, []byte("---\n"))
+	if !ok {
+		return ""
+	}
+	header, _, ok := bytes.Cut(data, []byte("\n---\n"))
+	if !ok {
+		header, ok = bytes.CutSuffix(data, []byte("\n---"))
+		if !ok {
+			return ""
+		}
+	}
+	var fields map[string]any
+	if err := yaml.Unmarshal(header, &fields); err != nil {
+		return ""
+	}
+	id, _ := fields["id"].(string)
+	return strings.TrimSpace(id)
 }
 
 func cmdSporeAudit(args []string) error {

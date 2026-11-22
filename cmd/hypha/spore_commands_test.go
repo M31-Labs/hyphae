@@ -517,3 +517,13 @@ func TestResolveVerificationSporeMatchesFrontmatterID(t *testing.T) {
 		t.Fatal("resolve found a spore that does not exist")
 	}
 }
+
+func TestResolveVerificationSporeDecodesFrontmatterID(t *testing.T) {
+	root := t.TempDir()
+	path := filepath.Join(root, "spaces", "example-knowledge", "inbox", "agents", "encoded.md")
+	writeCLIFile(t, path, []byte("---\r\nid: \"spore.encoded\\x2Did\"\r\ntype: spore\r\n---\r\n\r\n# Encoded\r\n"))
+	got, err := resolveVerificationSpore(root, "spore.encoded-id", "")
+	if err != nil || got != path {
+		t.Fatalf("resolve = %q, %v; want %q", got, err, path)
+	}
+}
