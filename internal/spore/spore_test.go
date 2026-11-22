@@ -1013,3 +1013,19 @@ proposed_edges:
 		}
 	}
 }
+
+// TestParseSegmentedZeroNumberedList verifies that a long spore ending in a
+// list numbered from zero parses. mdpp before v0.5.0 looped forever on it once
+// the document was long enough (2048 bytes, three headings) to be segmented.
+func TestParseSegmentedZeroNumberedList(t *testing.T) {
+	doc := append(append([]byte{}, validSporeDoc...), []byte("\n"+
+		strings.Repeat("Padding keeps this spore above the size where mdpp segments it.\n", 40)+
+		"\n## Phasing\n\n0. **Flag gate.** first step\n1. second step\n")...)
+	s, errs := spore.Parse(doc)
+	if len(errs) != 0 {
+		t.Fatalf("Parse returned unexpected errors: %v", errs)
+	}
+	if s.ID != "spore.2026-05-25.cloud-agent.7f3a" {
+		t.Errorf("ID = %q, want \"spore.2026-05-25.cloud-agent.7f3a\"", s.ID)
+	}
+}
